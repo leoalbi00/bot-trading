@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="it" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quant AI Terminal</title>
+
+    <!-- Font Finanziari Professionale -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        obsidian: '#09090b',
+                        surface: '#121215',
+                        borderSubtle: 'rgba(255, 255, 255, 0.08)',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- TradingView Lightweight Charts & Lucide Icons -->
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        body {
+            background-color: #09090b;
+            color: #f4f4f5;
+            font-family: 'Inter', sans-serif;
+        }
+        .tabular-nums {
+            font-variant-numeric: tabular-nums;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col antialiased selection:bg-zinc-800">
+
+    <!-- Navbar -->
+    <header class="border-b border-borderSubtle bg-surface/80 backdrop-blur-md sticky top-0 z-50 px-6 py-3.5 flex items-center justify-between">
+        <div class="flex items-center gap-3">
+            <div id="statusIndicator" class="h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse"></div>
+            <span class="font-semibold text-sm tracking-wide uppercase text-zinc-300">QUANT-AI TERMINAL</span>
+            <span class="text-xs px-2 py-0.5 rounded border border-zinc-800 bg-zinc-900 text-zinc-400 font-mono" id="botStatusText">Inizializzazione...</span>
+        </div>
+        
+        <div class="flex items-center gap-3">
+            <button onclick="triggerScan()" class="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-1.5 rounded transition">
+                <i data-lucide="zap" class="w-3.5 h-3.5"></i> SCAN ORA
+            </button>
+            <button onclick="toggleBot()" id="btnToggle" class="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-borderSubtle text-xs font-semibold px-3 py-1.5 rounded transition">
+                <i data-lucide="pause" class="w-3.5 h-3.5"></i> PAUSA BOT
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="flex-1 p-6 grid grid-cols-12 gap-6 max-w-[1800px] mx-auto w-full">
+        
+        <!-- Metrics -->
+        <div class="col-span-12 grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div class="bg-surface border border-borderSubtle p-4 rounded-lg">
+                <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-1">Valore Portafoglio</div>
+                <div class="text-2xl font-semibold tabular-nums text-white" id="portfolioVal">$0.00</div>
+                <div class="text-xs text-zinc-500 mt-1 font-mono">Alpaca Paper Trading</div>
+            </div>
+            <div class="bg-surface border border-borderSubtle p-4 rounded-lg">
+                <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-1">Liquidità Disponibile (Cash)</div>
+                <div class="text-2xl font-semibold tabular-nums text-emerald-400" id="cashVal">$0.00</div>
+                <div class="text-xs text-zinc-500 mt-1 font-mono" id="buyingPower">Potere d'acquisto: $0.00</div>
+            </div>
+            <div class="bg-surface border border-borderSubtle p-4 rounded-lg">
+                <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-1">Ultima Scansione</div>
+                <div class="text-lg font-semibold tabular-nums text-zinc-200 mt-1" id="lastScan">-</div>
+                <div class="text-xs text-zinc-500 mt-1 font-mono">Ciclo Automatico: 15m</div>
+            </div>
+            <div class="bg-surface border border-borderSubtle p-4 rounded-lg">
+                <div class="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-1">Motore Decisionale AI</div>
+                <div class="text-lg font-semibold text-zinc-200 mt-1">Google Gemini 2.0</div>
+                <div class="text-xs text-emerald-400 mt-1 font-mono">Buy & Sell Logic Active</div>
+            </div>
+        </div>
+
+        <!-- Chart Section (8 cols) -->
+        <div class="col-span-12 lg:col-span-8 bg-surface border border-borderSubtle rounded-lg p-5 flex flex-col">
+            <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center gap-3">
+                    <h2 class="text-sm font-semibold text-zinc-200 uppercase tracking-wide">Analisi Performance Portafoglio</h2>
+                </div>
+                <div class="text-xs font-mono text-zinc-400">TradingView Lightweight Chart</div>
+            </div>
+            <div id="chart-container" class="w-full h-[360px] rounded border border-borderSubtle/50 bg-obsidian"></div>
+        </div>
+
+        <!-- Operational Logs (4 cols) -->
+        <div class="col-span-12 lg:col-span-4 bg-surface border border-borderSubtle rounded-lg p-5 flex flex-col">
+            <div class="flex items-center justify-between mb-3">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="terminal" class="w-4 h-4 text-zinc-400"></i>
+                    <h2 class="text-sm font-semibold text-zinc-200 uppercase tracking-wide">Terminal Log Live</h2>
+                </div>
+                <span class="h-2 w-2 rounded-full bg-emerald-500"></span>
+            </div>
+            <div id="logContainer" class="flex-1 bg-obsidian border border-borderSubtle rounded p-3 font-mono text-xs text-zinc-300 overflow-y-auto max-h-[360px] custom-scrollbar space-y-1.5">
+                <div class="text-zinc-500">Connessione al terminale in corso...</div>
+            </div>
+        </div>
+
+        <!-- Open Positions Table (12 cols) -->
+        <div class="col-span-12 bg-surface border border-borderSubtle rounded-lg p-5">
+            <h2 class="text-sm font-semibold text-zinc-200 uppercase tracking-wide mb-4">Posizioni Attive in Portafoglio</h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs font-mono">
+                    <thead>
+                        <tr class="border-b border-borderSubtle text-zinc-500 uppercase">
+                            <th class="pb-3 font-medium">Asset</th>
+                            <th class="pb-3 font-medium">Quantità</th>
+                            <th class="pb-3 font-medium">Prezzo Attuale</th>
+                            <th class="pb-3 font-medium">Valore Totale</th>
+                            <th class="pb-3 font-medium">P&L Non Realizzato</th>
+                        </tr>
+                    </thead>
+                    <tbody id="positionsTable" class="divide-y divide-borderSubtle/50 text-zinc-300">
+                        <tr><td colspan="5" class="py-4 text-center text-zinc-500">Caricamento posizioni...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </main>
+
+    <script>
+        lucide.createIcons();
+
+        // Inizializzazione Grafico TradingView
+        const chartContainer = document.getElementById('chart-container');
+        const chart = LightweightCharts.createChart(chartContainer, {
+            layout: { backgroundColor: '#09090b', textColor: '#a1a1aa' },
+            grid: {
+                vertLines: { color: 'rgba(255, 255, 255, 0.04)' },
+                horzLines: { color: 'rgba(255, 255, 255, 0.04)' }
+            },
+            timeScale: { borderColor: 'rgba(255, 255, 255, 0.08)' }
+        });
+        const lineSeries = chart.addLineSeries({ color: '#10b981', lineWidth: 2 });
+        
+        let historyData = [];
+
+        async function fetchDashboard() {
+            try {
+                const res = await fetch('/api/data');
+                const data = await res.json();
+                
+                document.getElementById('portfolioVal').innerText = '$' + data.account.portfolio.toLocaleString('it-IT', {minimumFractionDigits: 2});
+                
+                const cashElem = document.getElementById('cashVal');
+                cashElem.innerText = '$' + data.account.cash.toLocaleString('it-IT', {minimumFractionDigits: 2});
+                if (data.account.cash < 0) {
+                    cashElem.className = "text-2xl font-semibold tabular-nums text-rose-500";
+                } else {
+                    cashElem.className = "text-2xl font-semibold tabular-nums text-emerald-400";
+                }
+
+                document.getElementById('buyingPower').innerText = 'Potere d\'acquisto: $' + data.account.buying_power.toLocaleString('it-IT', {minimumFractionDigits: 2});
+                document.getElementById('lastScan').innerText = data.bot.last_scan;
+                document.getElementById('botStatusText').innerText = data.bot.status;
+
+                // Tabella Posizioni
+                const tbody = document.getElementById('positionsTable');
+                tbody.innerHTML = '';
+                if (!data.positions || data.positions.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-zinc-500">Nessuna posizione aperta al momento.</td></tr>';
+                } else {
+                    data.positions.forEach(p => {
+                        const plClass = p.unrealized_pl >= 0 ? 'text-emerald-400' : 'text-rose-400';
+                        const sign = p.unrealized_pl >= 0 ? '+' : '';
+                        tbody.innerHTML += `
+                            <tr class="hover:bg-zinc-900/50 transition">
+                                <td class="py-3 font-bold text-white">${p.symbol}</td>
+                                <td class="py-3 tabular-nums">${p.qty}</td>
+                                <td class="py-3 tabular-nums">$${p.current_price.toFixed(2)}</td>
+                                <td class="py-3 tabular-nums">$${p.market_value.toFixed(2)}</td>
+                                <td class="py-3 tabular-nums ${plClass} font-semibold">${sign}$${p.unrealized_pl.toFixed(2)}</td>
+                            </tr>
+                        `;
+                    });
+                }
+
+                // Log Operativi
+                const logBox = document.getElementById('logContainer');
+                logBox.innerHTML = data.bot.logs.map(l => {
+                    let style = "text-zinc-300";
+                    if(l.includes("ORDINE ESEGUITO") || l.includes("BUY")) style = "text-emerald-400 font-semibold";
+                    if(l.includes("VENDITA") || l.includes("SELL")) style = "text-rose-400 font-semibold";
+                    if(l.includes("Errore")) style = "text-amber-400";
+                    return `<div class="${style}">${l}</div>`;
+                }).join('');
+
+                // Aggiornamento dinamico grafico
+                const now = new Date();
+                const timeStr = now.toISOString().split('T')[0];
+                if (data.account.portfolio > 0) {
+                    historyData.push({ time: timeStr, value: data.account.portfolio });
+                    if (historyData.length > 30) historyData.shift();
+                    lineSeries.setData(historyData);
+                }
+
+            } catch(e) {
+                console.error("Errore sincro dashboard:", e);
+            }
+        }
+
+        async function triggerScan() {
+            await fetch('/api/trigger', {method: 'POST'});
+            fetchDashboard();
+        }
+
+        async function toggleBot() {
+            const res = await fetch('/api/toggle', {method: 'POST'});
+            const data = await res.json();
+            document.getElementById('btnToggle').innerHTML = data.active ? 
+                '<i data-lucide="pause" class="w-3.5 h-3.5"></i> PAUSA BOT' : 
+                '<i data-lucide="play" class="w-3.5 h-3.5"></i> RIPRENDI BOT';
+            lucide.createIcons();
+        }
+
+        setInterval(fetchDashboard, 3000);
+        fetchDashboard();
+
+        window.addEventListener('resize', () => {
+            chart.applyOptions({ width: chartContainer.clientWidth });
+        });
+    </script>
+</body>
+</html>

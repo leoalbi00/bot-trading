@@ -6,7 +6,7 @@ import dotenv
 import pandas as pd
 import yfinance as yf
 import ta
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template, request
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -33,7 +33,7 @@ def log_message(msg):
     entry = f"[{timestamp}] {msg}"
     print(entry)
     bot_state["logs"].insert(0, entry)
-    if len(bot_state["logs"]) > 40:
+    if len(bot_state["logs"]) > 50:
         bot_state["logs"].pop()
 
 def get_account_summary():
@@ -71,7 +71,7 @@ def get_open_positions():
 
 def query_gemini_ai(prompt):
     if not GEMINI_KEY:
-        return "DECISIONE: BUY | MOTIVO: Test senza API Key"
+        return "DECISIONE: BUY | MOTIVO: Test modalità fallback"
 
     try:
         from google import genai
@@ -86,13 +86,60 @@ def query_gemini_ai(prompt):
     except Exception:
         pass
 
-    return "DECISIONE: BUY\nCONFIDENZA: 85%\nMOTIVAZIONE: Indicatori tecnici in fase rialzista."
+    return "DECISIONE: HOLD | MOTIVO: Analisi tecnica in fase neutrale."
 
 def run_trading_cycle():
-    bot_state["status"] = "Scansione Mercato..."
+    bot_state["status"] = "Scansione & Valutazione..."
     bot_state["last_scan"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_message("=== AVVIO SCANSIONE MERCATO ===")
-    
+    log_message("=== AVVIO SCANSIONE MERCATO & PORTAFOGLIO ===")
+
+    # ---------------------------------------------------------
+    # 1. GESTIONE E VENDITA DELLE POSIZIONI APERTE (TAKE PROFIT / STOP LOSS / SELL AI)
+    # ---------------------------------------------------------
+    open_positions = get_open_positions()
+    for pos in open_positions:
+        sym = pos["symbol"]
+        qty = pos["qty"]
+        unrealized_pl = pos["unrealized_pl"]
+        mkt_val = pos["market_value"]
+        pl_percent = (unrealized_pl / (mkt_val - unrealized_pl)) * 100 if mkt_val != unrealized_pl else 0
+
+        log_message(f"Verifica Posizione {sym}: Qty {qty} | PnL: ${unrealized_pl:.2f} ({pl_percent:.2f}%)")
+
+        # Regola di Take Profit (+3%) o Stop Loss (-2%)
+        should_sell = False
+        reason = ""
+
+        if pl_percent >= 3.0:
+            should_sell = True
+            reason = f"Take Profit raggiunto (+{pl_percent:.2f}%)"
+        elif pl_percent <= -2.0:
+            should_sell = True
+            reason = f"Stop Loss attivato ({pl_percent:.2f}%)"
+        else:
+            prompt = f"Posizione aperta: {sym}, Qty: {qty}, PnL %: {pl_percent:.2f}%. Rispondi SELL se consigli di chiudere la posizione, altrimenti HOLD."
+            ai_res = query_gemini_ai(prompt)
+            if "SELL" in ai_res.upper():
+                should_sell = True
+                reason = "Segnale di vendita espresso dall'AI Gemini"
+
+        if should_sell:
+            try:
+                log_message(f"EXEC VENDITA {sym} ({qty} quote): {reason}")
+                order_data = MarketOrderRequest(
+                    symbol=sym,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC
+                )
+                order = alpaca_client.submit_order(order_data)
+                log_message(f"ORDINE DI VENDITA ESEGUITO: {sym} (ID: {order.id})")
+            except Exception as e:
+                log_message(f"Errore Vendita {sym}: {e}")
+
+    # ---------------------------------------------------------
+    # 2. SCANSIONE E ACQUISTO NUOVE OPPORTUNITÀ (BUY)
+    # ---------------------------------------------------------
     candidates = []
     for ticker in WATCHLIST:
         try:
@@ -104,28 +151,36 @@ def run_trading_cycle():
                 candidates.append({"symbol": ticker, "price": price, "rsi": round(rsi, 2), "score": score})
         except Exception:
             continue
-            
+
     candidates.sort(key=lambda x: x['score'], reverse=True)
     top_3 = candidates[:3]
-    log_message(f"Asset selezionati: {[c['symbol'] for c in top_3]}")
+    log_message(f"Asset selezionati per analisi BUY: {[c['symbol'] for c in top_3]}")
 
-    for asset in top_3:
-        log_message(f"Analisi AI per {asset['symbol']} (${asset['price']:.2f})...")
-        prompt = f"Analizza {asset['symbol']}: Prezzo ${asset['price']:.2f}, RSI {asset['rsi']}. Decidi se acquistare."
-        ai_res = query_gemini_ai(prompt)
-        
-        if "BUY" in ai_res.upper() or asset['score'] >= 60:
-            acc = get_account_summary()
-            allocation = acc["cash"] * 0.15
-            if allocation >= 10:
-                qty = max(1, int(allocation / asset['price']))
-                sym = asset['symbol'].replace("-", "")
-                try:
-                    order_data = MarketOrderRequest(symbol=sym, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
-                    order = alpaca_client.submit_order(order_data)
-                    log_message(f"ORDINE ESEGUITO: {qty} x {sym} (ID: {order.id})")
-                except Exception as e:
-                    log_message(f"Errore Ordine {sym}: {e}")
+    acc = get_account_summary()
+    if acc["cash"] < 10:
+        log_message("Liquidità Cash insufficiente (< $10) per nuovi acquisti.")
+    else:
+        for asset in top_3:
+            log_message(f"Analisi AI per {asset['symbol']} (${asset['price']:.2f})...")
+            prompt = f"Analizza {asset['symbol']}: Prezzo ${asset['price']:.2f}, RSI {asset['rsi']}. Rispondi BUY se reputi opportuno acquistare."
+            ai_res = query_gemini_ai(prompt)
+
+            if "BUY" in ai_res.upper() or asset['score'] >= 65:
+                allocation = acc["cash"] * 0.15
+                if allocation >= 10:
+                    qty = max(1, int(allocation / asset['price']))
+                    sym = asset['symbol'].replace("-", "")
+                    try:
+                        order_data = MarketOrderRequest(
+                            symbol=sym,
+                            qty=qty,
+                            side=OrderSide.BUY,
+                            time_in_force=TimeInForce.GTC
+                        )
+                        order = alpaca_client.submit_order(order_data)
+                        log_message(f"ORDINE ESEGUITO ACQUISTO: {qty} x {sym} (ID: {order.id})")
+                    except Exception as e:
+                        log_message(f"Errore Ordine Acquisto {sym}: {e}")
 
     bot_state["status"] = "Attivo (In attesa ciclo)"
     log_message("=== SCANSIONE COMPLETATA ===")
@@ -141,133 +196,9 @@ def background_loop():
 
 app = Flask(__name__)
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="it">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Quantitative Trading Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-900 text-gray-100 p-4 md:p-8 font-sans">
-    <div class="max-w-7xl mx-auto space-y-6">
-        <!-- Header -->
-        <div class="flex flex-col md:flex-row justify-between items-start md:items-center bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-xl gap-4">
-            <div>
-                <h1 class="text-2xl font-bold text-blue-400 flex items-center gap-2">🤖 AI Quantitative Trading Dashboard</h1>
-                <p class="text-gray-400 text-sm mt-1">Stato: <span id="botStatus" class="font-bold text-green-400">Inizializzazione...</span> | Ultimo Scan: <span id="lastScan" class="text-gray-300">-</span></p>
-            </div>
-            <div class="flex gap-3">
-                <button onclick="triggerScan()" class="bg-blue-600 hover:bg-blue-500 text-white font-semibold px-4 py-2 rounded-lg transition shadow">🚀 Esegui Scan Ora</button>
-                <button onclick="toggleBot()" id="btnToggle" class="bg-yellow-600 hover:bg-yellow-500 text-white font-semibold px-4 py-2 rounded-lg transition shadow">Pausa Bot</button>
-            </div>
-        </div>
-
-        <!-- Metrics -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div class="bg-gray-800 p-5 rounded-xl border border-gray-700 shadow">
-                <p class="text-gray-400 text-sm font-medium">Valore Portafoglio</p>
-                <h2 id="portfolioVal" class="text-3xl font-extrabold text-white mt-2">$0.00</h2>
-            </div>
-            <div class="bg-gray-800 p-5 rounded-xl border border-gray-700 shadow">
-                <p class="text-gray-400 text-sm font-medium">Liquidità Disponibile (Cash)</p>
-                <h2 id="cashVal" class="text-3xl font-extrabold text-green-400 mt-2">$0.00</h2>
-            </div>
-            <div class="bg-gray-800 p-5 rounded-xl border border-gray-700 shadow">
-                <p class="text-gray-400 text-sm font-medium">Potere d'Acquisto</p>
-                <h2 id="buyingPower" class="text-3xl font-extrabold text-blue-400 mt-2">$0.00</h2>
-            </div>
-        </div>
-
-        <!-- Tables and Logs -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <!-- Open Positions -->
-            <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow">
-                <h3 class="text-lg font-bold text-gray-200 mb-4">📈 Posizioni Aperte (Alpaca)</h3>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left text-sm text-gray-300">
-                        <thead class="bg-gray-700 text-gray-400 uppercase text-xs">
-                            <tr>
-                                <th class="p-3">Asset</th>
-                                <th class="p-3">Quantità</th>
-                                <th class="p-3">Prezzo Mkt</th>
-                                <th class="p-3">Valore Totale</th>
-                                <th class="p-3">P/L Non Realizzato</th>
-                            </tr>
-                        </thead>
-                        <tbody id="positionsTable" class="divide-y divide-gray-700"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Operational Logs -->
-            <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow">
-                <h3 class="text-lg font-bold text-gray-200 mb-4">📋 Log Operativi Live</h3>
-                <div id="logContainer" class="bg-gray-950 p-4 rounded-lg h-72 overflow-y-auto text-xs font-mono text-green-400 space-y-1"></div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        async function fetchDashboard() {
-            try {
-                const res = await fetch('/api/data');
-                const data = await res.json();
-                
-                document.getElementById('portfolioVal').innerText = '$' + data.account.portfolio.toLocaleString(undefined, {minimumFractionDigits: 2});
-                document.getElementById('cashVal').innerText = '$' + data.account.cash.toLocaleString(undefined, {minimumFractionDigits: 2});
-                document.getElementById('buyingPower').innerText = '$' + data.account.buying_power.toLocaleString(undefined, {minimumFractionDigits: 2});
-                document.getElementById('lastScan').innerText = data.bot.last_scan;
-                document.getElementById('botStatus').innerText = data.bot.status;
-
-                const tbody = document.getElementById('positionsTable');
-                tbody.innerHTML = '';
-                if(data.positions.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="p-4 text-center text-gray-500">Nessuna posizione aperta al momento.</td></tr>';
-                } else {
-                    data.positions.forEach(p => {
-                        const plColor = p.unrealized_pl >= 0 ? 'text-green-400 font-bold' : 'text-red-400 font-bold';
-                        tbody.innerHTML += `
-                            <tr>
-                                <td class="p-3 font-bold text-white">${p.symbol}</td>
-                                <td class="p-3">${p.qty}</td>
-                                <td class="p-3">$${p.current_price.toFixed(2)}</td>
-                                <td class="p-3">$${p.market_value.toFixed(2)}</td>
-                                <td class="p-3 ${plColor}">$${p.unrealized_pl.toFixed(2)}</td>
-                            </tr>
-                        `;
-                    });
-                }
-
-                const logBox = document.getElementById('logContainer');
-                logBox.innerHTML = data.bot.logs.map(l => `<div>${l}</div>`).join('');
-            } catch(e) {
-                console.error("Errore aggiornamento dashboard:", e);
-            }
-        }
-
-        async function triggerScan() {
-            await fetch('/api/trigger', {method: 'POST'});
-            fetchDashboard();
-        }
-
-        async function toggleBot() {
-            const res = await fetch('/api/toggle', {method: 'POST'});
-            const data = await res.json();
-            document.getElementById('btnToggle').innerText = data.active ? 'Pausa Bot' : 'Riprendi Bot';
-        }
-
-        setInterval(fetchDashboard, 3000);
-        fetchDashboard();
-    </script>
-</body>
-</html>
-"""
-
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template("index.html")
 
 @app.route("/api/data")
 def api_data():
