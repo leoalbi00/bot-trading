@@ -6,3 +6,4 @@ ta
 requests
 python-dotenv
 google-genai
+resend
