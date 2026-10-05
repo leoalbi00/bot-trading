@@ -1,0 +1,8 @@
+.env
+__pycache__/
+bot.pid
+bot.log
+bot_state.json
+crypto_exits.json
+scanner.pid
+bot_activity.log

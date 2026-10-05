@@ -1,0 +1,8 @@
+flask
+gunicorn
+alpaca-py
+yfinance
+ta
+requests
+python-dotenv
+google-genai
