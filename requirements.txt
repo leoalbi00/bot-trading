@@ -1,9 +1,8 @@
-flask
-gunicorn
-alpaca-py
-yfinance
-ta
-requests
-python-dotenv
+Flask==3.0.3
+gunicorn==22.0.0
+python-dotenv==1.0.1
+pandas==2.2.2
+yfinance==0.2.40
+ta==0.11.0
+alpaca-py==0.21.1
 google-genai
-resend
