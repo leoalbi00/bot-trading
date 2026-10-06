@@ -186,7 +186,7 @@ def execute_sell(pos, label, reason, auto_trade, pending, market_open):
         log_message(f"Errore Vendita {sym}: {e}")
         return None
 
-def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO"):
+def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=None):
     """Acquisto a importo (notional) o segnalazione in modalità Advisor. Restituisce l'ordine o None."""
     if not auto_trade:
         log_message(f"🧭 [Advisor] Suggerito {label} di ${amount:,.2f} di {sym}: ordine non inviato.")
@@ -194,7 +194,7 @@ def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO"):
     if not alpaca_client:
         return None
     try:
-        order = core.submit_notional_buy(sym, amount)
+        order = core.submit_notional_buy(sym, amount, stop_pct=stop_pct)
         pending.add(core.normalize_symbol(sym))
         log_message(f"✅ ORDINE {label} INVIATO: ${amount:,.2f} di {sym} (ID: {order.id})")
         return order
@@ -202,7 +202,7 @@ def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO"):
         log_message(f"Errore Ordine Acquisto {sym}: {e}")
         return None
 
-def rotate_capital(sell_report, target, cfg, auto_trade, pending):
+def rotate_capital(sell_report, target, cfg, auto_trade, pending, stop_pct=None):
     """Opportunity Cost Trade: vende sell_report e reinveste il ricavato su target entro il limite di esposizione."""
     pos = sell_report["pos"]
     if not auto_trade:
@@ -223,7 +223,7 @@ def rotate_capital(sell_report, target, cfg, auto_trade, pending):
     if amount < core.MIN_ORDER_USD:
         log_message(f"🔄 Nessun reinvestimento in {target}: fondi entro il limite di esposizione ${funds:,.2f}.")
         return
-    execute_buy(target, amount, auto_trade, pending, label="ACQUISTO DA ROTAZIONE")
+    execute_buy(target, amount, auto_trade, pending, label="ACQUISTO DA ROTAZIONE", stop_pct=stop_pct)
 
 def describe_decision(d):
     if d["action"] == "ROTATE":
@@ -278,8 +278,10 @@ def run_trading_cycle(manual=False, boot=False):
         analysis = core.market_analyst(cfg["watchlist"] + [p["yf_symbol"] for p in positions], log=log_message)
         if not manual and should_abort():
             return
+        # Storico ordini Alpaca: trade chiusi, data di apertura e stop delle posizioni (nessuno stato locale)
+        ledger = core.sync_ledger(log=log_message)
         # Agente 7: Post-Trade Auditor (penalità allo score prima delle altre valutazioni)
-        audit = core.post_trade_auditor(analysis, log=log_message)
+        audit = core.post_trade_auditor(analysis, log=log_message, ledger=ledger)
         # Agente 5: Volume & Liquidity
         volume = core.volume_agent(analysis, log=log_message)
         # Agente 4: Macro Regime
@@ -293,10 +295,10 @@ def run_trading_cycle(manual=False, boot=False):
         # Agente 2: Sentiment Intelligence
         sentiment = core.sentiment_agent(focus, log=log_message)
         # Agente 3: Volatility Manager
-        vol, stops, trailing = core.volatility_agent(focus, positions, state, cfg, log=log_message)
+        vol, stops, trailing = core.volatility_agent(focus, positions, cfg, log=log_message, ledger=ledger)
 
         # Risk Manager: stato delle posizioni con stop dinamici e trailing stop
-        risk = core.risk_manager(positions, analysis, acc, cfg, log=log_message, stops=stops, trailing=trailing)
+        risk = core.risk_manager(positions, analysis, acc, cfg, log=log_message, stops=stops, trailing=trailing, ledger=ledger)
 
         # Vendite difensive obbligatorie (consentite anche con il blocco da drawdown)
         sold = set()
@@ -352,8 +354,6 @@ def run_trading_cycle(manual=False, boot=False):
             factor = macro["crypto" if crypto else "stock"]["factor"]
             pct, pct_eff = core.cio_allocation(final, target_info["score"] if target_info else None, cfg, factor)
             stop = core.cio_stop(final, vol.get(target_key))
-            if stop is not None:
-                state.setdefault("stops", {})[target_key] = stop
             exec_note = (f"allocazione {pct:.1f}%" + (f" → {pct_eff:.1f}% (macro RISK-OFF)" if factor < 1 else "")
                          + (f", stop {stop:.1f}%" if stop is not None else ""))
             log_message(f"💼 [CIO] {final['buy_symbol']}: {exec_note}")
@@ -366,7 +366,7 @@ def run_trading_cycle(manual=False, boot=False):
             pass
         elif final["action"] == "BUY":
             _, allocation = core.buy_budget(acc, risk["exposure"], cfg, crypto=crypto, pct=pct_eff)
-            execute_buy(final["buy_symbol"], allocation, auto_trade, pending, label=f"ACQUISTO CIO {pct_eff:.0f}%")
+            execute_buy(final["buy_symbol"], allocation, auto_trade, pending, label=f"ACQUISTO CIO {pct_eff:.0f}%", stop_pct=stop)
         else:
             sell_report = next(r for r in risk["positions"]
                                if core.normalize_symbol(r["pos"]["yf_symbol"]) == core.normalize_symbol(final["sell_symbol"]))
@@ -375,7 +375,7 @@ def run_trading_cycle(manual=False, boot=False):
             else:
                 log_message(f"🔄 Rotazione capitale: {sell_report['pos']['symbol']} (score {sell_report['score']}) → "
                             f"{final['buy_symbol']}")
-                rotate_capital(sell_report, final["buy_symbol"], cfg, auto_trade, pending)
+                rotate_capital(sell_report, final["buy_symbol"], cfg, auto_trade, pending, stop_pct=stop)
         core.save_state(state)
 
         # Badge per la dashboard
@@ -416,7 +416,12 @@ def run_trading_cycle(manual=False, boot=False):
         scan_lock.release()
 
 def background_loop():
-    time.sleep(3)  # Pausa di 3 secondi all'avvio per caricamento server
+    # Grace period: lascia stabilizzare server e connessioni API prima di toccare Alpaca
+    time.sleep(core.STARTUP_GRACE_SECONDS)
+    try:
+        core.startup_system_sync(log=log_message)
+    except Exception as e:
+        log_message(f"🔄 [Sync] Errore sincronizzazione di avvio: {e}")
     last_run = 0.0
     boot = True  # il primo ciclo dopo l'avvio non apre posizioni
     while True:
@@ -488,8 +493,16 @@ def start_background_threads():
     threading.Thread(target=background_loop, daemon=True).start()
     threading.Thread(target=keep_alive_loop, daemon=True).start()
     log_message(f"🧵 Thread di trading e Keep-Alive avviati (PID {os.getpid()})")
-    mode = "Auto-Trading attivo" if core.get_config()["auto_execute_trades"] else "Advisor (nessun ordine)"
-    log_message(f"⚙️ Modalità di avvio: {mode} — BOT_AUTO_EXECUTE={os.getenv('BOT_AUTO_EXECUTE', 'non impostata (default true)')}")
+    cfg = core.get_config()
+    mode = "Auto-Trading attivo" if cfg["auto_execute_trades"] else "Advisor (nessun ordine)"
+    locked = core.env_overrides()
+    source = (f"fissata da {core.ENV_OVERRIDES['auto_execute_trades']}" if "auto_execute_trades" in locked
+              else "default/config.json (BOT_AUTO_EXECUTE non impostata)")
+    log_message(f"⚙️ Modalità di avvio: {mode} — {source}")
+    if locked:
+        log_message(f"⚙️ Impostazioni fissate da variabili d'ambiente: "
+                    f"{', '.join(f'{core.ENV_OVERRIDES[k]}={v}' for k, v in locked.items())}")
+    log_message(f"⏳ Grace period di {core.STARTUP_GRACE_SECONDS}s, poi sincronizzazione con Alpaca e ciclo di avvio.")
 
 @app.before_request
 def ensure_background_threads():

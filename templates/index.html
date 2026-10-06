@@ -355,7 +355,10 @@
                 const remove = el('button', 'text-zinc-400 hover:text-rose-400 px-1 rounded', '×');
                 remove.type = 'button';
                 remove.title = `Rimuovi ${ticker}`;
-                remove.onclick = () => { watchlist = watchlist.filter(t => t !== ticker); renderWatchlist(); };
+                remove.onclick = () => {
+                    if (envLocked.watchlist) return showSettingsNotice(`Watchlist fissata da ${envLocked.watchlist}`, 'error');
+                    watchlist = watchlist.filter(t => t !== ticker); renderWatchlist();
+                };
                 chip.appendChild(remove);
                 box.appendChild(chip);
             }
@@ -382,6 +385,27 @@
                 : 'Advisor: registra solo i suggerimenti';
         }
 
+        // Campi delle impostazioni e relative chiavi di config (per i valori fissati da Render)
+        const SETTING_FIELDS = {
+            stop_loss_pct: 'setStopLoss', base_allocation_pct: 'setBaseAllocation', max_allocation_pct: 'setAllocation',
+            max_exposure_pct: 'setExposure', scan_interval_min: 'setInterval', auto_execute_trades: 'setAutoTrade',
+            keep_alive_enabled: 'setKeepAlive', ai_provider: 'setAiProvider', watchlist: 'tickerInput'
+        };
+        let envLocked = {};
+
+        function applyEnvLocks(locked) {
+            envLocked = locked || {};
+            for (const [key, id] of Object.entries(SETTING_FIELDS)) {
+                const field = document.getElementById(id);
+                if (!field) continue;
+                const env = envLocked[key];
+                field.disabled = Boolean(env);
+                field.title = env ? `Fissato dalla variabile d'ambiente ${env} su Render` : '';
+                const container = field.closest('label') || field.closest('form');
+                if (container) container.classList.toggle('opacity-50', Boolean(env));
+            }
+        }
+
         function applySettings(cfg) {
             watchlist = Array.isArray(cfg.watchlist) ? [...cfg.watchlist] : [];
             renderWatchlist();
@@ -394,6 +418,7 @@
             document.getElementById('setKeepAlive').checked = Boolean(cfg.keep_alive_enabled);
             document.getElementById('setAiProvider').value = cfg.ai_provider || 'gemini';
             updateToggleHints();
+            applyEnvLocks(cfg.env_locked);
         }
 
         let noticeTimer = null;
@@ -429,6 +454,7 @@
                 keep_alive_enabled: document.getElementById('setKeepAlive').checked,
                 ai_provider: document.getElementById('setAiProvider').value
             };
+            for (const key of Object.keys(envLocked)) delete payload[key];  // gestiti da Render
             btn.disabled = true;
             try {
                 const { res, data } = await apiRequest('/api/settings', 'POST', payload);

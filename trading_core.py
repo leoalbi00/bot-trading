@@ -10,6 +10,7 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 import json
 import secrets
+import uuid
 import threading
 import time
 
@@ -61,6 +62,8 @@ def now_local():
 
 
 MIN_ORDER_USD = 10.0
+ORDER_TAG_PREFIX = "brd-"  # prefisso del client_order_id degli acquisti del bot
+_ORDER_STOP_RE = re.compile(r"^brd-s(\d+)-")
 HTTP_TIMEOUT = 10
 
 # Regole di uscita attiva e rotazione del capitale
@@ -76,7 +79,7 @@ SCORE_BUY = 75                 # > 75: candidato BUY
 STRONG_BUY_SCORE = 85          # >= 85: STRONG BUY, allocazione maggiorata (25-30%)
 SCORE_SELL = 45                # < 45: candidato SELL / debolezza
 STALL_SCORE = 55               # stallo: ROC vicino a 0 e score < 55...
-STALL_STREAK = 3               # ...per più di 2 cicli consecutivi
+STALL_MIN_HOLD_MIN = 45        # ...con posizione aperta da almeno 45 minuti (3 cicli), letta da Alpaca
 
 # ---------------------------------------------------------------------------
 # Configurazione dinamica (config.json)
@@ -114,16 +117,53 @@ DEFAULT_CONFIG = {
 }
 
 
-def env_auto_execute():
-    """Valore iniziale di Auto-Trading (default: true = ordini automatici).
+# Variabili d'ambiente (es. su Render) con PRIORITÀ ASSOLUTA su config.json.
+# Una chiave impostata da ambiente non può essere modificata dalla dashboard.
+ENV_OVERRIDES = {
+    "auto_execute_trades": "BOT_AUTO_EXECUTE",
+    "ai_provider": "BOT_AI_PROVIDER",
+    "watchlist": "BOT_WATCHLIST",
+    "base_allocation_pct": "BOT_BASE_ALLOCATION_PCT",
+    "max_allocation_pct": "BOT_MAX_ALLOCATION_PCT",
+    "max_exposure_pct": "BOT_MAX_EXPOSURE_PCT",
+    "stop_loss_pct": "BOT_STOP_LOSS_PCT",
+    "scan_interval_min": "BOT_SCAN_INTERVAL_MIN",
+    "keep_alive_enabled": "BOT_KEEP_ALIVE",
+}
+_TRUE = ("1", "true", "yes", "on", "si", "sì")
+_FALSE = ("0", "false", "no", "off")
 
-    config.json su Render si azzera a ogni deploy: il bot riparte sempre con questo valore.
-    Per avviarlo in modalità Advisor impostare BOT_AUTO_EXECUTE=false.
-    """
-    return os.getenv("BOT_AUTO_EXECUTE", "true").strip().lower() in ("1", "true", "yes", "on", "si", "sì")
+
+def _parse_env_value(key, raw):
+    raw = raw.strip()
+    if isinstance(DEFAULT_CONFIG[key], bool):
+        if raw.lower() in _TRUE:
+            return True
+        if raw.lower() in _FALSE:
+            return False
+        raise ValueError(f"valore booleano non valido: {raw!r}")
+    if isinstance(DEFAULT_CONFIG[key], list):
+        return [t.strip() for t in raw.split(",") if t.strip()]
+    return raw
 
 
-DEFAULT_CONFIG["auto_execute_trades"] = env_auto_execute()
+_env_warned = set()
+
+
+def env_overrides():
+    """{chiave: valore validato} per le variabili d'ambiente presenti. Valori non validi vengono ignorati."""
+    out = {}
+    for key, env_name in ENV_OVERRIDES.items():
+        raw = os.getenv(env_name)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            out[key] = _validate_config({key: _parse_env_value(key, raw)}, DEFAULT_CONFIG)[key]
+        except ValueError as e:
+            if (env_name, raw) not in _env_warned:
+                _env_warned.add((env_name, raw))
+                print(f"[!] {env_name} ignorata: {e}", flush=True)
+    return out
 
 _config_lock = threading.Lock()
 _config = None
@@ -189,6 +229,7 @@ def _validate_config(data, base):
 
 
 def _save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
     tmp = CONFIG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -219,31 +260,42 @@ def _load_config():
 
 
 def get_config():
-    """Copia della configurazione corrente (caricata da config.json al primo uso)."""
+    """Configurazione corrente: config.json (o default) + variabili d'ambiente con priorità assoluta."""
     global _config
     with _config_lock:
         if _config is None:
             _config = _load_config()
-        return json.loads(json.dumps(_config))
+        cfg = json.loads(json.dumps(_config))
+    cfg.update(env_overrides())
+    return cfg
 
 
 def update_config(changes):
-    """Valida, applica e salva le modifiche. Restituisce la nuova configurazione."""
+    """Valida, applica e salva le modifiche. Restituisce la nuova configurazione.
+
+    Le chiavi fissate da variabile d'ambiente non possono essere cambiate: la richiesta viene rifiutata.
+    """
     global _config
     changes = {k: v for k, v in changes.items() if k not in SECRET_FIELDS}  # i segreti non si cambiano da UI
-    current = get_config()
-    new_cfg = _validate_config(changes, current)
+    locked = env_overrides()
+    for key, value in changes.items():
+        if key in locked and _validate_config({key: value}, DEFAULT_CONFIG)[key] != locked[key]:
+            raise ValueError(f"{key} è fissato dalla variabile d'ambiente {ENV_OVERRIDES[key]}: modificala su Render")
     with _config_lock:
+        if _config is None:
+            _config = _load_config()
+        new_cfg = _validate_config(changes, _config)
         _save_config(new_cfg)
         _config = new_cfg
-    return json.loads(json.dumps(new_cfg))
+    return get_config()
 
 
 def public_config():
-    """Configurazione senza segreti, per la dashboard."""
+    """Configurazione senza segreti, per la dashboard, con l'elenco delle chiavi fissate da ambiente."""
     cfg = get_config()
     for key in SECRET_FIELDS:
         cfg.pop(key, None)
+    cfg["env_locked"] = {key: ENV_OVERRIDES[key] for key in env_overrides()}
     return cfg
 
 
@@ -309,7 +361,7 @@ def to_yf_symbol(alpaca_symbol, crypto=None):
 # ---------------------------------------------------------------------------
 # IA
 # ---------------------------------------------------------------------------
-_SCORE_RE = re.compile(r"SCORE[\s*_`]*[:=]?[\s*_`\[]*(\d{1,3})", re.IGNORECASE)
+_SCORE_RE = re.compile(r"SCORE[\s*_`]*[:=][\s*_`\[]*(\d{1,3})", re.IGNORECASE)
 
 
 def parse_score(text):
@@ -828,17 +880,21 @@ def is_market_open(log=print):
         return False
 
 
-def submit_notional_buy(yf_symbol, amount_usd):
+def submit_notional_buy(yf_symbol, amount_usd, stop_pct=None):
     """Acquisto a importo (notional), così non si compra mai più del budget.
 
     Le azioni frazionarie richiedono time_in_force=DAY, le crypto GTC.
+    Lo stop assegnato dal CIO viene salvato nel client_order_id dell'ordine (es. "brd-s450-…" = -4.50%):
+    così sopravvive ai deploy e viene riletto dallo storico ordini di Alpaca.
     """
     crypto = is_crypto(yf_symbol)
+    tag = f"s{int(round(abs(stop_pct) * 100))}" if stop_pct else "s0"
     order_data = MarketOrderRequest(
         symbol=to_alpaca_symbol(yf_symbol),
         notional=round(amount_usd, 2),
         side=OrderSide.BUY,
         time_in_force=TimeInForce.GTC if crypto else TimeInForce.DAY,
+        client_order_id=f"{ORDER_TAG_PREFIX}{tag}-{uuid.uuid4().hex[:16]}",
     )
     return alpaca_client.submit_order(order_data)
 
@@ -928,29 +984,27 @@ def market_analyst(symbols, log=print):
     return analysis
 
 
-_stall_streaks = {}
-
-
-def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trailing=None):
+def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trailing=None, ledger=None):
     """FASE 2: classifica ogni posizione e calcola fondi ed esposizione.
 
-    Stati: STOP_LOSS, RIBASSISTA, STALLO (prolungato) -> vendita obbligatoria;
+    Senza stato in memoria: il tempo di permanenza in posizione viene dalla data del primo acquisto
+    ancora aperto negli ordini Alpaca (ledger["open"]), non da contatori di cicli.
+    Stati: STOP_LOSS, TRAILING_STOP, RIBASSISTA, STALLO -> vendita obbligatoria;
            IN_STALLO (in osservazione), OK, NO_DATA -> mantenute.
     """
-    held = {normalize_symbol(p["symbol"]) for p in positions}
-    for key in list(_stall_streaks):
-        if key not in held:
-            del _stall_streaks[key]
-
+    open_info = (ledger or {}).get("open", {})
+    now = now_local()
     report = []
     for pos in positions:
         key = normalize_symbol(pos["symbol"])
         a = analysis.get(normalize_symbol(pos["yf_symbol"]))
         pl = pos["unrealized_plpc"]
         score = a["score"] if a else None
+        opened = open_info.get(key, {}).get("opened_at")
+        held_min = (now - opened).total_seconds() / 60 if opened else None  # None = oltre lo storico (90 gg)
         stalled_now = bool(a) and abs(a["ind"]["roc"]) <= STALL_ROC_PCT and a["score"] < STALL_SCORE
-        streak = _stall_streaks.get(key, 0) + 1 if stalled_now else 0
-        _stall_streaks[key] = streak
+        held_long = held_min is None or held_min >= STALL_MIN_HOLD_MIN
+        held_txt = "da oltre 90 giorni" if held_min is None else f"da {held_min:.0f} min"
 
         stop = (stops or {}).get(key, cfg["stop_loss_pct"])
         trail = (trailing or {}).get(key)
@@ -966,15 +1020,16 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
                 status, reason = "RIBASSISTA", why
             elif a["score"] < SCORE_SELL:
                 status, reason = "RIBASSISTA", f"Score di Forza {a['score']} < {SCORE_SELL}"
-            elif streak >= STALL_STREAK:
-                status, reason = "STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']} da {streak} cicli"
+            elif stalled_now and held_long:
+                status, reason = "STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']}, in posizione {held_txt}"
             elif stalled_now:
-                status, reason = "IN_STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']} (ciclo {streak}/{STALL_STREAK})"
+                status, reason = "IN_STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']}, in posizione {held_txt} (minimo {STALL_MIN_HOLD_MIN})"
             else:
-                status, reason = "OK", f"ROC {a['ind']['roc']:.2f}%"
-        report.append({"pos": pos, "analysis": a, "score": score, "status": status, "reason": reason, "streak": streak})
+                status, reason = "OK", f"ROC {a['ind']['roc']:.2f}%, in posizione {held_txt}"
+        report.append({"pos": pos, "analysis": a, "score": score, "status": status, "reason": reason,
+                       "held_min": held_min})
         log(f"🛡️ [Risk] {pos['symbol']}: {status} | score {score if score is not None else 'N/D'} | "
-            f"PnL {pl:.2f}% | {reason}")
+            f"PnL {pl:.2f}% | stop {stop:.1f}% | {reason}")
 
     exposure = sum(abs(p["market_value"]) for p in positions)
     equity = float(account.get("portfolio", account.get("equity", 0)) or 0)
@@ -1237,28 +1292,45 @@ AUDIT_PENALTY = 15
 _state_lock = threading.Lock()
 
 
-def load_state():
-    """Stato persistente del boardroom (picchi per trailing stop, stop assegnati, blocco drawdown)."""
+def read_json_file(path, default):
+    """Legge un file JSON di stato. Se manca o è corrotto (es. dopo un deploy) lo rigenera con `default`."""
     with _state_lock:
         try:
-            with open(BOARDROOM_STATE_PATH, encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except (OSError, ValueError):
+            if isinstance(data, type(default)):
+                return data
+            print(f"[!] {os.path.basename(path)} con struttura inattesa: rigenerato.", flush=True)
+        except FileNotFoundError:
             pass
-        return {}
+        except (OSError, ValueError) as e:
+            print(f"[!] {os.path.basename(path)} illeggibile ({e}): rigenerato.", flush=True)
+    write_json_file(path, default)
+    return json.loads(json.dumps(default))
+
+
+def write_json_file(path, data):
+    """Scrittura atomica; gli errori vengono stampati ma non interrompono il bot."""
+    with _state_lock:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+            os.replace(tmp, path)
+            return True
+        except OSError as e:
+            print(f"[!] Impossibile salvare {os.path.basename(path)}: {e}", flush=True)
+            return False
+
+
+def load_state():
+    """Stato accessorio del boardroom (solo blocco da drawdown). Tutto il resto viene da Alpaca."""
+    return read_json_file(BOARDROOM_STATE_PATH, {"drawdown": {}})
 
 
 def save_state(state):
-    with _state_lock:
-        try:
-            tmp = BOARDROOM_STATE_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
-            os.replace(tmp, BOARDROOM_STATE_PATH)
-        except OSError as e:
-            print(f"[!] Impossibile salvare lo stato del boardroom: {e}")
+    write_json_file(BOARDROOM_STATE_PATH, state)
 
 
 # ---------------- Agente 2: Sentiment Intelligence ----------------
@@ -1325,11 +1397,23 @@ def dynamic_stop_pct(atr_percent, crypto):
     return round(max(STOP_WIDEST_PCT, min(STOP_TIGHTEST_PCT, -mult * atr_percent)), 2)
 
 
-def volatility_agent(symbols, positions, state, cfg, log=print):
-    """ATR, stop dinamico per ogni simbolo e trailing stop per le posizioni aperte.
+def _peak_since(yf_symbol, opened_at):
+    """Prezzo massimo (chiusure orarie) dall'apertura della posizione, letto da yfinance."""
+    if not opened_at:
+        return None
+    try:
+        df = yf.Ticker(yf_symbol).history(start=opened_at.astimezone(dt.timezone.utc), interval="1h")
+        return float(df["Close"].max()) if len(df) else None
+    except Exception:
+        return None
 
-    Restituisce (vol, stops, trailing): vol[key] = {atr_pct, stop_pct}; stops[key] = stop in vigore
-    per le posizioni (quello assegnato dal CIO o, in mancanza, quello da ATR); trailing[key] = esito.
+
+def volatility_agent(symbols, positions, cfg, log=print, ledger=None):
+    """ATR, stop dinamico per ogni simbolo e trailing stop per le posizioni aperte (senza stato locale).
+
+    - stop di una posizione: quello del CIO salvato nel client_order_id dell'acquisto, altrimenti da ATR;
+    - picco per il trailing: massimo dei prezzi dall'apertura (data letta dagli ordini Alpaca).
+    Restituisce (vol, stops, trailing).
     """
     vol = {}
     for sym in symbols:
@@ -1339,23 +1423,17 @@ def volatility_agent(symbols, positions, state, cfg, log=print):
         a = atr_pct(df)
         vol[normalize_symbol(sym)] = {"atr_pct": a, "stop_pct": dynamic_stop_pct(a, is_crypto(sym))}
 
-    peaks = state.setdefault("peaks", {})
-    assigned = state.setdefault("stops", {})
+    open_info = (ledger or {}).get("open", {})
     held = {normalize_symbol(p["symbol"]) for p in positions}
-    for key in list(peaks):
-        if key not in held:
-            peaks.pop(key, None)
-            assigned.pop(key, None)
-
     stops, trailing, parts = {}, {}, []
     for p in positions:
         key = normalize_symbol(p["symbol"])
         v = vol.get(normalize_symbol(p["yf_symbol"]))
-        stop = assigned.get(key, v["stop_pct"] if v else cfg["stop_loss_pct"])
+        info = open_info.get(key, {})
+        stop = info.get("stop_pct") or (v["stop_pct"] if v else cfg["stop_loss_pct"])
         stops[key] = stop
         price, entry = p["current_price"], p.get("avg_entry_price") or p["current_price"]
-        peak = max(float(peaks.get(key, 0)), price, entry)
-        peaks[key] = peak
+        peak = max([x for x in (_peak_since(p["yf_symbol"], info.get("opened_at")), price, entry) if x] or [0.0])
         if v:
             trail_pct = (ATR_MULT_CRYPTO if p["is_crypto"] else ATR_MULT_STOCK) * v["atr_pct"]
             active = peak >= entry * (1 + trail_pct / 100)
@@ -1366,6 +1444,7 @@ def volatility_agent(symbols, positions, state, cfg, log=print):
                 "reason": f"prezzo ${price:.2f} sotto il trailing stop ${trigger:.2f} (picco ${peak:.2f} - {trail_pct:.1f}%)",
             }
             parts.append(f"{p['symbol']} ATR {v['atr_pct']:.1f}% stop {stop:.1f}%"
+                         + (" (CIO)" if info.get("stop_pct") else "")
                          + (f" trailing ${trigger:.2f}" if active else ""))
         else:
             parts.append(f"{p['symbol']} stop {stop:.1f}% (ATR N/D)")
@@ -1419,35 +1498,49 @@ def volume_agent(analysis, log=print):
 
 
 # ---------------- Agente 6: Drawdown & Risk Controller ----------------
+def _intraday_equity_peak():
+    """Massimo dell'equity di oggi dallo storico del portafoglio Alpaca (None se non disponibile)."""
+    if not alpaca_client:
+        return None
+    try:
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        hist = alpaca_client.get_portfolio_history(GetPortfolioHistoryRequest(period="1D", timeframe="15Min"))
+        values = [float(e) for e in (hist.equity or []) if e]
+        return max(values) if values else None
+    except Exception:
+        return None
+
+
 def drawdown_controller(account, state, log=print):
-    """Perdita del giorno rispetto al massimo tra chiusura precedente e picco intraday.
+    """Perdita del giorno rispetto al massimo tra chiusura precedente e picco intraday (letto da Alpaca).
 
     Oltre DAILY_DRAWDOWN_LIMIT blocca i nuovi acquisti per DRAWDOWN_BLOCK_HOURS (solo vendite difensive).
+    Il blocco vale comunque finché la perdita del giorno resta oltre il limite, anche dopo un deploy.
     """
     now = time.time()
-    today = now_local().strftime("%Y-%m-%d")
     equity = float(account.get("portfolio", 0) or 0)
     last_equity = float(account.get("last_equity", 0) or 0) or equity
-    dd_state = state.setdefault("drawdown", {})
-    if dd_state.get("date") != today:
-        dd_state.update({"date": today, "peak": 0.0})
-    peak = max(last_equity, float(dd_state.get("peak", 0)), equity)
-    dd_state["peak"] = peak
+    peak = max([x for x in (last_equity, _intraday_equity_peak(), equity) if x] or [0.0])
     drawdown = (equity / peak - 1) * 100 if peak else 0.0
+    dd_state = state.setdefault("drawdown", {})
     if drawdown <= DAILY_DRAWDOWN_LIMIT and now >= float(dd_state.get("block_until", 0)):
         dd_state["block_until"] = now + DRAWDOWN_BLOCK_HOURS * 3600
         log(f"🚫 [Drawdown] Perdita giornaliera {drawdown:.2f}% oltre {DAILY_DRAWDOWN_LIMIT:.0f}%: "
             f"acquisti bloccati per {DRAWDOWN_BLOCK_HOURS} ore.")
-    blocked = now < float(dd_state.get("block_until", 0))
     remaining = max(0, float(dd_state.get("block_until", 0)) - now) / 3600
+    blocked = remaining > 0 or drawdown <= DAILY_DRAWDOWN_LIMIT
     log(f"📉 [Drawdown] Oggi {drawdown:+.2f}% (capitale ${equity:,.0f}, riferimento ${peak:,.0f})"
-        + (f" | ACQUISTI BLOCCATI ancora per {remaining:.1f}h" if blocked else " | acquisti consentiti"))
+        + (f" | ACQUISTI BLOCCATI ancora per {max(remaining, 0):.1f}h" if blocked else " | acquisti consentiti"))
     return {"drawdown_pct": round(drawdown, 2), "blocked": blocked, "hours_left": round(remaining, 1)}
 
 
 # ---------------- Agente 7: Post-Trade Auditor ----------------
-def rebuild_trade_history(days=90, log=print):
-    """Ricostruisce i trade chiusi (FIFO) dagli ordini eseguiti su Alpaca e li salva in trade_history.json."""
+def sync_ledger(days=90, log=print):
+    """Ricostruisce dagli ordini Alpaca eseguiti (FIFO) i trade chiusi e le posizioni aperte.
+
+    Restituisce {"trades": [...], "open": {simbolo: {"opened_at", "stop_pct"}}} oppure None se Alpaca
+    non risponde. I trade vengono salvati in trade_history.json (solo come copia: la fonte è Alpaca).
+    """
     if not alpaca_client:
         return None
     from datetime import datetime, timedelta, timezone
@@ -1467,8 +1560,11 @@ def rebuild_trade_history(days=90, log=print):
             continue
         key = normalize_symbol(o.symbol)
         side = str(getattr(o.side, "value", o.side)).lower()
+        filled_at = o.filled_at.astimezone(TIMEZONE) if hasattr(o.filled_at, "astimezone") else None
         if side == "buy":
-            lots.setdefault(key, []).append([qty, price])
+            m = _ORDER_STOP_RE.match(o.client_order_id or "")
+            stop = -int(m.group(1)) / 100 if m and int(m.group(1)) > 0 else None
+            lots.setdefault(key, []).append([qty, price, filled_at, stop])
             continue
         remaining, cost, matched = qty, 0.0, 0.0
         queue = lots.get(key, [])
@@ -1480,27 +1576,37 @@ def rebuild_trade_history(days=90, log=print):
             queue[0][0] -= take
             if queue[0][0] <= 1e-9:
                 queue.pop(0)
+        # Residui dovuti alle commissioni crypto (trattenute nella moneta): se dopo la vendita resta
+        # meno dell'1% di quanto venduto, la posizione è chiusa e i lotti vengono azzerati
+        if queue and sum(lot[0] for lot in queue) <= qty * 0.01:
+            queue.clear()
         if matched > 0:
             entry = cost / matched
             trades.append({
                 "symbol": o.symbol, "qty": round(matched, 8), "entry": round(entry, 6), "exit": round(price, 6),
                 "pnl": round((price - entry) * matched, 2), "pnl_pct": round((price / entry - 1) * 100, 2),
-                "closed_at": o.filled_at.astimezone(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-                if hasattr(o.filled_at, "astimezone") else str(o.filled_at)[:19],
+                "closed_at": filled_at.strftime("%Y-%m-%d %H:%M:%S") if filled_at else str(o.filled_at)[:19],
             })
-    try:
-        tmp = TRADE_HISTORY_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(trades, f, indent=2)
-        os.replace(tmp, TRADE_HISTORY_PATH)
-    except OSError as e:
-        log(f"[!] Impossibile salvare trade_history.json: {e}")
-    return trades
+    open_info = {}
+    for key, queue in lots.items():
+        if queue:
+            stops = [lot[3] for lot in queue if lot[3]]
+            open_info[key] = {"opened_at": queue[0][2], "stop_pct": stops[-1] if stops else None}
+    write_json_file(TRADE_HISTORY_PATH, trades)
+    return {"trades": trades, "open": open_info}
+
+
+def rebuild_trade_history(days=90, log=print):
+    """Compatibilità: solo l'elenco dei trade chiusi."""
+    ledger = sync_ledger(days, log)
+    return ledger["trades"] if ledger else None
 
 
 def win_rates(trades):
     stats = {}
     for t in trades or []:
+        if not isinstance(t, dict) or "symbol" not in t or "pnl" not in t:
+            continue
         s = stats.setdefault(normalize_symbol(t["symbol"]), {"trades": 0, "wins": 0, "pnl": 0.0})
         s["trades"] += 1
         s["wins"] += 1 if t["pnl"] > 0 else 0
@@ -1510,12 +1616,11 @@ def win_rates(trades):
     return stats
 
 
-def post_trade_auditor(analysis, log=print):
-    """Aggiorna lo storico e penalizza lo score dei ticker con win rate < 30% (almeno 3 trade)."""
-    trades = rebuild_trade_history(log=log)
-    if trades is None:
-        log("🧾 [Auditor] Storico non disponibile.")
-        return {}
+def post_trade_auditor(analysis, log=print, ledger=None):
+    """Penalizza lo score dei ticker con win rate < 30% (almeno 3 trade chiusi)."""
+    trades = ledger["trades"] if ledger else read_json_file(TRADE_HISTORY_PATH, [])
+    if not ledger:
+        log("🧾 [Auditor] Alpaca non disponibile: uso la copia locale di trade_history.json.")
     stats = win_rates(trades)
     penalized = []
     for key, a in analysis.items():
@@ -1526,8 +1631,8 @@ def post_trade_auditor(analysis, log=print):
             a["audit_penalty"] = AUDIT_PENALTY
             penalized.append(f"{a['symbol']} (win rate {s['win_rate']:.0f}% su {s['trades']})")
     total = len(trades)
-    wins = sum(1 for t in trades if t["pnl"] > 0)
-    pnl = sum(t["pnl"] for t in trades)
+    wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
+    pnl = sum(t.get("pnl", 0) for t in trades)
     log(f"🧾 [Auditor] {total} trade chiusi (90gg), win rate {wins / total * 100 if total else 0:.0f}%, "
         f"PnL realizzato ${pnl:,.2f}" + (f" | Penalità -{AUDIT_PENALTY}: {', '.join(penalized)}" if penalized else ""))
     return stats
@@ -1622,3 +1727,48 @@ def cio_stop(decision, vol_info):
     if stop is None or stop == 0:
         return vol_info["stop_pct"] if vol_info else None
     return round(max(STOP_WIDEST_PCT, min(STOP_TIGHTEST_PCT, stop)), 2)
+
+
+# ===========================================================================
+# AVVIO: sincronizzazione con Alpaca (unica fonte di verità)
+# ===========================================================================
+STARTUP_GRACE_SECONDS = 10
+
+
+def startup_system_sync(log=print):
+    """Eseguita all'avvio del server, dopo il grace period e prima del primo ciclo.
+
+    - legge da Alpaca conto, posizioni e ordini aperti (nessuno stato locale viene considerato);
+    - annulla gli ordini di ACQUISTO rimasti aperti dal deploy precedente (il ciclo di avvio non compra);
+    - mantiene gli ordini di VENDITA aperti (vendite difensive, es. stop loss in attesa dell'apertura).
+    """
+    if not alpaca_client:
+        log("🔄 [Sync] Credenziali Alpaca non configurate: sincronizzazione saltata.")
+        return None
+    summary = {"cancelled": [], "kept": []}
+    try:
+        acc = alpaca_client.get_account()
+        positions = alpaca_client.get_all_positions()
+        orders = alpaca_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    except Exception as e:
+        log(f"🔄 [Sync] Alpaca non raggiungibile all'avvio: {e}. Riprovo al primo ciclo.")
+        return None
+    for o in orders:
+        side = str(getattr(o.side, "value", o.side)).lower()
+        label = f"{side.upper()} {o.symbol} ({o.notional and f'${float(o.notional):,.2f}' or o.qty})"
+        if side == "buy":
+            try:
+                alpaca_client.cancel_order_by_id(o.id)
+                summary["cancelled"].append(label)
+            except Exception as e:
+                log(f"🔄 [Sync] Impossibile annullare {label}: {e}")
+        else:
+            summary["kept"].append(label)
+    exposure = sum(abs(float(p.market_value)) for p in positions)
+    log(f"🔄 [Sync] Stato Alpaca: capitale ${float(acc.equity):,.0f}, cash ${float(acc.cash):,.0f}, "
+        f"{len(positions)} posizioni (${exposure:,.0f}), {len(orders)} ordini aperti")
+    if summary["cancelled"]:
+        log(f"🔄 [Sync] Annullati acquisti pendenti dal deploy precedente: {', '.join(summary['cancelled'])}")
+    if summary["kept"]:
+        log(f"🔄 [Sync] Vendite pendenti mantenute: {', '.join(summary['kept'])}")
+    return summary
