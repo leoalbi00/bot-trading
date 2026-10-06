@@ -239,10 +239,12 @@ def rotate_capital(target, target_score, holdings, auto_trade, pending):
         return True
 
     proceeds = float(filled.filled_qty or 0) * float(filled.filled_avg_price or 0)
-    funds = core.available_funds(get_account_summary(), crypto=core.is_crypto(target))
+    # Reinveste solo entro il limite di esposizione (se il conto era sovraesposto la vendita riduce la leva)
+    exposure_after = sum(abs(h["pos"]["market_value"]) for h in holdings)
+    funds, _ = core.buy_budget(get_account_summary(), exposure_after, core.get_config(), crypto=core.is_crypto(target))
     amount = min(proceeds, funds)
     if amount < core.MIN_ORDER_USD:
-        log_message(f"🔄 Fondi dalla vendita non ancora disponibili (${funds:,.2f}): acquisto di {target} rimandato.")
+        log_message(f"🔄 Nessun reinvestimento in {target}: fondi entro il limite di esposizione ${funds:,.2f}.")
         return True
     execute_buy(target, amount, auto_trade, pending, label="ACQUISTO DA ROTAZIONE")
     return True
@@ -389,6 +391,11 @@ def run_trading_cycle(manual=False):
         log_message(f"Asset selezionati per analisi BUY: {[(c['symbol'], c['score']) for c in top_3]}")
 
         acc = get_account_summary()
+        exposure = sum(abs(p["market_value"]) for p in open_positions)
+        log_message(
+            f"Esposizione attuale ${exposure:,.0f} su capitale ${acc.get('portfolio', 0):,.0f} "
+            f"(limite {cfg['max_exposure_pct']:.0f}%)"
+        )
         rotated = False
         for asset in top_3:
             if not manual and should_abort():
@@ -422,10 +429,10 @@ def run_trading_cycle(manual=False):
             if not is_buy:
                 continue
 
-            funds = core.available_funds(acc, crypto=crypto)
-            allocation = funds * cfg["max_allocation_pct"] / 100
+            funds, allocation = core.buy_budget(acc, exposure, cfg, crypto=crypto)
             if allocation >= core.MIN_ORDER_USD:
                 if execute_buy(sym, allocation, auto_trade, pending):
+                    exposure += allocation
                     acc["buying_power"] = acc.get("buying_power", 0) - allocation
                     acc["non_marginable_buying_power"] = acc.get("non_marginable_buying_power", 0) - allocation
             elif funds <= core.ROTATION_FUNDS_THRESHOLD and score >= core.ROTATION_MIN_SCORE and not rotated:

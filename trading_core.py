@@ -84,6 +84,7 @@ DEFAULT_CONFIG = {
         "NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META", "PLTR", "COIN", "SMCI",
     ],
     "max_allocation_pct": 15.0,
+    "max_exposure_pct": 100.0,
     "stop_loss_pct": -5.0,
     "scan_interval_min": 15,
     "auto_execute_trades": True,
@@ -128,6 +129,7 @@ def _validate_config(data, base):
             cfg[key] = value
 
     number("max_allocation_pct", 0.5, 100.0)
+    number("max_exposure_pct", 10.0, 400.0)
     number("stop_loss_pct", -50.0, -0.5)
     number("scan_interval_min", 1, 1440, int)
 
@@ -742,6 +744,23 @@ def submit_notional_buy(yf_symbol, amount_usd):
 def close_position(alpaca_symbol):
     """Chiude l'intera posizione (gestisce anche le quantità frazionarie)."""
     return alpaca_client.close_position(alpaca_symbol)
+
+
+def buy_budget(account, exposure, cfg, crypto=False):
+    """(fondi disponibili, importo del prossimo ordine) rispettando i limiti di rischio.
+
+    - L'ordine è max_allocation_pct del CAPITALE (equity), non del buying power a margine.
+    - L'esposizione totale (valore delle posizioni + nuovi ordini) non supera max_exposure_pct
+      del capitale: con 100% il bot non usa mai il margine.
+    """
+    try:
+        equity = max(0.0, float(account.get("portfolio", account.get("equity", 0)) or 0))
+    except (TypeError, ValueError):
+        equity = 0.0
+    room = equity * cfg["max_exposure_pct"] / 100 - exposure
+    funds = max(0.0, min(available_funds(account, crypto), room))
+    allocation = min(equity * cfg["max_allocation_pct"] / 100, funds)
+    return funds, allocation
 
 
 def available_funds(account, crypto=False):

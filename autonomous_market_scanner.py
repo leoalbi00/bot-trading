@@ -182,8 +182,9 @@ def evaluate_and_trade(asset, positions, pending, market_open):
             if not core.is_crypto(asset['symbol']) and not market_open:
                 print(f"[i] Mercato azionario chiuso: acquisto di {asset['symbol']} non inviato.")
                 return
-            funds = core.available_funds(get_account_summary(), crypto=core.is_crypto(asset['symbol']))
-            allocation = funds * core.get_config()['max_allocation_pct'] / 100
+            exposure = sum(abs(p['market_value']) for p in positions.values())
+            funds, allocation = core.buy_budget(get_account_summary(), exposure, core.get_config(),
+                                                crypto=core.is_crypto(asset['symbol']))
             if funds <= core.MIN_ORDER_USD:
                 print(f"[Trading] Liquidità disponibile insufficiente per nuovi acquisti (${funds:,.2f})")
             elif allocation >= core.MIN_ORDER_USD:

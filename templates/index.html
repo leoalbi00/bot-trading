@@ -138,8 +138,13 @@
                                class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
                     </label>
                     <label class="block">
-                        <span class="text-[10px] text-zinc-400 uppercase">% Allocazione Capitale (per ordine)</span>
+                        <span class="text-[10px] text-zinc-400 uppercase">% del Capitale per ordine</span>
                         <input id="setAllocation" type="number" step="0.5" min="0.5" max="100"
+                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
+                    </label>
+                    <label class="block">
+                        <span class="text-[10px] text-zinc-400 uppercase">Esposizione massima % del capitale (100 = niente margine)</span>
+                        <input id="setExposure" type="number" step="5" min="10" max="400"
                                class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
                     </label>
                     <label class="block">
@@ -375,6 +380,7 @@
             renderWatchlist();
             document.getElementById('setStopLoss').value = cfg.stop_loss_pct;
             document.getElementById('setAllocation').value = cfg.max_allocation_pct;
+            document.getElementById('setExposure').value = cfg.max_exposure_pct;
             document.getElementById('setInterval').value = cfg.scan_interval_min;
             document.getElementById('setAutoTrade').checked = Boolean(cfg.auto_execute_trades);
             document.getElementById('setKeepAlive').checked = Boolean(cfg.keep_alive_enabled);
@@ -408,6 +414,7 @@
                 watchlist,
                 stop_loss_pct: Number(document.getElementById('setStopLoss').value),
                 max_allocation_pct: Number(document.getElementById('setAllocation').value),
+                max_exposure_pct: Number(document.getElementById('setExposure').value),
                 scan_interval_min: Number(document.getElementById('setInterval').value),
                 auto_execute_trades: document.getElementById('setAutoTrade').checked,
                 keep_alive_enabled: document.getElementById('setKeepAlive').checked,
