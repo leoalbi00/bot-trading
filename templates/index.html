@@ -100,7 +100,7 @@
                 </div>
                 <div class="mt-4">
                     <div class="text-2xl font-bold tabular-nums text-white" id="cashBalance">--</div>
-                    <div class="text-xs text-zinc-500 mt-1 font-mono" id="cashRatio">Quota Cash: --</div>
+                    <div class="text-xs text-zinc-500 mt-1 font-mono" id="cashRatio">Buying Power: --</div>
                 </div>
             </div>
 
@@ -169,71 +169,69 @@
 
         async function fetchStatus() {
             try {
-                let res = await fetch('/api/data');
-                if (!res.ok) {
-                    res = await fetch('/api/status');
-                }
+                const res = await fetch('/api/data');
                 if (!res.ok) throw new Error(`HTTP status ${res.status}`);
 
                 const data = await res.json();
 
-                // Portfolio Value
-                const val = data.portfolio_value ?? data.equity;
+                // 1. Lettura Dati Account (supporta sia data.account che struttura piatta)
+                const account = data.account || {};
+                const val = account.portfolio ?? data.portfolio_value ?? data.equity;
                 if (val !== undefined) {
-                    document.getElementById('portfolioValue').textContent = typeof val === 'number' 
+                    document.getElementById('portfolioValue').textContent = typeof val === 'number'
                         ? `$${val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                         : val;
                 }
 
-                // PnL
-                if (data.pnl !== undefined) {
-                    document.getElementById('portfolioPnL').textContent = `PnL: ${data.pnl}`;
-                }
-
-                // Cash
-                const cash = data.cash;
+                const cash = account.cash ?? data.cash;
                 if (cash !== undefined) {
                     document.getElementById('cashBalance').textContent = typeof cash === 'number'
                         ? `$${cash.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                         : cash;
                 }
 
-                // Cash Ratio / Buying Power
-                if (data.cash_ratio !== undefined) {
+                const buyingPower = account.buying_power ?? data.buying_power;
+                if (buyingPower !== undefined) {
+                    document.getElementById('cashRatio').textContent = `Buying Power: $${Number(buyingPower).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+                } else if (data.cash_ratio !== undefined) {
                     document.getElementById('cashRatio').textContent = `Quota Cash: ${data.cash_ratio}`;
-                } else if (data.buying_power !== undefined) {
-                    document.getElementById('cashRatio').textContent = `Buying Power: $${Number(data.buying_power).toFixed(2)}`;
                 }
 
-                // Last Scan
-                if (data.last_scan) {
-                    document.getElementById('lastScanTime').textContent = data.last_scan;
-                } else {
-                    document.getElementById('lastScanTime').textContent = new Date().toLocaleTimeString('it-IT');
+                if (data.pnl !== undefined) {
+                    document.getElementById('portfolioPnL').textContent = `PnL: ${data.pnl}`;
                 }
 
-                if (data.scan_status) {
-                    document.getElementById('lastScanStatus').textContent = `Stato: ${data.scan_status}`;
-                } else {
-                    document.getElementById('lastScanStatus').textContent = `Stato: Attivo`;
+                // 2. Lettura Dati Bot e Log Terminale
+                const bot = data.bot || {};
+                const lastScan = bot.last_scan || data.last_scan;
+                if (lastScan) {
+                    document.getElementById('lastScanTime').textContent = lastScan;
                 }
 
-                // Live Terminal Logs
-                if (Array.isArray(data.logs) && data.logs.length > 0) {
+                const statusMsg = data.status || data.scan_status;
+                if (statusMsg) {
+                    document.getElementById('lastScanStatus').textContent = `Stato: ${statusMsg}`;
+                }
+
+                const logs = bot.logs || data.logs;
+                if (Array.isArray(logs) && logs.length > 0) {
                     const container = document.getElementById('terminalContainer');
-                    container.innerHTML = data.logs.map(l => `<div class="text-zinc-300 leading-relaxed break-all">${l}</div>`).join('');
-                    container.scrollTop = container.scrollHeight;
+                    if (container) {
+                        container.innerHTML = logs.map(l => `<div class="text-zinc-300 leading-relaxed break-all">${l}</div>`).join('');
+                        container.scrollTop = container.scrollHeight;
+                    }
                 }
 
-                if (data.is_running !== undefined) {
+                if (bot.active !== undefined) {
+                    isRunning = Boolean(bot.active);
+                } else if (data.is_running !== undefined) {
                     isRunning = Boolean(data.is_running);
-                } else {
-                    isRunning = true;
                 }
+
                 updateBotStatusDisplay();
 
             } catch (err) {
-                document.getElementById('botStatusText').textContent = 'In attesa risposta backend...';
+                document.getElementById('botStatusText').textContent = 'Connessione al server...';
                 document.getElementById('statusIndicator').className = 'h-2.5 w-2.5 rounded-full bg-amber-500 animate-pulse';
             }
         }
@@ -263,7 +261,13 @@
             addLog('Avvio scansione manuale...', 'system');
             try {
                 const res = await fetch('/api/scan', { method: 'POST' });
-                const data = await res.json();
+                const text = await res.text();
+                let data;
+                try {
+                    data = JSON.parse(text);
+                } catch (e) {
+                    throw new Error('Risposta del server non valida');
+                }
                 addLog(data.message || 'Scansione completata con successo', 'success');
                 fetchStatus();
             } catch (err) {
