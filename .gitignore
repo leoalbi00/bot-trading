@@ -10,3 +10,6 @@ bot_activity.log
 config.json
 config.json.tmp
 credenziali.txt
+trade_history.json
+boardroom_state.json
+*.json.tmp

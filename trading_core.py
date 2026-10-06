@@ -559,22 +559,54 @@ def _ask_gemini(prompt, log, system=None, validate=_has_decision):
 # ---------------------------------------------------------------------------
 # Dati di mercato
 # ---------------------------------------------------------------------------
+FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
+CRYPTO_NAMES = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "AVAX": "avalanche",
+                "ADA": "cardano", "DOGE": "dogecoin", "XRP": "xrp", "LTC": "litecoin", "DOT": "polkadot"}
+_crypto_news_cache = {"ts": 0.0, "items": []}
+
+
 def get_recent_news(yf_symbol, limit=3):
-    """Ultimi titoli di notizie tramite yfinance (compatibile con vecchio e nuovo formato)."""
+    """Ultimi titoli di notizie: yfinance, poi Finnhub come riserva (azioni e crypto)."""
+    titles = []
     try:
-        news = yf.Ticker(yf_symbol).news or []
-        titles = []
-        for item in news:
+        for item in yf.Ticker(yf_symbol).news or []:
             title = item.get("title") or (item.get("content") or {}).get("title")
             if title:
                 titles.append(title)
             if len(titles) >= limit:
                 break
-        if titles:
-            return " | ".join(titles)
     except Exception:
         pass
-    return "Nessuna notizia rilevante recente."
+    if not titles:
+        titles = _finnhub_headlines(yf_symbol, limit)
+    return " | ".join(titles) if titles else "Nessuna notizia rilevante recente."
+
+
+def _finnhub_headlines(yf_symbol, limit):
+    if not FINNHUB_KEY:
+        return []
+    import requests
+    from datetime import date, timedelta
+    try:
+        if is_crypto(yf_symbol):
+            # Notizie crypto generali (cache 10 minuti) filtrate per ticker o nome della moneta
+            if time.time() - _crypto_news_cache["ts"] > 600:
+                r = requests.get("https://finnhub.io/api/v1/news", params={"category": "crypto", "token": FINNHUB_KEY},
+                                 timeout=HTTP_TIMEOUT)
+                _crypto_news_cache.update(ts=time.time(), items=r.json() if r.ok else [])
+            base = yf_symbol.upper().split("-")[0]
+            name = CRYPTO_NAMES.get(base, base.lower())
+            pattern = re.compile(rf"\b({re.escape(base)}|{re.escape(name)})\b", re.IGNORECASE)
+            return [a["headline"] for a in _crypto_news_cache["items"]
+                    if a.get("headline") and pattern.search(a["headline"])][:limit]
+        today = date.today()
+        r = requests.get("https://finnhub.io/api/v1/company-news", timeout=HTTP_TIMEOUT, params={
+            "symbol": yf_symbol, "from": (today - timedelta(days=7)).isoformat(), "to": today.isoformat(),
+            "token": FINNHUB_KEY})
+        items = r.json() if r.ok else []
+        return [a["headline"] for a in items if isinstance(a, dict) and a.get("headline")][:limit]
+    except Exception:
+        return []
 
 
 def get_indicators(yf_symbol):
@@ -586,13 +618,17 @@ def get_indicators(yf_symbol):
         df = yf.Ticker(yf_symbol).history(period="3mo", interval="1h")
         if len(df) < 60:
             return None
-        return compute_indicators(df["Close"])
+        return compute_indicators(df["Close"], volume=df["Volume"])
     except Exception:
         return None
 
 
-def compute_indicators(close):
-    """Calcola gli indicatori da una serie di prezzi di chiusura (almeno 60 valori)."""
+def compute_indicators(close, volume=None):
+    """Calcola gli indicatori da una serie di prezzi di chiusura (almeno 60 valori).
+
+    Con `volume` calcola anche vol_ratio: volume dell'ultima candela COMPLETA
+    (la più recente di yfinance è ancora in corso) diviso la media dei 20 periodi precedenti.
+    """
     macd = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
     hist = macd.macd_diff()
     # Incrocio MACD/segnale nelle ultime 3 candele
@@ -613,7 +649,28 @@ def compute_indicators(close):
         "roc": round(float(ta.momentum.ROCIndicator(close, window=10).roc().iloc[-1]), 2),
         "sma20": float(ta.trend.SMAIndicator(close, window=20).sma_indicator().iloc[-1]),
         "sma50": float(ta.trend.SMAIndicator(close, window=50).sma_indicator().iloc[-1]),
+        "vol_ratio": _volume_ratio(volume),
     }
+
+
+def _volume_ratio(volume):
+    """Volume dell'ultima candela completa rispetto alla media della STESSA ORA nei giorni precedenti.
+
+    Il volume intraday ha un andamento a U (alto in apertura e chiusura): confrontarlo con la media
+    delle ultime 20 ore segnalerebbe ogni ora centrale come "bassa liquidità". Senza abbastanza
+    campioni orari si usa la media dei 20 periodi precedenti.
+    """
+    if volume is None or len(volume) < 22:
+        return None
+    last = float(volume.iloc[-2])
+    history = volume.iloc[:-2]
+    try:
+        same_hour = history[history.index.hour == volume.index[-2].hour].iloc[-20:]
+    except AttributeError:
+        same_hour = history.iloc[:0]
+    sample = same_hour if len(same_hour) >= 5 else history.iloc[-20:]
+    avg = float(sample.mean())
+    return round(last / avg, 2) if avg > 0 else None
 
 
 def ta_score(ind):
@@ -794,7 +851,7 @@ def allocation_pct_for_score(score, cfg):
     return max(min(base, cap), min(strong, cap))
 
 
-def buy_budget(account, exposure, cfg, crypto=False, score=None):
+def buy_budget(account, exposure, cfg, crypto=False, score=None, pct=None, factor=1.0):
     """(fondi disponibili, importo del prossimo ordine) rispettando i limiti di rischio.
 
     - L'ordine è una percentuale del CAPITALE (equity) che cresce con lo score
@@ -808,7 +865,8 @@ def buy_budget(account, exposure, cfg, crypto=False, score=None):
         equity = 0.0
     room = equity * cfg["max_exposure_pct"] / 100 - exposure
     funds = max(0.0, min(available_funds(account, crypto), room))
-    allocation = min(equity * allocation_pct_for_score(score, cfg) / 100, funds)
+    pct = allocation_pct_for_score(score, cfg) if pct is None else pct
+    allocation = min(equity * pct * factor / 100, funds)
     return funds, allocation
 
 
@@ -862,7 +920,7 @@ def market_analyst(symbols, log=print):
 _stall_streaks = {}
 
 
-def risk_manager(positions, analysis, account, cfg, log=print):
+def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trailing=None):
     """FASE 2: classifica ogni posizione e calcola fondi ed esposizione.
 
     Stati: STOP_LOSS, RIBASSISTA, STALLO (prolungato) -> vendita obbligatoria;
@@ -883,8 +941,12 @@ def risk_manager(positions, analysis, account, cfg, log=print):
         streak = _stall_streaks.get(key, 0) + 1 if stalled_now else 0
         _stall_streaks[key] = streak
 
-        if pl <= cfg["stop_loss_pct"]:
-            status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ stop loss {cfg['stop_loss_pct']:.1f}%"
+        stop = (stops or {}).get(key, cfg["stop_loss_pct"])
+        trail = (trailing or {}).get(key)
+        if pl <= stop:
+            status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ stop loss {stop:.1f}%"
+        elif trail and trail.get("hit"):
+            status, reason = "TRAILING_STOP", trail["reason"]
         elif not a:
             status, reason = "NO_DATA", "indicatori non disponibili"
         else:
@@ -1006,7 +1068,16 @@ def parse_broker_json(text):
         "buy_symbol": str(data.get("buy_symbol") or "").strip().upper(),
         "reason": str(data.get("reason") or "").strip(),
         "score": _clean_score(data.get("score")),
+        "allocation_pct": _clean_number(data.get("allocation_pct")),
+        "dynamic_stop_loss_pct": _clean_number(data.get("dynamic_stop_loss_pct")),
     }
+
+
+def _clean_number(value):
+    try:
+        return float(str(value).replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _clean_score(value):
@@ -1016,12 +1087,12 @@ def _clean_score(value):
         return None
 
 
-def ask_broker_ai(prompt, log=print):
+def ask_broker_ai(prompt, log=print, system=None):
     """Interroga l'IA del Broker secondo ai_provider. Restituisce (decisione, motore) o (None, None)."""
     provider = _resolve_provider(get_config()["ai_provider"], log)
     if provider == "quant":
         return None, None
-    ask = lambda fn: parse_broker_json(fn(prompt, log, system=BROKER_SYSTEM_PROMPT,
+    ask = lambda fn: parse_broker_json(fn(prompt, log, system=system or BROKER_SYSTEM_PROMPT,
                                           validate=lambda t: parse_broker_json(t) is not None,
                                           **({"max_tokens": 2048} if fn is _ask_groq else {})))
     if provider == "hybrid":
@@ -1122,3 +1193,420 @@ def validate_broker_decision(decision, risk, candidates, sold_keys=(), log=print
         return hold(f"Rotazione scartata: vantaggio {buy['symbol']} {buy['score']} vs {sell['pos']['yf_symbol']} "
                     f"{sell['score']} inferiore a {ROTATION_MIN_EDGE} punti")
     return {**decision, "action": "ROTATE", "sell_symbol": sell["pos"]["yf_symbol"], "buy_symbol": buy["symbol"]}
+
+
+# ===========================================================================
+# VIRTUAL BOARDROOM: 8 agenti quantitativi
+#   1 Market Analyst        -> market_analyst (RSI, MACD, SMA20/50, ROC, Score di Forza)
+#   2 Sentiment Intelligence-> sentiment_agent (veto BUY se sentiment < -40)
+#   3 Volatility Manager    -> volatility_agent (ATR giornaliero, stop dinamico, trailing stop)
+#   4 Macro Regime Analyst  -> macro_regime (SPY / BTC sotto SMA50 -> budget -50%)
+#   5 Volume & Liquidity    -> volume_agent (vol_ratio < 0.8 con prezzo in salita = falso breakout)
+#   6 Drawdown Controller   -> drawdown_controller (perdita giornaliera > 5% -> stop acquisti 24h)
+#   7 Post-Trade Auditor    -> post_trade_auditor (trade_history.json, win rate per ticker)
+#   8 CIO / Portfolio Broker-> build_cio_prompt + ask_broker_ai (una chiamata JSON)
+# ===========================================================================
+DATA_DIR = os.getenv("BOT_DATA_DIR", os.path.dirname(CONFIG_PATH))
+TRADE_HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.json")
+BOARDROOM_STATE_PATH = os.path.join(DATA_DIR, "boardroom_state.json")
+
+SENTIMENT_VETO = -40
+ATR_MULT_STOCK = 1.5
+ATR_MULT_CRYPTO = 2.0
+STOP_TIGHTEST_PCT = -2.0       # limiti dello stop dinamico
+STOP_WIDEST_PCT = -15.0
+MACRO_RISK_OFF_FACTOR = 0.5
+VOLUME_LOW_RATIO = 0.8
+DAILY_DRAWDOWN_LIMIT = -5.0
+DRAWDOWN_BLOCK_HOURS = 24
+AUDIT_MIN_TRADES = 3
+AUDIT_LOW_WINRATE = 30.0
+AUDIT_PENALTY = 15
+
+_state_lock = threading.Lock()
+
+
+def load_state():
+    """Stato persistente del boardroom (picchi per trailing stop, stop assegnati, blocco drawdown)."""
+    with _state_lock:
+        try:
+            with open(BOARDROOM_STATE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except (OSError, ValueError):
+            pass
+        return {}
+
+
+def save_state(state):
+    with _state_lock:
+        try:
+            tmp = BOARDROOM_STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, BOARDROOM_STATE_PATH)
+        except OSError as e:
+            print(f"[!] Impossibile salvare lo stato del boardroom: {e}")
+
+
+# ---------------- Agente 2: Sentiment Intelligence ----------------
+_POSITIVE_STEMS = (
+    "beat", "surge", "soar", "rall", "upgrad", "record", "growth", "gain", "bullish", "outperform", "raise",
+    "strong", "jump", "rise", "rising", "profit", "boost", "expan", "partnership", "approv", "breakthrough",
+    "optimis", "top", "win", "accelerat", "buyback", "dividend",
+)
+_NEGATIVE_STEMS = (
+    "miss", "plung", "drop", "fall", "downgrad", "lawsuit", "sue", "probe", "investigat", "fraud", "bearish",
+    "cut", "weak", "loss", "declin", "selloff", "sell-off", "slump", "recall", "bankrupt", "warn", "layoff",
+    "tumbl", "crash", "sink", "fear", "concern", "halt", "ban", "fine", "hack", "breach", "delay", "slow",
+    "underperform", "risk", "short",
+)
+
+
+def sentiment_score(text):
+    """Sentiment dei titoli da -100 a +100 (dizionario di parole chiave finanziarie).
+
+    Restituisce (score, parole rilevanti trovate). Con poche parole lo score viene attenuato.
+    """
+    if not text or text.startswith("Nessuna notizia"):
+        return 0, 0
+    words = re.findall(r"[a-z][a-z\-]+", text.lower())
+    pos = sum(1 for w in words if w.startswith(_POSITIVE_STEMS))
+    neg = sum(1 for w in words if w.startswith(_NEGATIVE_STEMS))
+    total = pos + neg
+    if not total:
+        return 0, 0
+    return int(round((pos - neg) / total * 100 * min(1.0, total / 3))), total
+
+
+def sentiment_agent(symbols, log=print):
+    """Notizie e sentiment per i simboli indicati. Veto agli acquisti se sentiment < SENTIMENT_VETO."""
+    out = {}
+    for sym in symbols:
+        news = get_recent_news(sym)
+        score, hits = sentiment_score(news)
+        out[normalize_symbol(sym)] = {"symbol": sym, "news": news, "sentiment": score, "hits": hits,
+                                      "veto": score < SENTIMENT_VETO}
+    vetoed = [f"{v['symbol']} ({v['sentiment']})" for v in out.values() if v["veto"]]
+    summary = ", ".join(f"{v['symbol']} {v['sentiment']:+d}" for v in out.values())
+    log(f"📰 [Sentiment] {summary or '-'}" + (f" | VETO BUY: {', '.join(vetoed)}" if vetoed else ""))
+    return out
+
+
+# ---------------- Agente 3: Volatility Manager ----------------
+def get_daily_bars(yf_symbol, period="6mo"):
+    try:
+        df = yf.Ticker(yf_symbol).history(period=period, interval="1d")
+        return df if len(df) >= 55 else None
+    except Exception:
+        return None
+
+
+def atr_pct(df):
+    """ATR(14) giornaliero in percentuale del prezzo."""
+    atr = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
+    return round(float(atr.iloc[-1]) / float(df["Close"].iloc[-1]) * 100, 2)
+
+
+def dynamic_stop_pct(atr_percent, crypto):
+    mult = ATR_MULT_CRYPTO if crypto else ATR_MULT_STOCK
+    return round(max(STOP_WIDEST_PCT, min(STOP_TIGHTEST_PCT, -mult * atr_percent)), 2)
+
+
+def volatility_agent(symbols, positions, state, cfg, log=print):
+    """ATR, stop dinamico per ogni simbolo e trailing stop per le posizioni aperte.
+
+    Restituisce (vol, stops, trailing): vol[key] = {atr_pct, stop_pct}; stops[key] = stop in vigore
+    per le posizioni (quello assegnato dal CIO o, in mancanza, quello da ATR); trailing[key] = esito.
+    """
+    vol = {}
+    for sym in symbols:
+        df = get_daily_bars(sym)
+        if df is None:
+            continue
+        a = atr_pct(df)
+        vol[normalize_symbol(sym)] = {"atr_pct": a, "stop_pct": dynamic_stop_pct(a, is_crypto(sym))}
+
+    peaks = state.setdefault("peaks", {})
+    assigned = state.setdefault("stops", {})
+    held = {normalize_symbol(p["symbol"]) for p in positions}
+    for key in list(peaks):
+        if key not in held:
+            peaks.pop(key, None)
+            assigned.pop(key, None)
+
+    stops, trailing, parts = {}, {}, []
+    for p in positions:
+        key = normalize_symbol(p["symbol"])
+        v = vol.get(normalize_symbol(p["yf_symbol"]))
+        stop = assigned.get(key, v["stop_pct"] if v else cfg["stop_loss_pct"])
+        stops[key] = stop
+        price, entry = p["current_price"], p.get("avg_entry_price") or p["current_price"]
+        peak = max(float(peaks.get(key, 0)), price, entry)
+        peaks[key] = peak
+        if v:
+            trail_pct = (ATR_MULT_CRYPTO if p["is_crypto"] else ATR_MULT_STOCK) * v["atr_pct"]
+            active = peak >= entry * (1 + trail_pct / 100)
+            trigger = peak * (1 - trail_pct / 100)
+            hit = active and price <= trigger
+            trailing[key] = {
+                "active": active, "hit": hit, "trigger": trigger,
+                "reason": f"prezzo ${price:.2f} sotto il trailing stop ${trigger:.2f} (picco ${peak:.2f} - {trail_pct:.1f}%)",
+            }
+            parts.append(f"{p['symbol']} ATR {v['atr_pct']:.1f}% stop {stop:.1f}%"
+                         + (f" trailing ${trigger:.2f}" if active else ""))
+        else:
+            parts.append(f"{p['symbol']} stop {stop:.1f}% (ATR N/D)")
+    cands = [f"{v_sym} stop {v['stop_pct']:.1f}%" for v_sym, v in vol.items() if v_sym not in held]
+    log(f"📏 [Volatilità] Posizioni: {'; '.join(parts) or '-'}" + (f" | Candidati: {', '.join(cands)}" if cands else ""))
+    return vol, stops, trailing
+
+
+# ---------------- Agente 4: Macro Regime Analyst ----------------
+def macro_regime(log=print):
+    """Regime di mercato: SPY (azioni) e BTC (crypto) rispetto alla SMA50 giornaliera."""
+    out = {}
+    for cls, sym in (("stock", "SPY"), ("crypto", "BTC-USD")):
+        df = get_daily_bars(sym)
+        if df is None:
+            out[cls] = {"symbol": sym, "regime": "N/D", "factor": 1.0, "detail": "dati non disponibili"}
+            continue
+        price = float(df["Close"].iloc[-1])
+        sma50 = float(df["Close"].rolling(50).mean().iloc[-1])
+        risk_off = price < sma50
+        out[cls] = {
+            "symbol": sym, "regime": "RISK-OFF" if risk_off else "RISK-ON",
+            "factor": MACRO_RISK_OFF_FACTOR if risk_off else 1.0,
+            "detail": f"{sym} ${price:,.2f} {'<' if risk_off else '>'} SMA50 ${sma50:,.2f}",
+        }
+    log("🌍 [Macro] " + " | ".join(
+        f"{'Azioni' if c == 'stock' else 'Crypto'}: {m['regime']} ({m['detail']})"
+        + (" → budget -50%" if m["factor"] < 1 else "") for c, m in out.items()))
+    return out
+
+
+# ---------------- Agente 5: Volume & Liquidity ----------------
+def volume_agent(analysis, log=print):
+    """Segnala i falsi breakout: prezzo in salita (ROC > 0) con volume < 0.8x la media."""
+    flags = {}
+    for key, a in analysis.items():
+        ratio, roc = a["ind"].get("vol_ratio"), a["ind"]["roc"]
+        if ratio is None:
+            status = "N/D"
+        elif roc > 0 and ratio < VOLUME_LOW_RATIO:
+            status = "FALSO_BREAKOUT"
+        elif ratio >= 1.5:
+            status = "VOLUMI_FORTI"
+        else:
+            status = "OK"
+        flags[key] = {"ratio": ratio, "status": status}
+    fake = [a["symbol"] for k, a in analysis.items() if flags[k]["status"] == "FALSO_BREAKOUT" and a["class"] == "BUY"]
+    strong = [a["symbol"] for k, a in analysis.items() if flags[k]["status"] == "VOLUMI_FORTI"]
+    log(f"📶 [Volumi] Falso breakout/bassa liquidità: {', '.join(fake) or '-'} | Volumi forti: {', '.join(strong) or '-'}")
+    return flags
+
+
+# ---------------- Agente 6: Drawdown & Risk Controller ----------------
+def drawdown_controller(account, state, log=print):
+    """Perdita del giorno rispetto al massimo tra chiusura precedente e picco intraday.
+
+    Oltre DAILY_DRAWDOWN_LIMIT blocca i nuovi acquisti per DRAWDOWN_BLOCK_HOURS (solo vendite difensive).
+    """
+    now = time.time()
+    today = time.strftime("%Y-%m-%d")
+    equity = float(account.get("portfolio", 0) or 0)
+    last_equity = float(account.get("last_equity", 0) or 0) or equity
+    dd_state = state.setdefault("drawdown", {})
+    if dd_state.get("date") != today:
+        dd_state.update({"date": today, "peak": 0.0})
+    peak = max(last_equity, float(dd_state.get("peak", 0)), equity)
+    dd_state["peak"] = peak
+    drawdown = (equity / peak - 1) * 100 if peak else 0.0
+    if drawdown <= DAILY_DRAWDOWN_LIMIT and now >= float(dd_state.get("block_until", 0)):
+        dd_state["block_until"] = now + DRAWDOWN_BLOCK_HOURS * 3600
+        log(f"🚫 [Drawdown] Perdita giornaliera {drawdown:.2f}% oltre {DAILY_DRAWDOWN_LIMIT:.0f}%: "
+            f"acquisti bloccati per {DRAWDOWN_BLOCK_HOURS} ore.")
+    blocked = now < float(dd_state.get("block_until", 0))
+    remaining = max(0, float(dd_state.get("block_until", 0)) - now) / 3600
+    log(f"📉 [Drawdown] Oggi {drawdown:+.2f}% (capitale ${equity:,.0f}, riferimento ${peak:,.0f})"
+        + (f" | ACQUISTI BLOCCATI ancora per {remaining:.1f}h" if blocked else " | acquisti consentiti"))
+    return {"drawdown_pct": round(drawdown, 2), "blocked": blocked, "hours_left": round(remaining, 1)}
+
+
+# ---------------- Agente 7: Post-Trade Auditor ----------------
+def rebuild_trade_history(days=90, log=print):
+    """Ricostruisce i trade chiusi (FIFO) dagli ordini eseguiti su Alpaca e li salva in trade_history.json."""
+    if not alpaca_client:
+        return None
+    from datetime import datetime, timedelta, timezone
+    try:
+        orders = alpaca_client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED, limit=500, direction="asc",
+            after=datetime.now(timezone.utc) - timedelta(days=days)))
+    except Exception as e:
+        log(f"Errore lettura storico ordini: {e}")
+        return None
+
+    lots, trades = {}, []
+    for o in orders:
+        qty = float(o.filled_qty or 0)
+        price = float(o.filled_avg_price or 0)
+        if qty <= 0 or price <= 0:
+            continue
+        key = normalize_symbol(o.symbol)
+        side = str(getattr(o.side, "value", o.side)).lower()
+        if side == "buy":
+            lots.setdefault(key, []).append([qty, price])
+            continue
+        remaining, cost, matched = qty, 0.0, 0.0
+        queue = lots.get(key, [])
+        while remaining > 1e-9 and queue:
+            take = min(remaining, queue[0][0])
+            cost += take * queue[0][1]
+            matched += take
+            remaining -= take
+            queue[0][0] -= take
+            if queue[0][0] <= 1e-9:
+                queue.pop(0)
+        if matched > 0:
+            entry = cost / matched
+            trades.append({
+                "symbol": o.symbol, "qty": round(matched, 8), "entry": round(entry, 6), "exit": round(price, 6),
+                "pnl": round((price - entry) * matched, 2), "pnl_pct": round((price / entry - 1) * 100, 2),
+                "closed_at": str(o.filled_at)[:19],
+            })
+    try:
+        tmp = TRADE_HISTORY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(trades, f, indent=2)
+        os.replace(tmp, TRADE_HISTORY_PATH)
+    except OSError as e:
+        log(f"[!] Impossibile salvare trade_history.json: {e}")
+    return trades
+
+
+def win_rates(trades):
+    stats = {}
+    for t in trades or []:
+        s = stats.setdefault(normalize_symbol(t["symbol"]), {"trades": 0, "wins": 0, "pnl": 0.0})
+        s["trades"] += 1
+        s["wins"] += 1 if t["pnl"] > 0 else 0
+        s["pnl"] = round(s["pnl"] + t["pnl"], 2)
+    for s in stats.values():
+        s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1)
+    return stats
+
+
+def post_trade_auditor(analysis, log=print):
+    """Aggiorna lo storico e penalizza lo score dei ticker con win rate < 30% (almeno 3 trade)."""
+    trades = rebuild_trade_history(log=log)
+    if trades is None:
+        log("🧾 [Auditor] Storico non disponibile.")
+        return {}
+    stats = win_rates(trades)
+    penalized = []
+    for key, a in analysis.items():
+        s = stats.get(key)
+        if s and s["trades"] >= AUDIT_MIN_TRADES and s["win_rate"] < AUDIT_LOW_WINRATE:
+            a["score"] = max(0, a["score"] - AUDIT_PENALTY)
+            a["class"] = classify_score(a["score"])
+            a["audit_penalty"] = AUDIT_PENALTY
+            penalized.append(f"{a['symbol']} (win rate {s['win_rate']:.0f}% su {s['trades']})")
+    total = len(trades)
+    wins = sum(1 for t in trades if t["pnl"] > 0)
+    pnl = sum(t["pnl"] for t in trades)
+    log(f"🧾 [Auditor] {total} trade chiusi (90gg), win rate {wins / total * 100 if total else 0:.0f}%, "
+        f"PnL realizzato ${pnl:,.2f}" + (f" | Penalità -{AUDIT_PENALTY}: {', '.join(penalized)}" if penalized else ""))
+    return stats
+
+
+# ---------------- Agente 8: Chief Investment Officer ----------------
+CIO_SYSTEM_PROMPT = (
+    "Sei il Chief Investment Officer del Virtual Boardroom Finanziario di un bot di trading algoritmico "
+    "che opera su un conto paper (simulato) Alpaca. Le tue risposte vengono lette da un programma: "
+    "rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo."
+)
+
+
+def build_cio_prompt(board, cfg):
+    """Matrice dei report dei 7 agenti per il CIO."""
+    risk, macro, dd = board["risk"], board["macro"], board["drawdown"]
+    vol, sent, volume, stats = board["volatility"], board["sentiment"], board["volume"], board["audit"]
+
+    def row(key, a):
+        v, s, vf, st = vol.get(key), sent.get(key), volume.get(key, {}), stats.get(key)
+        ind = a["ind"]
+        return (
+            f"score {a['score']}{' (penalità auditor)' if a.get('audit_penalty') else ''}, "
+            f"RSI {ind['rsi']:.1f}, MACD hist {ind['macd_hist']:.4f}, ROC {ind['roc']:.2f}%, "
+            f"SMA20 {'>' if ind['sma20'] > ind['sma50'] else '<'} SMA50 | "
+            f"sentiment {s['sentiment']:+d}{' VETO' if s['veto'] else ''} | " if s else
+            f"score {a['score']}, RSI {ind['rsi']:.1f}, ROC {ind['roc']:.2f}% | sentiment N/D | "
+        ) + (
+            f"ATR {v['atr_pct']:.1f}% (stop {v['stop_pct']:.1f}%) | " if v else "ATR N/D | "
+        ) + (
+            f"volume {vf.get('ratio')}x {vf.get('status')} | "
+        ) + (
+            f"win rate {st['win_rate']:.0f}% su {st['trades']} trade" if st else "nessuno storico"
+        )
+
+    pos_lines = []
+    for r in risk["positions"]:
+        p, a = r["pos"], r["analysis"]
+        key = normalize_symbol(p["yf_symbol"])
+        detail = row(key, a) if a else "indicatori N/D"
+        pos_lines.append(f"  - {p['yf_symbol']}: valore ${p['market_value']:,.0f}, PnL {p['unrealized_plpc']:.2f}%, "
+                         f"stato {r['status']} ({r['reason']}) | {detail}")
+    cand_lines = [f"  - {a['symbol']}: {row(normalize_symbol(a['symbol']), a)}" for a in board["candidates"][:6]]
+    excluded = [f"{sym} ({why})" for sym, why in board["excluded"]]
+    f_stock, f_crypto = risk["funds"]["stock"][0], risk["funds"]["crypto"][0]
+    return (
+        "Sei il Chief Investment Officer. Hai ricevuto le analisi dettagliate dei 7 agenti del tuo comitato:\n"
+        "1. Tecnico (RSI/MACD)\n2. Sentiment News (Veto attivo?)\n3. ATR (Stop Loss %)\n4. Macro (Regime Mercato)\n"
+        "5. Volume (Conferma Volumi)\n6. Drawdown (Rischio Globale)\n7. Auditor (Win Rate Storico)\n\n"
+        f"[Macro] Azioni: {macro['stock']['regime']} ({macro['stock']['detail']}); "
+        f"Crypto: {macro['crypto']['regime']} ({macro['crypto']['detail']})\n"
+        f"[Drawdown] Oggi {dd['drawdown_pct']:+.2f}%, acquisti {'BLOCCATI' if dd['blocked'] else 'consentiti'}\n"
+        f"[Conto] Capitale ${risk['equity']:,.0f}, esposizione ${risk['exposure']:,.0f}, "
+        f"liquidità disponibile azioni ${f_stock:,.0f}, crypto ${f_crypto:,.0f}\n"
+        f"Posizioni aperte:\n{chr(10).join(pos_lines) or '  (nessuna)'}\n"
+        f"Candidati all'acquisto ammessi dal comitato:\n{chr(10).join(cand_lines) or '  (nessuno)'}\n"
+        f"Esclusi dal comitato: {', '.join(excluded) or 'nessuno'}\n\n"
+        "Regole del boardroom:\n"
+        "- Se c'è liquidità disponibile (almeno $10) e c'è almeno un candidato ammesso, scegli BUY del migliore: "
+        "il capitale libero va investito. Non confrontare i candidati con le posizioni già aperte. "
+        "Usa HOLD solo per motivi concreti citati dagli agenti.\n"
+        f"- ROTATE solo se la liquidità è insufficiente (< ${ROTATION_FUNDS_THRESHOLD}), buy_symbol ha score > "
+        f"{ROTATION_MIN_SCORE} e almeno {ROTATION_MIN_EDGE} punti più di sell_symbol (preferisci posizioni deboli o in stallo).\n"
+        "- SELL per chiudere una posizione debole; le vendite per stop loss, trailing stop, trend ribassista "
+        "e stallo sono già eseguite dal Risk Manager.\n"
+        f"- allocation_pct tra {cfg['base_allocation_pct']:.0f} e {cfg['max_allocation_pct']:.0f} in base alla confidenza "
+        "(il regime macro RISK-OFF dimezza automaticamente il budget).\n"
+        f"- dynamic_stop_loss_pct negativo, coerente con l'ATR (tra {STOP_WIDEST_PCT:.0f} e {STOP_TIGHTEST_PCT:.0f}).\n\n"
+        "Restituisci la decisione in formato JSON pulito:\n"
+        '{\n  "action": "BUY" | "SELL" | "ROTATE" | "HOLD",\n  "sell_symbol": "TICKER_DA_VENDERE",\n'
+        '  "buy_symbol": "TICKER_DA_COMPRARE",\n  "allocation_pct": 15_a_30,\n'
+        '  "dynamic_stop_loss_pct": valore_numerico_negativo,\n'
+        '  "reason": "Sintesi esecutiva che cita il parere dei vari agenti del comitato"\n}\n'
+        "Usa i ticker esattamente come scritti sopra e stringa vuota per i campi non usati."
+    )
+
+
+def cio_allocation(decision, analysis_score, cfg, macro_factor):
+    """Percentuale del capitale per il BUY: quella del CIO (limitata a base..max) o quella da score."""
+    pct = decision.get("allocation_pct")
+    if pct is None:
+        pct = allocation_pct_for_score(decision.get("score") or analysis_score, cfg)
+    pct = max(cfg["base_allocation_pct"], min(cfg["max_allocation_pct"], pct))
+    return pct, pct * macro_factor
+
+
+def cio_stop(decision, vol_info):
+    """Stop per la nuova posizione: quello del CIO entro i limiti, altrimenti da ATR."""
+    stop = decision.get("dynamic_stop_loss_pct")
+    if stop is not None and stop > 0:
+        stop = -stop
+    if stop is None or stop == 0:
+        return vol_info["stop_pct"] if vol_info else None
+    return round(max(STOP_WIDEST_PCT, min(STOP_TIGHTEST_PCT, stop)), 2)

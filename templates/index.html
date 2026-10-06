@@ -198,7 +198,7 @@
                     <div class="flex items-center justify-between border-b border-borderSubtle pb-3 mb-4">
                         <div class="flex items-center gap-2">
                             <i data-lucide="cpu" class="w-4 h-4 text-cyan-400"></i>
-                            <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">In Diretta: Focus Analisi IA</span>
+                            <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">In Diretta: Focus Analisi IA · Virtual Boardroom</span>
                         </div>
                         <span id="aiTargetSymbol" class="text-xs font-mono font-bold px-2.5 py-1 bg-cyan-950 border border-cyan-800 text-cyan-300 rounded">--</span>
                     </div>
@@ -217,6 +217,8 @@
                             <div id="aiVerdict" class="text-sm font-mono font-bold text-cyan-400 mt-1">--</div>
                         </div>
                     </div>
+
+                    <div id="boardroomBadges" class="flex flex-wrap gap-2 mb-4"></div>
 
                     <div class="bg-black/40 border border-zinc-800/80 p-3 rounded text-xs font-mono text-zinc-300 leading-relaxed" id="aiReasoning">
                         <span class="text-cyan-400 font-bold">[RAGIONAMENTO IA]:</span> In attesa dell'avvio della prima scansione.
@@ -544,6 +546,25 @@
             }
         }
 
+        const BADGE_TONES = {
+            ok: 'border-emerald-800 bg-emerald-950/60 text-emerald-300',
+            warn: 'border-amber-800 bg-amber-950/60 text-amber-300',
+            bad: 'border-rose-800 bg-rose-950/60 text-rose-300',
+            neutral: 'border-zinc-700 bg-zinc-900 text-zinc-300'
+        };
+
+        function renderBoardroom(badges) {
+            const box = document.getElementById('boardroomBadges');
+            if (!box) return;
+            box.replaceChildren();
+            for (const b of badges) {
+                const chip = el('span', `inline-flex items-center gap-1.5 px-2 py-1 rounded border text-[11px] font-mono ${BADGE_TONES[b.tone] || BADGE_TONES.neutral}`);
+                chip.appendChild(el('span', 'font-bold uppercase tracking-wider text-[10px] opacity-80', b.agent));
+                chip.appendChild(el('span', '', b.value));
+                box.appendChild(chip);
+            }
+        }
+
         async function fetchStatus() {
             try {
                 const res = await fetch('/api/data');
@@ -570,8 +591,9 @@
                 // 3. Posizioni Aperte (Movimentazioni)
                 renderPositions(Array.isArray(data.positions) ? data.positions : []);
 
-                // 4. Analisi Live dell'IA
+                // 4. Analisi Live dell'IA e pareri del Boardroom
                 if (bot.latest_ai_analysis) renderAiAnalysis(bot.latest_ai_analysis);
+                if (Array.isArray(bot.boardroom)) renderBoardroom(bot.boardroom);
 
                 if (bot.active !== undefined) isRunning = Boolean(bot.active);
                 updateBotStatusDisplay();
