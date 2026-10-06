@@ -98,43 +98,71 @@
         </section>
 
         <!-- ============ UFFICIO VIRTUALE ============ -->
-        <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+        <section class="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
 
-            <!-- 1. Agente Esploratore #1 -->
-            <div class="border border-slate-800 rounded-lg bg-slate-900/40">
+            <!-- 1. Agente Gestore Operativo & Esploratore radar -->
+            <div class="border border-slate-800 rounded-lg bg-slate-900/40 flex flex-col">
                 <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Agente Esploratore #1</h2>
-                    <span class="text-[11px] text-slate-500 num" x-text="officeTime()"></span>
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Agente Gestore · Radar Esploratore #1</h2>
+                    <span class="text-[11px] text-slate-500 num" x-text="radar.next_scan_in != null ? 'prossimo ' + mmss(radar.next_scan_in) : ''"></span>
                 </div>
-                <dl class="p-4 space-y-3 text-sm">
-                    <div>
-                        <dt class="text-[11px] uppercase tracking-wider text-slate-500">Mercato in perlustrazione</dt>
-                        <dd class="mt-0.5 text-slate-100" x-text="office.sector || '—'"></dd>
+                <div class="p-4 space-y-4 text-sm">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Settore setacciato</div>
+                            <div class="mt-0.5 text-slate-100" x-text="radar.current_sector || '—'"></div>
+                            <div class="mt-0.5 text-[11px] text-slate-500 num" x-text="shortTime(radar.last_scan)"></div>
+                        </div>
+                        <div>
+                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Prossimo paniere</div>
+                            <div class="mt-0.5 text-slate-300" x-text="radar.next_sector || '—'"></div>
+                        </div>
                     </div>
+                    <div class="num text-[11px] text-slate-500 break-words" x-text="(radar.tickers_inspected || []).join('  ')"></div>
+
                     <div>
-                        <dt class="text-[11px] uppercase tracking-wider text-slate-500">Ticker ispezionati</dt>
-                        <dd class="mt-0.5 num text-xs text-slate-400 break-words" x-text="(office.tickers_inspected || []).join('  ') || '—'"></dd>
-                    </div>
-                    <div>
-                        <dt class="text-[11px] uppercase tracking-wider text-slate-500">Proposte</dt>
-                        <dd class="mt-1 space-y-1.5">
-                            <template x-if="!(office.discoveries || []).length">
-                                <div class="text-xs text-slate-500">Nessuna anomalia eccezionale nel settore.</div>
-                            </template>
-                            <template x-for="d in (office.discoveries || [])" :key="d.symbol">
-                                <div class="flex items-baseline justify-between gap-3 text-xs">
-                                    <span class="min-w-0">
-                                        <span class="num text-slate-100" x-text="d.symbol"></span>
-                                        <span class="text-slate-500" x-text="' · ' + (d.anomalies || []).join(', ')"></span>
-                                    </span>
-                                    <span class="shrink-0 num px-1.5 py-0.5 rounded text-[10px] border"
-                                          :class="d.verdict === 'APPROVATO' ? 'border-emerald-900 text-emerald-400' : 'border-rose-900 text-rose-400'"
-                                          x-text="d.verdict || 'IN REVISIONE'"></span>
+                        <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">
+                            Coda proposte <span class="normal-case tracking-normal" x-text="'(TTL ' + (radar.ttl_minutes || 20) + ' min)'"></span>
+                        </div>
+                        <template x-if="!(radar.queue || []).length">
+                            <div class="text-xs text-slate-500">Nessuna proposta attiva.</div>
+                        </template>
+                        <div class="space-y-1.5">
+                            <template x-for="q in (radar.queue || [])" :key="q.symbol + q.discovered_at">
+                                <div class="rounded border border-slate-800 px-2.5 py-2 text-xs">
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span class="num text-slate-100" x-text="q.symbol + ' · ' + q.score"></span>
+                                        <span class="flex items-center gap-2">
+                                            <span class="num text-[10px] px-1.5 py-0.5 rounded border" :class="statusStyle(q.status)" x-text="statusLabel(q.status)"></span>
+                                            <span class="num text-[11px]" :class="q.ttl_seconds < 300 ? 'text-amber-400' : 'text-slate-400'" x-text="mmss(q.ttl_seconds)"></span>
+                                        </span>
+                                    </div>
+                                    <div class="mt-1 text-slate-500" x-text="q.sector + ' · ' + (q.anomalies || []).join(', ')"></div>
+                                    <div x-show="q.package" class="mt-1 num text-[11px] text-slate-400"
+                                         x-text="q.package ? 'Target ' + usd(q.package.target_price) + ' · stop ' + q.package.stop_pct + '%' : ''"></div>
+                                    <div x-show="q.note" class="mt-1 text-[11px] text-slate-500" x-text="q.note"></div>
                                 </div>
                             </template>
-                        </dd>
+                        </div>
                     </div>
-                </dl>
+
+                    <div x-show="(radar.recent || []).length">
+                        <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Esiti recenti</div>
+                        <div class="space-y-1">
+                            <template x-for="r in (radar.recent || []).slice(0, 6)" :key="r.symbol + r.updated_at">
+                                <div class="flex items-baseline gap-2 text-[11px]">
+                                    <span class="num shrink-0 w-24" :class="statusStyle(r.status, true)" x-text="statusLabel(r.status)"></span>
+                                    <span class="num text-slate-300 shrink-0" x-text="r.symbol"></span>
+                                    <span class="text-slate-500 truncate" :title="r.reason || r.note" x-text="r.reason || r.note"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+
+                    <div x-show="(radar.cooldown || []).length" class="text-[11px] text-slate-500">
+                        Cooldown: <span class="num text-slate-400" x-text="(radar.cooldown || []).map(c => c.symbol + ' ' + c.minutes + 'm').join('  ')"></span>
+                    </div>
+                </div>
             </div>
 
             <!-- 3. Decisione esecutiva del CIO -->
@@ -172,8 +200,7 @@
                             <div class="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
                                 <span x-show="cio.proposal && cio.proposal !== cioDescription()" x-text="'Proposta originale: ' + cio.proposal"></span>
                                 <span x-show="cio.suspended" class="text-amber-400/90">Sospesa: ciclo di avvio dopo il deploy</span>
-                                <span x-show="(office.discoveries || []).length" :class="cio.scout_approved ? 'text-emerald-400/90' : ''"
-                                      x-text="cio.scout_approved ? 'Scoperta dell\'Esploratore approvata' : 'Scoperta dell\'Esploratore non selezionata'"></span>
+                                <span x-show="cio.scout_approved" class="text-emerald-400/90">Proposta dell'Esploratore approvata dal CIO</span>
                             </div>
                         </div>
                     </template>
@@ -413,7 +440,7 @@
             return {
                 connected: true,
                 account: {}, positions: [], bot: { logs: [] },
-                office: {}, review: [], cio: {},
+                radar: {}, review: [], cio: {},
                 settings: { watchlist: [] }, envLocked: {},
                 showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
                 localLogs: [], clearedId: 0, clearedTs: 0,
@@ -454,8 +481,27 @@
                     if (!eq || this.account.exposure === undefined) return '—';
                     return (this.account.exposure / eq * 100).toFixed(1) + '%';
                 },
-                officeTime() {
-                    return this.office.timestamp ? String(this.office.timestamp).replace('T', ' ').slice(0, 19) : '';
+                shortTime(iso) {
+                    return iso ? String(iso).replace('T', ' ').slice(11, 19) : '';
+                },
+                mmss(sec) {
+                    if (sec === null || sec === undefined) return '';
+                    const s = Math.max(0, Math.floor(sec));
+                    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+                },
+                statusLabel(st) {
+                    return { DISCOVERED: 'SCOPERTA', UNDER_REVIEW: 'IN REVISIONE', APPROVED_FOR_CIO: 'PRONTA CIO',
+                             REJECTED: 'SCARTATA', EXPIRED: 'SCADUTA', EXECUTED: 'ESEGUITA' }[st] || st;
+                },
+                statusStyle(st, textOnly = false) {
+                    const map = {
+                        APPROVED_FOR_CIO: ['border-emerald-800 text-emerald-400', 'text-emerald-400'],
+                        EXECUTED: ['border-sky-800 text-sky-400', 'text-sky-400'],
+                        REJECTED: ['border-rose-900 text-rose-400', 'text-rose-400'],
+                        EXPIRED: ['border-slate-700 text-slate-500', 'text-slate-500'],
+                    };
+                    const v = map[st] || ['border-amber-800 text-amber-400', 'text-amber-400'];
+                    return textOnly ? v[1] : v[0];
                 },
                 actionStyle(a) {
                     return {
@@ -525,7 +571,7 @@
                         this.account = data.account || {};
                         this.positions = Array.isArray(data.positions) ? data.positions : [];
                         this.bot = data.bot || { logs: [] };
-                        this.office = this.bot.office || {};
+                        this.radar = data.radar || {};
                         this.review = Array.isArray(this.bot.review) ? this.bot.review : [];
                         this.cio = this.bot.cio || {};
                         this.connected = true;

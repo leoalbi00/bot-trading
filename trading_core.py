@@ -1849,140 +1849,383 @@ def startup_system_sync(log=print):
 
 
 # ===========================================================================
-# UFFICIO VIRTUALE: Agente Esploratore #1 e registro di coordinamento
+# UFFICIO VIRTUALE: Esploratore #1 (radar multi-settore), Agente Gestore Operativo
+# e Reparto Revisione event-driven. Il radar gira in un thread separato e NON invia ordini:
+# le proposte approvate restano in coda (TTL 20 min) finché il CIO non le valuta.
 # ===========================================================================
 SCOUT_ID = "Esploratore_1"
 SCOUT_REGISTRY_PATH = os.path.join(DATA_DIR, "scout_registry.json")
-SCOUT_SECTORS = {
-    "Metalli preziosi & Materie prime": ["GLD", "SLV", "USO", "COPX"],
-    "Obbligazioni & T-Bills": ["TLT", "BND"],
-    "ETF settoriali ad alta crescita": ["SMH", "XLE", "ARKK"],
-    "Crypto (top gainer e breakout di volume)": ["LINK-USD", "DOGE-USD", "LTC-USD", "XRP-USD", "ADA-USD",
-                                                  "DOT-USD", "AAVE-USD", "BCH-USD"],
-}
-SCOUT_MAX_PICKS = 2
+DYNAMIC_BASKET = "Gainers & Volumi anomali"
+RADAR_BASKETS = [
+    ("Metalli & Materie prime", ["GLD", "SLV", "USO", "COPX", "UNG"]),
+    ("Obbligazioni & T-Bills", ["TLT", "BND", "HYG"]),
+    ("ETF settoriali momentum", ["SMH", "XLE", "XLF", "XBI", "ARKK"]),
+    ("Crypto high-vol", ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "NEAR-USD"]),
+    ("Mega-cap tech", ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META"]),
+    (DYNAMIC_BASKET, None),  # elenco dinamico dallo screener "day_gainers" di Yahoo
+]
+RADAR_INTERVAL_SEC = 120        # un paniere ogni 2 minuti (giro completo in 12 minuti)
+PROPOSAL_TTL_MIN = 20           # oltre questo tempo una proposta è considerata stantia
+REJECT_COOLDOWN_MIN = 60        # un ticker respinto non viene riproposto per 60 minuti
 SCOUT_VOLUME_ANOMALY = 1.5      # volume >= 1.5x la media della stessa ora
 SCOUT_EXPLOSIVE_ROC = 3.0       # ROC(10) >= 3% = trend esplosivo
-SCOUT_SECTOR_LOCK_MIN = 30      # un settore ispezionato da un altro esploratore è riservato per 30 minuti
-SCOUT_HISTORY_MAX = 50
-_SCOUT_REGISTRY_DEFAULT = {"scouts": {}, "history": []}
+TARGET_RISK_REWARD = 2.0        # target price = 2x la distanza dello stop
+REVIEW_MAX_RSI = 80             # oltre: ipercomprato estremo, proposta respinta
+REVIEW_MAX_ROC = 15.0           # oltre: movimento già esteso (es. gap da notizia), non si insegue il prezzo
+QUEUE_MAX = 20
+RECENT_MAX = 30
+SCAN_HISTORY_MAX = 50
+
+# Stati del ciclo di vita di una proposta
+DISCOVERED, UNDER_REVIEW, APPROVED_FOR_CIO, REJECTED = "DISCOVERED", "UNDER_REVIEW", "APPROVED_FOR_CIO", "REJECTED"
+EXPIRED, EXECUTED = "EXPIRED", "EXECUTED"
+ACTIVE_STATES = (DISCOVERED, UNDER_REVIEW, APPROVED_FOR_CIO)
+
+_registry_lock = threading.RLock()   # il radar e il ciclo del CIO aggiornano il registro da thread diversi
+_REGISTRY_DEFAULT = {"scouts": {}, "radar": {"basket_index": 0}, "queue": [], "recent": [], "cooldown": {}, "history": []}
+_tradable_cache = {}
 
 
 def load_scout_registry():
-    """Registro degli esploratori; se manca o è corrotto viene rigenerato con la struttura di default."""
-    reg = read_json_file(SCOUT_REGISTRY_PATH, _SCOUT_REGISTRY_DEFAULT)
-    if not isinstance(reg.get("scouts"), dict) or not isinstance(reg.get("history"), list):
-        reg = json.loads(json.dumps(_SCOUT_REGISTRY_DEFAULT))
-        write_json_file(SCOUT_REGISTRY_PATH, reg)
+    """Registro di coordinamento; rigenerato con la struttura di default se manca o è corrotto."""
+    reg = read_json_file(SCOUT_REGISTRY_PATH, _REGISTRY_DEFAULT)
+    for key, default in _REGISTRY_DEFAULT.items():
+        if not isinstance(reg.get(key), type(default)):
+            reg[key] = json.loads(json.dumps(default))
     return reg
 
 
-def _parse_ts(value):
+def _save_registry(reg):
+    write_json_file(SCOUT_REGISTRY_PATH, reg)
+
+
+def _now_epoch():
+    return time.time()
+
+
+def _close(reg, proposal, status, note=""):
+    """Sposta una proposta dalla coda attiva allo storico recente."""
+    proposal["status"] = status
+    proposal["updated_at"] = now_local().isoformat(timespec="seconds")
+    if note:
+        proposal["note"] = note
+    reg["queue"] = [p for p in reg["queue"] if p["id"] != proposal["id"]]
+    reg["recent"] = ([proposal] + reg["recent"])[:RECENT_MAX]
+
+
+def run_orchestrator_service(log=print):
+    """Agente Gestore Operativo: TTL della coda e scadenza dei cooldown. Restituisce il registro aggiornato."""
+    with _registry_lock:
+        reg = load_scout_registry()
+        now = _now_epoch()
+        expired = [p for p in reg["queue"] if p.get("expires_epoch", 0) <= now]
+        for p in expired:
+            _close(reg, p, EXPIRED, f"TTL di {PROPOSAL_TTL_MIN} minuti scaduto")
+        reg["cooldown"] = {s: until for s, until in reg["cooldown"].items() if until > now}
+        if expired:
+            log(f"🗂️ [Gestore] Proposte scadute (TTL {PROPOSAL_TTL_MIN} min): {', '.join(p['symbol'] for p in expired)}")
+        _save_registry(reg)
+        return reg
+
+
+def dynamic_gainers(limit=8):
+    """Titoli USA in maggior rialzo oggi (screener Yahoo), prezzo >= $5."""
     try:
-        return dt.datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def choose_scout_sector(registry, scout_id, market_open):
-    """Settore ispezionato meno di recente, escludendo quelli riservati da altri esploratori.
-
-    A mercato azionario chiuso solo le crypto (le uniche acquistabili).
-    """
-    now = now_local()
-    last_scan, claimed = {}, set()
-    for entry in registry["history"]:
-        ts = _parse_ts(entry.get("timestamp"))
-        sector = entry.get("sector_scanned")
-        if not ts or sector not in SCOUT_SECTORS:
-            continue
-        last_scan[sector] = max(last_scan.get(sector, ts), ts)
-        if entry.get("scout_id") != scout_id and (now - ts).total_seconds() < SCOUT_SECTOR_LOCK_MIN * 60:
-            claimed.add(sector)
-    sectors = [s for s in SCOUT_SECTORS if s not in claimed]
-    if not market_open:
-        sectors = [s for s in sectors if all(is_crypto(t) for t in SCOUT_SECTORS[s])]
-    if not sectors:
-        return None
-    oldest = dt.datetime.min.replace(tzinfo=TIMEZONE)
-    return min(sectors, key=lambda s: last_scan.get(s, oldest))
-
-
-def run_esploratore_scout(exclude_keys=(), market_open=True, log=print, scout_id=SCOUT_ID):
-    """Agente Esploratore #1: perlustra un settore fuori dalla watchlist e propone fino a 2 anomalie.
-
-    Un ticker è una scoperta se ha Score di Forza > SCORE_BUY e almeno un'anomalia: volume >= 1.5x
-    (stessa ora) o trend esplosivo (ROC >= 3%). Ricerca e scoperte vengono scritte in scout_registry.json.
-    Restituisce (voce del registro, scoperte con indicatori).
-    """
-    registry = load_scout_registry()
-    sector = choose_scout_sector(registry, scout_id, market_open)
-    if not sector:
-        log(f"🔍 [{scout_id}] Nessun settore disponibile (riservati da altri esploratori o mercato chiuso).")
-        return None, []
-
-    inspected, picks = [], []
-    for ticker in SCOUT_SECTORS[sector]:
-        if normalize_symbol(ticker) in exclude_keys:
-            continue
-        ind = get_indicators(ticker)
-        if not ind:
-            continue
-        score = ta_score(ind)
-        inspected.append(ticker)
-        anomalies = []
-        if ind.get("vol_ratio") is not None and ind["vol_ratio"] >= SCOUT_VOLUME_ANOMALY:
-            anomalies.append(f"volume {ind['vol_ratio']}x")
-        if ind["roc"] >= SCOUT_EXPLOSIVE_ROC:
-            anomalies.append(f"trend esplosivo ROC {ind['roc']:+.2f}%")
-        if anomalies and score > SCORE_BUY:
-            picks.append({"symbol": ticker, "ind": ind, "score": score, "class": classify_score(score),
-                          "anomalies": anomalies, "scout": True})
-    picks = sorted(picks, key=lambda p: p["score"], reverse=True)[:SCOUT_MAX_PICKS]
-
-    entry = {
-        "scout_id": scout_id,
-        "sector_scanned": sector,
-        "tickers_inspected": inspected,
-        "timestamp": now_local().isoformat(timespec="seconds"),
-        "discoveries": [{"symbol": p["symbol"], "score": p["score"], "roc": p["ind"]["roc"],
-                         "vol_ratio": p["ind"].get("vol_ratio"), "anomalies": p["anomalies"]} for p in picks],
-        "status": "Inviato al Reparto Revisione" if picks else "Nessuna anomalia eccezionale",
-        "review": {},
-        "cio": None,
-    }
-    registry["scouts"][scout_id] = entry
-    registry["history"] = (registry["history"] + [entry])[-SCOUT_HISTORY_MAX:]
-    write_json_file(SCOUT_REGISTRY_PATH, registry)
-
-    found = ", ".join(f"{p['symbol']} (score {p['score']}, {' + '.join(p['anomalies'])})" for p in picks)
-    log(f"🔍 [{scout_id}] Settore: {sector} | ispezionati: {', '.join(inspected) or '-'} | "
-        + (f"scoperte → Reparto Revisione: {found}" if picks else "nessuna anomalia eccezionale"))
-    return entry, picks
-
-
-def update_scout_registry(scout_id, review, cio):
-    """Registra nel registro l'esito del Reparto Revisione e la decisione del CIO sull'ultima ricerca."""
-    registry = load_scout_registry()
-    entry = registry["scouts"].get(scout_id)
-    if not entry:
-        return
-    entry["review"] = review
-    entry["cio"] = cio
-    if not entry["discoveries"]:
-        pass
-    elif cio and cio.get("approved"):
-        entry["status"] = "Approvato dal CIO"
-    elif not any(v.get("verdict") == "APPROVATO" for v in review.values()):
-        entry["status"] = "Respinto dal Reparto Revisione"
-    else:
-        entry["status"] = "Respinto dal CIO"
-    for i in range(len(registry["history"]) - 1, -1, -1):
-        h = registry["history"][i]
-        if h.get("scout_id") == scout_id and h.get("timestamp") == entry["timestamp"]:
-            registry["history"][i] = entry
+        quotes = yf.screen("day_gainers", count=25).get("quotes", [])
+    except Exception:
+        return []
+    out = []
+    for q in quotes:
+        sym = q.get("symbol", "")
+        if re.fullmatch(r"[A-Z]{1,5}", sym) and (q.get("regularMarketPrice") or 0) >= 5:
+            out.append(sym)
+        if len(out) >= limit:
             break
-    write_json_file(SCOUT_REGISTRY_PATH, registry)
+    return out
+
+
+def _download(tickers, period, interval):
+    """yf.download in batch -> {ticker: DataFrame}. Gestisce sia colonne MultiIndex sia ticker singolo."""
+    if not tickers:
+        return {}
+    try:
+        df = yf.download(tickers, period=period, interval=interval, group_by="ticker",
+                         progress=False, threads=True, auto_adjust=True)
+    except Exception:
+        return {}
+    out = {}
+    for t in tickers:
+        try:
+            sub = df[t] if hasattr(df.columns, "levels") and t in df.columns.get_level_values(0) else df
+            sub = sub.dropna(subset=["Close"])
+            if len(sub):
+                out[t] = sub
+        except Exception:
+            continue
+    return out
+
+
+def batch_indicators(tickers):
+    return {t: compute_indicators(df["Close"], volume=df["Volume"])
+            for t, df in _download(tickers, "3mo", "1h").items() if len(df) >= 60}
+
+
+def batch_atr(tickers):
+    return {t: atr_pct(df) for t, df in _download(tickers, "6mo", "1d").items() if len(df) >= 20}
+
+
+def is_tradable(yf_symbol):
+    """Asset negoziabile su Alpaca (cache 6 ore). Se Alpaca non risponde si assume negoziabile."""
+    key = normalize_symbol(yf_symbol)
+    cached = _tradable_cache.get(key)
+    if cached and time.time() - cached[0] < 6 * 3600:
+        return cached[1]
+    if not alpaca_client:
+        return True
+    try:
+        ok = bool(alpaca_client.get_asset(to_alpaca_symbol(yf_symbol)).tradable)
+    except Exception as e:
+        if "not found" not in str(e).lower() and "404" not in str(e):
+            return True
+        ok = False
+    _tradable_cache[key] = (time.time(), ok)
+    return ok
+
+
+def _review_context():
+    """Dati condivisi dal Reparto Revisione per tutte le proposte di un passaggio del radar."""
+    ctx = {"drawdown_pct": 0.0, "drawdown_blocked": False, "market_open": True,
+           "stats": win_rates(read_json_file(TRADE_HISTORY_PATH, []))}
+    if alpaca_client:
+        try:
+            acc = alpaca_client.get_account()
+            equity, last = float(acc.equity), float(acc.last_equity or 0)
+            peak = max([x for x in (last, _intraday_equity_peak(), equity) if x] or [0.0])
+            ctx["drawdown_pct"] = round((equity / peak - 1) * 100, 2) if peak else 0.0
+        except Exception:
+            pass
+        ctx["market_open"] = is_market_open(log=lambda m: None)
+    block_until = float(load_state().get("drawdown", {}).get("block_until", 0))
+    ctx["drawdown_blocked"] = ctx["drawdown_pct"] <= DAILY_DRAWDOWN_LIMIT or time.time() < block_until
+    return ctx
+
+
+def review_proposal(p, ind, atr, ctx):
+    """Reparto Revisione: Tecnico, Sentiment, Volumi/ATR, Rischio, Auditor. Restituisce (approvata, review, pacchetto)."""
+    sym, crypto = p["symbol"], is_crypto(p["symbol"])
+    checks, problems = {}, []
+
+    score = p["score"]
+    st = ctx["stats"].get(normalize_symbol(sym))
+    if st and st["trades"] >= AUDIT_MIN_TRADES and st["win_rate"] < AUDIT_LOW_WINRATE:
+        score = max(0, score - AUDIT_PENALTY)
+        checks["auditor"] = f"win rate {st['win_rate']:.0f}% su {st['trades']} trade → -{AUDIT_PENALTY}"
+    else:
+        checks["auditor"] = f"win rate {st['win_rate']:.0f}% su {st['trades']} trade" if st else "nessuno storico"
+
+    exit_kind, why = ta_exit_signal(ind)
+    checks["tecnico"] = f"score {score}, RSI {ind['rsi']:.1f}, MACD hist {ind['macd_hist']:.4f}, ROC {ind['roc']:+.2f}%"
+    if score <= SCORE_BUY:
+        problems.append(f"score {score} non superiore a {SCORE_BUY}")
+    if exit_kind == "ribassista":
+        problems.append(f"segnale ribassista ({why})")
+    if ind["rsi"] > REVIEW_MAX_RSI:
+        problems.append(f"ipercomprato estremo (RSI {ind['rsi']:.1f} > {REVIEW_MAX_RSI})")
+    if ind["roc"] > REVIEW_MAX_ROC:
+        problems.append(f"movimento già esteso (ROC {ind['roc']:+.1f}% > {REVIEW_MAX_ROC:.0f}%): non si insegue il prezzo")
+
+    s_score, _ = sentiment_score(get_recent_news(sym))
+    checks["sentiment"] = f"{s_score:+d}" + (" VETO" if s_score < SENTIMENT_VETO else "")
+    if s_score < SENTIMENT_VETO:
+        problems.append(f"veto sentiment {s_score:+d}")
+
+    ratio = ind.get("vol_ratio")
+    checks["volumi"] = f"{ratio}x" if ratio is not None else "N/D"
+    if ratio is not None and ind["roc"] > 0 and ratio < VOLUME_LOW_RATIO:
+        problems.append(f"falso breakout, volume {ratio}x")
+
+    stop = dynamic_stop_pct(atr, crypto) if atr else get_config()["stop_loss_pct"]
+    checks["atr"] = f"ATR {atr:.2f}% → stop {stop:.1f}%" if atr else f"ATR N/D → stop {stop:.1f}%"
+
+    checks["rischio"] = f"drawdown {ctx['drawdown_pct']:+.2f}%" + (" BLOCCO ACQUISTI" if ctx["drawdown_blocked"] else "")
+    if ctx["drawdown_blocked"]:
+        problems.append("acquisti bloccati dal Drawdown Controller")
+    if not is_tradable(sym):
+        problems.append("non negoziabile su Alpaca")
+    if not crypto and not ctx["market_open"]:
+        problems.append("mercato azionario chiuso")
+
+    review = {"verdict": "RESPINTO" if problems else "APPROVATO", "checks": checks,
+              "reason": "; ".join(problems) if problems else "tutti i controlli superati", "score": score}
+    package = None
+    if not problems:
+        price = ind["price"]
+        package = {
+            "entry_price": round(price, 6),
+            "target_price": round(price * (1 + TARGET_RISK_REWARD * abs(stop) / 100), 6),
+            "stop_pct": stop,
+            "reason": f"{p['sector']}: {', '.join(p['anomalies'])}; score {score}, sentiment {s_score:+d}, "
+                      f"volume {checks['volumi']}, stop {stop:.1f}% (ATR)",
+        }
+    return not problems, review, package
+
+
+def _next_basket(reg, market_open):
+    """Prossimo paniere della rotazione; a mercato azionario chiuso solo le crypto."""
+    idx = int(reg["radar"].get("basket_index", 0)) % len(RADAR_BASKETS)
+    for step in range(len(RADAR_BASKETS)):
+        i = (idx + step) % len(RADAR_BASKETS)
+        name, tickers = RADAR_BASKETS[i]
+        if market_open or (tickers and all(is_crypto(t) for t in tickers)):
+            return i, name, tickers
+    return None, None, None
+
+
+def run_esploratore_radar(held_keys=(), pending=(), log=print, scout_id=SCOUT_ID):
+    """Un passaggio del radar: scansione di un paniere, proposte all'Agente Gestore e revisione immediata."""
+    reg = run_orchestrator_service(log=log)
+    market_open = is_market_open(log=lambda m: None) if alpaca_client else True
+    idx, sector, tickers = _next_basket(reg, market_open)
+    if sector is None:
+        return None
+    if tickers is None:
+        tickers = dynamic_gainers()
+
+    inds = batch_indicators(tickers)
+    with _registry_lock:
+        reg = load_scout_registry()
+        active = {normalize_symbol(p["symbol"]) for p in reg["queue"]}
+        cooldown = reg["cooldown"]
+        found, skipped = [], []
+        for t in tickers:
+            ind = inds.get(t)
+            if not ind:
+                continue
+            score = ta_score(ind)
+            anomalies = []
+            if ind.get("vol_ratio") is not None and ind["vol_ratio"] >= SCOUT_VOLUME_ANOMALY:
+                anomalies.append(f"volume {ind['vol_ratio']}x")
+            if ind["roc"] >= SCOUT_EXPLOSIVE_ROC:
+                anomalies.append(f"trend esplosivo ROC {ind['roc']:+.2f}%")
+            if not anomalies or score <= SCORE_BUY:
+                continue
+            key = normalize_symbol(t)
+            if key in held_keys or key in pending or key in active:
+                skipped.append(f"{t} (già in portafoglio/coda)")
+                continue
+            if cooldown.get(key, 0) > _now_epoch():
+                skipped.append(f"{t} (cooldown {int((cooldown[key] - _now_epoch()) / 60)} min)")
+                continue
+            now = now_local()
+            proposal = {
+                "id": uuid.uuid4().hex[:10], "scout_id": scout_id, "symbol": t, "sector": sector,
+                "status": DISCOVERED, "score": score, "anomalies": anomalies,
+                "ind": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in ind.items()},
+                "discovered_at": now.isoformat(timespec="seconds"), "updated_at": now.isoformat(timespec="seconds"),
+                "expires_epoch": _now_epoch() + PROPOSAL_TTL_MIN * 60,
+            }
+            reg["queue"].append(proposal)
+            found.append(proposal)
+        reg["queue"] = reg["queue"][-QUEUE_MAX:]
+        entry = {"scout_id": scout_id, "sector_scanned": sector, "tickers_inspected": list(inds),
+                 "timestamp": now_local().isoformat(timespec="seconds"), "found": [p["symbol"] for p in found]}
+        reg["scouts"][scout_id] = entry
+        reg["history"] = (reg["history"] + [entry])[-SCAN_HISTORY_MAX:]
+        reg["radar"]["basket_index"] = (idx + 1) % len(RADAR_BASKETS)
+        reg["radar"]["last_scan_epoch"] = _now_epoch()
+        _save_registry(reg)
+
+    log(f"📡 [{scout_id}] {sector}: {len(inds)}/{len(tickers)} ticker"
+        + (f" | anomalie → Gestore: {', '.join(p['symbol'] + ' ' + '+'.join(p['anomalies']) for p in found)}" if found else " | nessuna anomalia")
+        + (f" | ignorati: {', '.join(skipped)}" if skipped else ""))
+    if not found:
+        return entry
+
+    # Reparto Revisione event-driven: analisi immediata delle nuove proposte
+    with _registry_lock:
+        reg = load_scout_registry()
+        for p in reg["queue"]:
+            if p["id"] in {f["id"] for f in found}:
+                p["status"] = UNDER_REVIEW
+        _save_registry(reg)
+    atrs = batch_atr([p["symbol"] for p in found])
+    ctx = _review_context()
+    results = {p["id"]: review_proposal(p, p["ind"], atrs.get(p["symbol"]), ctx) for p in found}
+
+    with _registry_lock:
+        reg = load_scout_registry()
+        for p in list(reg["queue"]):
+            if p["id"] not in results:
+                continue
+            ok, review, package = results[p["id"]]
+            p["review"], p["updated_at"] = review, now_local().isoformat(timespec="seconds")
+            if ok:
+                p["status"], p["package"] = APPROVED_FOR_CIO, package
+                log(f"🏢 [Reparto Revisione] {p['symbol']} APPROVATO → coda CIO (target ${package['target_price']:,.4f}, "
+                    f"stop {package['stop_pct']:.1f}%, valido {PROPOSAL_TTL_MIN} min)")
+            else:
+                reg["cooldown"][normalize_symbol(p["symbol"])] = _now_epoch() + REJECT_COOLDOWN_MIN * 60
+                _close(reg, p, REJECTED, review["reason"])
+                log(f"🏢 [Reparto Revisione] {p['symbol']} RESPINTO: {review['reason']} "
+                    f"(cooldown {REJECT_COOLDOWN_MIN} min, l'Esploratore passa al paniere successivo)")
+        _save_registry(reg)
+    return entry
+
+
+def cio_inbox():
+    """Proposte APPROVED_FOR_CIO ancora valide, pronte per il CIO."""
+    reg = run_orchestrator_service(log=lambda m: None)
+    return [p for p in reg["queue"] if p["status"] == APPROVED_FOR_CIO]
+
+
+def record_cio_outcome(selected_symbol, executed, decision_text):
+    """Dopo il CIO: la proposta acquistata diventa EXECUTED; le altre (o quella scelta ma non eseguita,
+    es. in Advisor o nel ciclo di avvio) restano in coda fino al TTL con una nota."""
+    selected = normalize_symbol(selected_symbol) if selected_symbol else None
+    with _registry_lock:
+        reg = load_scout_registry()
+        for p in list(reg["queue"]):
+            if p["status"] != APPROVED_FOR_CIO:
+                continue
+            if selected and normalize_symbol(p["symbol"]) == selected:
+                if executed:
+                    _close(reg, p, EXECUTED, f"acquistato dal CIO: {decision_text}")
+                else:
+                    p["cio_note"] = f"selezionata dal CIO, ordine non eseguito (Advisor o ciclo di avvio)"
+            else:
+                p["cio_note"] = f"non selezionata dal CIO ({decision_text})"
+        _save_registry(reg)
+
+
+def radar_snapshot():
+    """Stato del radar e della coda per la dashboard."""
+    reg = load_scout_registry()
+    now = _now_epoch()
+    last = reg["scouts"].get(SCOUT_ID, {})
+    next_idx = int(reg["radar"].get("basket_index", 0)) % len(RADAR_BASKETS)
+
+    def item(p):
+        return {
+            "symbol": p["symbol"], "sector": p.get("sector"), "status": p["status"], "score": p.get("score"),
+            "anomalies": p.get("anomalies", []), "package": p.get("package"),
+            "reason": (p.get("review") or {}).get("reason") or p.get("note", ""),
+            "checks": (p.get("review") or {}).get("checks", {}), "note": p.get("note") or p.get("cio_note", ""),
+            "discovered_at": p.get("discovered_at"), "updated_at": p.get("updated_at"),
+            "ttl_seconds": max(0, int(p.get("expires_epoch", now) - now)) if p["status"] in ACTIVE_STATES else None,
+        }
+
+    return {
+        "scout_id": SCOUT_ID,
+        "current_sector": last.get("sector_scanned"),
+        "tickers_inspected": last.get("tickers_inspected", []),
+        "last_scan": last.get("timestamp"),
+        "next_sector": RADAR_BASKETS[next_idx][0],
+        "next_scan_in": max(0, int(reg["radar"].get("last_scan_epoch", now) + RADAR_INTERVAL_SEC - now)),
+        "ttl_minutes": PROPOSAL_TTL_MIN,
+        "queue": [item(p) for p in reg["queue"]],
+        "recent": [item(p) for p in reg["recent"][:10]],
+        "cooldown": [{"symbol": s, "minutes": int((u - now) / 60) + 1} for s, u in reg["cooldown"].items() if u > now],
+    }
 
 
 # ===========================================================================

@@ -33,9 +33,8 @@ bot_state = {
     "active": True,
     "last_scan": "In attesa del primo scan...",
     "status": "Inizializzato",
-    "logs": deque(maxlen=150),  # ordine cronologico: il più recente è in fondo
+    "logs": deque(maxlen=300),  # ordine cronologico: il più recente è in fondo
     "boardroom": [],  # badge con il parere dei principali agenti (dashboard)
-    "office": {},     # Ufficio Virtuale: ricerca dell'Esploratore #1, revisione e decisione del CIO
     "review": [],     # Reparto Revisione: metriche dei 5 agenti per gli asset valutati
     "cio": {},        # Decisione esecutiva del CIO
     "latest_ai_analysis": {
@@ -281,15 +280,20 @@ def run_trading_cycle(manual=False, boot=False):
         analysis = core.market_analyst(cfg["watchlist"] + [p["yf_symbol"] for p in positions], log=log_message)
         if not manual and should_abort():
             return
-        # Ufficio Virtuale: l'Esploratore #1 perlustra un settore fuori dalla watchlist
+        # Ufficio Virtuale: proposte già approvate dal Reparto Revisione nella coda dell'Agente Gestore
         held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
-        scout_entry, scout_picks = core.run_esploratore_scout(
-            exclude_keys=set(analysis) | held_keys | pending, market_open=market_open, log=log_message)
-        scout_keys = set()
-        for pick in scout_picks:
-            key = core.normalize_symbol(pick["symbol"])
-            analysis[key] = {k: pick[k] for k in ("symbol", "ind", "score", "class", "scout")}
+        inbox = [p for p in core.cio_inbox()
+                 if core.normalize_symbol(p["symbol"]) not in held_keys | pending]
+        scout_keys, scout_props = set(), {}
+        for prop in inbox:
+            key = core.normalize_symbol(prop["symbol"])
+            analysis[key] = {"symbol": prop["symbol"], "ind": prop["ind"], "score": prop["score"],
+                             "class": core.classify_score(prop["score"]), "scout": True}
             scout_keys.add(key)
+            scout_props[key] = prop
+        log_message("📥 [CIO] Coda dell'Agente Gestore: " + (", ".join(
+            f"{p['symbol']} ({p['sector']}, score {p['score']}, scade tra {max(0, int((p['expires_epoch'] - time.time()) / 60))} min)"
+            for p in inbox) if inbox else "nessuna proposta approvata in attesa"))
         # Storico ordini Alpaca: trade chiusi, data di apertura e stop delle posizioni (nessuno stato locale)
         ledger = core.sync_ledger(log=log_message)
         # Agente 7: Post-Trade Auditor (penalità allo score prima delle altre valutazioni)
@@ -349,11 +353,9 @@ def run_trading_cycle(manual=False, boot=False):
         excluded_why = {core.normalize_symbol(s): w for s, w in excluded}
         admitted = {core.normalize_symbol(a["symbol"]) for a in candidates}
         for key in scout_keys:
-            a = analysis[key]
-            sent, vol_f = sentiment.get(key, {}), volume.get(key, {})
-            checks = (f"tecnico {a['score']}{' (penalità auditor)' if a.get('audit_penalty') else ''}, "
-                      f"sentiment {sent.get('sentiment', 0):+d}, volume {vol_f.get('ratio')}x, "
-                      f"drawdown {drawdown['drawdown_pct']:+.2f}%")
+            a, pkg = analysis[key], scout_props[key].get("package") or {}
+            checks = (f"{pkg.get('reason', '')}; target ${pkg.get('target_price', 0):,.4f}, stop {pkg.get('stop_pct', 0):.1f}%; "
+                      f"score attuale {a['score']}{' (penalità auditor)' if a.get('audit_penalty') else ''}")
             if key in admitted:
                 review[key] = {"symbol": a["symbol"], "verdict": "APPROVATO", "detail": checks}
             else:
@@ -367,7 +369,11 @@ def run_trading_cycle(manual=False, boot=False):
         # Agente 8: Chief Investment Officer
         board = {"risk": risk, "macro": macro, "drawdown": drawdown, "volatility": vol, "sentiment": sentiment,
                  "volume": volume, "audit": audit, "candidates": candidates, "excluded": excluded,
-                 "scout": scout_entry, "review": review}
+                 "scout": {"sector_scanned": "Radar multi-settore (coda dell'Agente Gestore)",
+                           "tickers_inspected": [p["symbol"] for p in inbox],
+                           "discoveries": [{"symbol": p["symbol"], "score": p["score"],
+                                            "anomalies": [p["sector"]] + p["anomalies"]} for p in inbox]},
+                 "review": review}
         decision, source = core.ask_broker_ai(core.build_cio_prompt(board, cfg), log=log_message,
                                               system=core.CIO_SYSTEM_PROMPT)
         if not decision:
@@ -388,14 +394,9 @@ def run_trading_cycle(manual=False, boot=False):
         cio_outcome = {"approved": scout_buy, "decision": describe_decision(final), "source": source,
                        "reason": core.summarize_reason(final["reason"] or decision["reason"], 300),
                        "suspended": boot and final["action"] in ("BUY", "ROTATE")}
-        if scout_entry:
-            core.update_scout_registry(core.SCOUT_ID, review, cio_outcome)
-            bot_state["office"] = {
-                "scout_id": scout_entry["scout_id"], "sector": scout_entry["sector_scanned"],
-                "tickers_inspected": scout_entry["tickers_inspected"], "timestamp": scout_entry["timestamp"],
-                "discoveries": [{**d, **review.get(core.normalize_symbol(d["symbol"]), {})} for d in scout_entry["discoveries"]],
-                "cio": cio_outcome,
-            }
+        if inbox:
+            executed = scout_buy and auto_trade and orders_allowed and not boot
+            core.record_cio_outcome(final["buy_symbol"] if scout_buy else None, executed, describe_decision(final))
 
         target = final["buy_symbol"] or final["sell_symbol"]
         target_key = core.normalize_symbol(target) if target else None
@@ -529,6 +530,23 @@ def background_loop():
             wake_event.clear()
             last_run = 0.0
 
+def radar_loop():
+    """Esploratore #1 + Agente Gestore: un paniere ogni RADAR_INTERVAL_SEC, indipendente dal ciclo del CIO.
+
+    Non invia ordini. Ogni passaggio ha timeout di rete (yfinance/Alpaca) e gli errori non fermano il loop.
+    """
+    time.sleep(core.STARTUP_GRACE_SECONDS + 20)  # dopo la sincronizzazione di avvio
+    while True:
+        started = time.time()
+        if bot_state["active"]:
+            try:
+                held = {core.normalize_symbol(p["yf_symbol"]) for p in cached("positions", get_open_positions)}
+                pending = core.get_pending_order_symbols(log=lambda m: None) or set()
+                core.run_esploratore_radar(held_keys=held, pending=pending, log=log_message)
+            except Exception as e:
+                log_message(f"📡 Errore radar Esploratore: {e}")
+        time.sleep(max(10, core.RADAR_INTERVAL_SEC - (time.time() - started)))
+
 def keep_alive_url():
     base = os.getenv("RENDER_EXTERNAL_URL")
     if base:
@@ -582,7 +600,8 @@ def start_background_threads():
         _threads_pid = os.getpid()
     threading.Thread(target=background_loop, daemon=True).start()
     threading.Thread(target=keep_alive_loop, daemon=True).start()
-    log_message(f"🧵 Thread di trading e Keep-Alive avviati (PID {os.getpid()})")
+    threading.Thread(target=radar_loop, daemon=True).start()
+    log_message(f"🧵 Thread di trading, radar Esploratore e Keep-Alive avviati (PID {os.getpid()})")
     cfg = core.get_config()
     mode = "Auto-Trading attivo" if cfg["auto_execute_trades"] else "Advisor (nessun ordine)"
     locked = core.env_overrides()
@@ -661,7 +680,6 @@ def api_data():
             "logs": list(bot_state["logs"]),
             "latest_ai_analysis": dict(bot_state["latest_ai_analysis"]),
             "boardroom": list(bot_state["boardroom"]),
-            "office": dict(bot_state["office"]),
             "review": list(bot_state["review"]),
             "cio": dict(bot_state["cio"]),
         }
@@ -669,6 +687,7 @@ def api_data():
         "account": cached("account_pnl", account_with_pnl),
         "positions": cached("positions", get_open_positions),
         "bot": bot,
+        "radar": core.radar_snapshot(),
         "sources": {
             "yfinance": "Yahoo Finance API (News & Historical)",
             "alpaca": "Alpaca Paper Trading v2 API",
