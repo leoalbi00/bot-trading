@@ -410,10 +410,32 @@ core.get_dashboard_password()  # genera (e stampa nei log) la password al primo 
 
 # NB: lo stato è in memoria nel processo. Avviare con UN solo worker
 # (vedi Procfile), altrimenti ogni worker eseguirebbe il proprio loop di trading.
-bg_thread = threading.Thread(target=background_loop, daemon=True)
-bg_thread.start()
-keep_alive_thread = threading.Thread(target=keep_alive_loop, daemon=True)
-keep_alive_thread.start()
+_threads_lock = threading.Lock()
+_threads_pid = None
+
+def start_background_threads():
+    """Avvia i thread di trading e Keep-Alive una sola volta per processo.
+
+    Con gunicorn --preload l'app viene importata nel master prima del fork e i thread
+    avviati lì non esistono nel worker che serve la dashboard: per questo sotto gunicorn
+    vengono avviati nel worker (gunicorn.conf.py o, in alternativa, alla prima richiesta).
+    """
+    global _threads_pid
+    with _threads_lock:
+        if _threads_pid == os.getpid():
+            return
+        _threads_pid = os.getpid()
+    threading.Thread(target=background_loop, daemon=True).start()
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
+    log_message(f"🧵 Thread di trading e Keep-Alive avviati (PID {os.getpid()})")
+
+@app.before_request
+def ensure_background_threads():
+    start_background_threads()
+
+# gunicorn imposta SERVER_SOFTWARE prima di importare l'app (anche con --preload)
+if "gunicorn" not in os.getenv("SERVER_SOFTWARE", ""):
+    start_background_threads()
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
