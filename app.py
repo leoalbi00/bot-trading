@@ -89,7 +89,7 @@ def query_gemini_ai(prompt):
     try:
         from google import genai
         client = genai.Client(api_key=GEMINI_KEY)
-        for m in ['gemini-2.0-flash', 'gemini-1.5-flash']:
+        for m in ['gemini-2.0-flash', 'gemini-3.8-flash']:
             try:
                 res = client.models.generate_content(model=m, contents=prompt)
                 if res and res.text:

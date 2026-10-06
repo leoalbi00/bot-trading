@@ -26,7 +26,7 @@ HEADERS = {
 
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    ai_model = genai.GenerativeModel('gemini-1.5-flash')
+    ai_model = genai.GenerativeModel('gemini-3.8-flash')
 
 WATCHLIST = ["BTC-USD", "ETH-USD", "ADA-USD", "SOL-USD", "NVDA", "AAPL", "TSLA", "MSFT"]
 
