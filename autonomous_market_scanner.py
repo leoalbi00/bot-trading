@@ -3,7 +3,7 @@ import sys
 import time
 import argparse
 import datetime
-import requests
+import finnhub
 import resend
 import yfinance as yf
 
@@ -19,6 +19,10 @@ ALERT_EMAIL = os.getenv("ALERT_EMAIL")  # destinatario notifiche; se assente le 
 
 if RESEND_KEY:
     resend.api_key = RESEND_KEY
+
+finnhub_client = finnhub.Client(api_key=FINNHUB_KEY) if FINNHUB_KEY else None
+if finnhub_client:
+    finnhub_client.DEFAULT_TIMEOUT = core.HTTP_TIMEOUT
 
 def send_trade_alert(symbol, action, amount, price):
     """Invia un'email di notifica tramite Resend quando un ordine viene inviato."""
@@ -104,19 +108,14 @@ def fetch_news(symbol):
         return core.get_recent_news(symbol)
     try:
         today = datetime.date.today()
-        params = {
-            "symbol": symbol,
-            "from": (today - datetime.timedelta(days=30)).isoformat(),
-            "to": today.isoformat(),
-            "token": FINNHUB_KEY,
-        }
-        r = requests.get("https://finnhub.io/api/v1/company-news", params=params, timeout=core.HTTP_TIMEOUT)
-        if r.status_code == 200:
-            headlines = [a.get('headline') for a in r.json()[:3] if a.get('headline')]
-            if headlines:
-                return " | ".join(headlines)
-        else:
-            print(f"[!] Finnhub {r.status_code}: {r.text[:200]}")
+        articles = finnhub_client.company_news(
+            symbol,
+            _from=(today - datetime.timedelta(days=30)).isoformat(),
+            to=today.isoformat(),
+        )
+        headlines = [a.get('headline') for a in (articles or [])[:3] if a.get('headline')]
+        if headlines:
+            return " | ".join(headlines)
     except Exception as e:
         print(f"[!] Errore notizie Finnhub: {e}")
     return core.get_recent_news(symbol)
@@ -163,7 +162,7 @@ def evaluate_and_trade(asset, positions, pending, market_open):
         f"e motiva in una frase."
     )
 
-    text = core.query_ai(prompt)
+    text = core.query_ai(prompt, symbol=asset['symbol'])
     print(f"Decisione AI:\n{text}")
     decision = core.parse_decision(text)
 

@@ -24,7 +24,7 @@ ALPACA_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
 
 # Modelli Gemini supportati, in ordine di preferenza (sovrascrivibili da .env)
 # I modelli in 404 vengono esclusi automaticamente alla prima risposta negativa
@@ -33,7 +33,7 @@ GEMINI_MODELS = [m.strip() for m in os.getenv(
     "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash",
 ).split(",") if m.strip()]
 GEMINI_TIMEOUT_MS = 45000
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 MIN_ORDER_USD = 10.0
 HTTP_TIMEOUT = 10
@@ -52,7 +52,9 @@ SECRET_FIELDS = {
     "dashboard_password": "DASHBOARD_PASSWORD",
     "flask_secret_key": "FLASK_SECRET_KEY",
 }
-AI_PROVIDERS = ("gemini", "claude", "hybrid")
+AI_PROVIDERS = ("gemini", "groq", "hybrid", "quant")
+# Valori di versioni precedenti, convertiti automaticamente
+LEGACY_PROVIDERS = {"claude": "gemini"}
 _TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,15}$")
 
 DEFAULT_CONFIG = {
@@ -113,6 +115,7 @@ def _validate_config(data, base):
 
     if "ai_provider" in data:
         provider = str(data["ai_provider"]).lower()
+        provider = LEGACY_PROVIDERS.get(provider, provider)
         if provider not in AI_PROVIDERS:
             raise ValueError(f"ai_provider deve essere uno tra {', '.join(AI_PROVIDERS)}")
         cfg["ai_provider"] = provider
@@ -270,76 +273,108 @@ def _warn_throttled(key, message, log, every=3600):
 
 def _resolve_provider(provider, log):
     """Sceglie il provider effettivo in base alle chiavi configurate."""
-    has_gemini, has_claude = bool(GEMINI_KEY), bool(ANTHROPIC_KEY)
-    if provider == "hybrid" and not (has_gemini and has_claude):
-        if has_gemini or has_claude:
-            fallback = "gemini" if has_gemini else "claude"
-            missing = "ANTHROPIC_API_KEY" if has_gemini else "GEMINI_API_KEY"
+    if provider == "quant":
+        return provider
+    has = {"gemini": bool(GEMINI_KEY), "groq": bool(GROQ_KEY)}
+    if provider == "hybrid":
+        if all(has.values()):
+            return provider
+        if any(has.values()):
+            fallback = "gemini" if has["gemini"] else "groq"
+            missing = "GROQ_API_KEY" if has["gemini"] else "GEMINI_API_KEY"
             _warn_throttled("hybrid", f"⚠️ Modalità Ibrida: {missing} non configurata, uso solo {fallback.capitalize()}.", log)
             return fallback
-    if provider == "claude" and not has_claude and has_gemini:
-        _warn_throttled("claude", "⚠️ ANTHROPIC_API_KEY non configurata: uso Gemini al posto di Claude.", log)
-        return "gemini"
-    if provider == "gemini" and not has_gemini and has_claude:
-        _warn_throttled("gemini", "⚠️ GEMINI_API_KEY non configurata: uso Claude al posto di Gemini.", log)
-        return "claude"
+        return _no_ai_keys(log)
+    if not has[provider]:
+        other = "groq" if provider == "gemini" else "gemini"
+        if has[other]:
+            _warn_throttled(provider, f"⚠️ {provider.upper()}_API_KEY non configurata: uso {other.capitalize()}.", log)
+            return other
+        return _no_ai_keys(log)
     return provider
 
 
-def query_ai(prompt, log=print):
-    """Interroga il motore IA scelto in config.json (gemini / claude / hybrid).
+def _no_ai_keys(log):
+    _warn_throttled("no-keys", "🧮 Nessuna chiave IA configurata (GEMINI_API_KEY / GROQ_API_KEY): uso l'analisi quantitativa di riserva.", log)
+    return "quant"
 
-    In modalità ibrida si opera solo se i due modelli sono d'accordo, altrimenti HOLD.
-    Se un provider non è configurato o non risponde, si usa automaticamente l'altro.
+
+def query_ai(prompt, log=print, symbol=None):
+    """Interroga il motore scelto in config.json (gemini / groq / hybrid / quant).
+
+    - hybrid: si opera solo se Gemini e Groq sono d'accordo, altrimenti HOLD;
+      se uno dei due non risponde si usa l'altro.
+    - Se nessuna IA risponde (o non ci sono chiavi) e `symbol` è indicato,
+      si usa il motore quantitativo di riserva (RSI + SMA20).
     """
     provider = _resolve_provider(get_config()["ai_provider"], log)
-    if provider == "claude":
-        return query_claude_ai(prompt, log=log)
+
+    if provider == "quant":
+        return quant_decision(symbol, log) if symbol else "DECISIONE: HOLD | MOTIVO: Nessun simbolo per l'analisi quantitativa"
+
     if provider == "hybrid":
         gemini_res = _ask_gemini(prompt, log)
-        claude_res = _ask_claude(prompt, log)
-        if gemini_res is None and claude_res is None:
-            return "DECISIONE: HOLD | MOTIVO: Nessun motore IA ha risposto"
-        if gemini_res is None or claude_res is None:
-            working, failed = ("Claude", "Gemini") if gemini_res is None else ("Gemini", "Claude")
+        groq_res = _ask_groq(prompt, log)
+        if gemini_res and groq_res:
+            d_gemini, d_groq = parse_decision(gemini_res), parse_decision(groq_res)
+            decision = d_gemini if d_gemini == d_groq else "HOLD"
+            return (f"DECISIONE: {decision} | IBRIDO (Gemini={d_gemini}, Groq={d_groq})\n"
+                    f"[Gemini] {gemini_res}\n[Groq] {groq_res}")
+        if gemini_res or groq_res:
+            working, failed = ("Gemini", "Groq") if gemini_res else ("Groq", "Gemini")
             log(f"⚠️ Modalità Ibrida: {failed} non ha risposto, decisione basata solo su {working}.")
-            return gemini_res or claude_res
-        d_gemini, d_claude = parse_decision(gemini_res), parse_decision(claude_res)
-        decision = d_gemini if d_gemini == d_claude else "HOLD"
-        return (f"DECISIONE: {decision} | IBRIDO (Gemini={d_gemini}, Claude={d_claude})\n"
-                f"[Gemini] {gemini_res}\n[Claude] {claude_res}")
-    return query_gemini_ai(prompt, log=log)
+            return gemini_res or groq_res
+        result = None
+    elif provider == "groq":
+        result = _ask_groq(prompt, log)
+    else:
+        result = _ask_gemini(prompt, log)
+
+    if result:
+        return result
+    if symbol:
+        log("🧮 Nessuna IA disponibile: uso l'analisi quantitativa di riserva (RSI + SMA20).")
+        return quant_decision(symbol, log)
+    return "DECISIONE: HOLD | MOTIVO: Nessun motore IA ha risposto"
 
 
-_claude_client = None
+_groq_client = None
 
 
-def query_claude_ai(prompt, log=print):
-    """Interroga Claude (Anthropic). In caso di errore la decisione diventa HOLD."""
-    return _ask_claude(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Claude"
+def query_groq_ai(prompt, log=print):
+    """Interroga Groq (Llama 3.3 70B). In caso di errore la decisione diventa HOLD."""
+    return _ask_groq(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Groq"
 
 
-def _ask_claude(prompt, log):
-    """Testo della risposta di Claude, oppure None se non disponibile. Gli errori vengono loggati."""
-    global _claude_client
-    if not ANTHROPIC_KEY:
-        log("⚠️ ANTHROPIC_API_KEY non configurata.")
+def _ask_groq(prompt, log):
+    """Testo della risposta di Groq, oppure None se non disponibile. Gli errori vengono loggati."""
+    global _groq_client
+    if not GROQ_KEY:
+        log("⚠️ GROQ_API_KEY non configurata.")
         return None
     try:
-        if _claude_client is None:
-            import anthropic
-            _claude_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY, timeout=60)
-        res = _claude_client.messages.create(
-            model=CLAUDE_MODEL,
+        import groq
+        if _groq_client is None:
+            _groq_client = groq.Groq(api_key=GROQ_KEY, timeout=45, max_retries=1)
+        res = _groq_client.chat.completions.create(
+            model=GROQ_MODEL,
             max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(block.text for block in res.content if block.type == "text")
+        text = res.choices[0].message.content if res.choices else None
         if text:
             return text
-        log(f"⚠️ Claude {CLAUDE_MODEL}: risposta vuota.")
+        log(f"⚠️ Groq {GROQ_MODEL}: risposta vuota.")
     except Exception as e:
-        log(f"❌ Errore Claude ({CLAUDE_MODEL}): {e}")
+        kind = type(e).__name__
+        if kind == "RateLimitError":
+            log(f"⚠️ Groq {GROQ_MODEL}: limite di richieste raggiunto (429).")
+        elif kind == "NotFoundError":
+            log(f"⚠️ Groq {GROQ_MODEL}: modello non disponibile (404), imposta GROQ_MODEL.")
+        elif kind == "AuthenticationError":
+            log("❌ Groq: GROQ_API_KEY non valida.")
+        else:
+            log(f"❌ Errore Groq ({GROQ_MODEL}): {str(e)[:200]}")
     return None
 
 
@@ -421,16 +456,47 @@ def get_recent_news(yf_symbol, limit=3):
     return "Nessuna notizia rilevante recente."
 
 
-def get_rsi_and_price(yf_symbol):
-    """Restituisce (rsi, prezzo) su candele 1h dell'ultimo mese, oppure (None, None)."""
+def get_indicators(yf_symbol):
+    """RSI(14), SMA(20) e prezzo su candele 1h dell'ultimo mese, oppure None."""
     try:
         df = yf.Ticker(yf_symbol).history(period="1mo", interval="1h")
         if len(df) >= 20:
-            rsi = float(ta.momentum.RSIIndicator(df["Close"], window=14).rsi().iloc[-1])
-            return round(rsi, 2), float(df["Close"].iloc[-1])
+            close = df["Close"]
+            return {
+                "rsi": round(float(ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]), 2),
+                "sma20": float(ta.trend.SMAIndicator(close, window=20).sma_indicator().iloc[-1]),
+                "price": float(close.iloc[-1]),
+            }
     except Exception:
         pass
-    return None, None
+    return None
+
+
+def get_rsi_and_price(yf_symbol):
+    """Restituisce (rsi, prezzo) su candele 1h dell'ultimo mese, oppure (None, None)."""
+    ind = get_indicators(yf_symbol)
+    return (ind["rsi"], ind["price"]) if ind else (None, None)
+
+
+def quant_rule(rsi, price, sma20):
+    """Regole del motore quantitativo: (decisione, motivo)."""
+    if rsi < 30 and price > sma20:
+        return "BUY", f"RSI {rsi:.1f} < 30 (ipervenduto) e prezzo sopra SMA20"
+    if rsi > 70:
+        return "SELL", f"RSI {rsi:.1f} > 70 (ipercomprato)"
+    return "HOLD", f"RSI {rsi:.1f} neutrale"
+
+
+def quant_decision(yf_symbol, log=print):
+    """Analisi tecnica senza IA, nello stesso formato testuale delle risposte IA."""
+    ind = get_indicators(yf_symbol)
+    if not ind:
+        log(f"🧮 [Quant] {yf_symbol}: dati insufficienti, HOLD.")
+        return "DECISIONE: HOLD | MOTIVO: [Quant] dati di mercato insufficienti"
+    decision, reason = quant_rule(ind["rsi"], ind["price"], ind["sma20"])
+    detail = f"prezzo ${ind['price']:.2f}, SMA20 ${ind['sma20']:.2f}"
+    log(f"🧮 [Quant] {yf_symbol}: {decision} ({reason}; {detail})")
+    return f"DECISIONE: {decision} | MOTIVO: [Quant] {reason}; {detail}"
 
 
 # ---------------------------------------------------------------------------

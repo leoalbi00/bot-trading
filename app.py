@@ -247,7 +247,7 @@ def run_trading_cycle(manual=False):
                 Inizia la risposta con esattamente 'DECISIONE: SELL' oppure 'DECISIONE: HOLD', seguito da una breve motivazione.
                 """
                 log_message(f"Interrogazione Gemini per vendita {sym}...")
-                ai_res = core.query_ai(prompt, log=log_message)
+                ai_res = core.query_ai(prompt, log=log_message, symbol=yf_sym)
                 decision = core.parse_decision(ai_res, allowed=("SELL", "HOLD"))
                 verdict = "SELL (Vendita)" if decision == "SELL" else "HOLD (Mantiene)"
 
@@ -327,7 +327,7 @@ def run_trading_cycle(manual=False):
                     f"Inizia la risposta con esattamente 'DECISIONE: BUY' se reputi opportuno acquistare "
                     f"oppure 'DECISIONE: HOLD', seguito da una breve motivazione."
                 )
-                ai_res = core.query_ai(prompt, log=log_message)
+                ai_res = core.query_ai(prompt, log=log_message, symbol=sym)
                 is_buy = core.parse_decision(ai_res, allowed=("BUY", "HOLD")) == "BUY"
 
                 set_ai_analysis(
@@ -495,7 +495,7 @@ def api_data():
         "sources": {
             "yfinance": "Yahoo Finance API (News & Historical)",
             "alpaca": "Alpaca Paper Trading v2 API",
-            "gemini": "Google Gemini AI (Modello Decisionale)",
+            "ai": "Google Gemini / Groq Llama 3.3 + motore quantitativo di riserva",
             "ta": "Indicatori Tecnici RSI(14) e SMA"
         }
     })
