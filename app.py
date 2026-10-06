@@ -522,6 +522,8 @@ def start_background_threads():
     threading.Thread(target=background_loop, daemon=True).start()
     threading.Thread(target=keep_alive_loop, daemon=True).start()
     log_message(f"🧵 Thread di trading e Keep-Alive avviati (PID {os.getpid()})")
+    mode = "Auto (ordini automatici)" if core.get_config()["auto_execute_trades"] else "Advisor (nessun ordine)"
+    log_message(f"⚙️ Modalità di avvio: {mode} — BOT_AUTO_EXECUTE={os.getenv('BOT_AUTO_EXECUTE', 'non impostata')}")
 
 @app.before_request
 def ensure_background_threads():

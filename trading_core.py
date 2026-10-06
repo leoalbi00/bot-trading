@@ -93,6 +93,18 @@ DEFAULT_CONFIG = {
     "bot_api_token": PLACEHOLDER_TOKEN,
 }
 
+
+def env_auto_execute():
+    """Valore iniziale di Auto-Trading da BOT_AUTO_EXECUTE (default: false = Advisor).
+
+    config.json su Render si azzera a ogni deploy: senza questa variabile il bot
+    riparte sempre in modalità Advisor e non invia ordini finché non viene attivato.
+    """
+    return os.getenv("BOT_AUTO_EXECUTE", "false").strip().lower() in ("1", "true", "yes", "on", "si", "sì")
+
+
+DEFAULT_CONFIG["auto_execute_trades"] = env_auto_execute()
+
 _config_lock = threading.Lock()
 _config = None
 
