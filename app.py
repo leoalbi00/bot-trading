@@ -7,12 +7,17 @@ import itertools
 from collections import deque
 from functools import wraps
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import trading_core as core
 from trading_core import alpaca_client
 
 KEEP_ALIVE_INTERVAL = 600  # secondi tra un self-ping e l'altro
+
+# Protezione login: dopo MAX_LOGIN_ATTEMPTS errori l'IP viene bloccato per LOGIN_LOCKOUT secondi
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT = 300
 DATA_CACHE_TTL = 5  # secondi: limita le chiamate ad Alpaca dal polling della dashboard
 
 # Lock per impedire scansioni multiple simultanee
@@ -104,15 +109,54 @@ def get_open_positions():
         log_message(f"Errore recupero posizioni: {e}")
         return []
 
+def has_valid_token():
+    provided = request.headers.get("X-API-Key", "")
+    return hmac.compare_digest(provided.encode(), core.get_api_token().encode())
+
+def is_logged_in():
+    return session.get("auth") is True
+
 def require_token(fn):
-    """Protegge gli endpoint di controllo con header X-API-Key = BOT_API_TOKEN (env o config.json)."""
+    """Protegge gli endpoint di controllo con header X-API-Key = BOT_API_TOKEN (env o config.json).
+
+    Il token è visibile solo nella dashboard dopo il login, quindi fa anche da protezione CSRF.
+    """
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        provided = request.headers.get("X-API-Key", "")
-        if not hmac.compare_digest(provided.encode(), core.get_api_token().encode()):
+        if not has_valid_token():
             return jsonify({"status": "error", "message": "Non autorizzato: chiave API mancante o errata"}), 401
         return fn(*args, **kwargs)
     return wrapper
+
+def require_login(fn):
+    """Accesso in lettura: sessione della dashboard oppure header X-API-Key valido."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not (is_logged_in() or has_valid_token()):
+            return jsonify({"status": "error", "message": "Sessione scaduta: effettua di nuovo il login"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+_failed_logins = {}
+_failed_lock = threading.Lock()
+
+def login_blocked_for(ip):
+    """Secondi di blocco rimanenti per questo IP (0 se può riprovare)."""
+    with _failed_lock:
+        count, first = _failed_logins.get(ip, (0, 0.0))
+        if count >= MAX_LOGIN_ATTEMPTS:
+            remaining = LOGIN_LOCKOUT - (time.time() - first)
+            if remaining > 0:
+                return int(remaining) + 1
+            _failed_logins.pop(ip, None)
+        return 0
+
+def register_failed_login(ip):
+    with _failed_lock:
+        count, first = _failed_logins.get(ip, (0, time.time()))
+        if time.time() - first > LOGIN_LOCKOUT:
+            count, first = 0, time.time()
+        _failed_logins[ip] = (count + 1, first)
 
 def should_abort():
     if not bot_state["active"]:
@@ -348,6 +392,16 @@ def keep_alive_loop():
             log_message(f"[Keep-Alive] Errore self-ping verso {url}: {e}")
 
 app = Flask(__name__)
+# Render (e simili) stanno dietro un proxy: serve per IP reale e schema https
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+app.config.update(
+    SECRET_KEY=core.get_secret_key(),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.getenv("RENDER_EXTERNAL_URL")),
+    PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=7),
+)
+core.get_dashboard_password()  # genera (e stampa nei log) la password al primo avvio se non configurata
 
 # NB: lo stato è in memoria nel processo. Avviare con UN solo worker
 # (vedi Procfile), altrimenti ogni worker eseguirebbe il proprio loop di trading.
@@ -356,10 +410,40 @@ bg_thread.start()
 keep_alive_thread = threading.Thread(target=keep_alive_loop, daemon=True)
 keep_alive_thread.start()
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if is_logged_in():
+        return redirect(url_for("index"))
+    error = None
+    if request.method == "POST":
+        ip = request.remote_addr or "?"
+        blocked = login_blocked_for(ip)
+        if blocked:
+            error = f"Troppi tentativi errati. Riprova tra {blocked} secondi."
+        elif hmac.compare_digest(request.form.get("password", "").encode(), core.get_dashboard_password().encode()):
+            with _failed_lock:
+                _failed_logins.pop(ip, None)
+            session.clear()
+            session.permanent = True
+            session["auth"] = True
+            log_message(f"🔐 Login dashboard riuscito da {ip}")
+            return redirect(url_for("index"))
+        else:
+            register_failed_login(ip)
+            log_message(f"🔐 Tentativo di login fallito da {ip}")
+            error = "Password errata."
+    return render_template("login.html", error=error), (401 if error else 200)
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
 @app.route("/")
 def index():
-    # Il token viene inserito nella pagina così i pulsanti funzionano senza configurazione.
-    # NB: chiunque possa aprire la dashboard può quindi usare i comandi.
+    if not is_logged_in():
+        return redirect(url_for("login"))
+    # Il token è inserito solo nella pagina riservata, dopo il login
     return render_template("index.html", api_token=core.get_api_token())
 
 @app.route("/ping")
@@ -367,6 +451,7 @@ def ping():
     return jsonify({"status": "alive", "timestamp": datetime.datetime.now().isoformat()}), 200
 
 @app.route("/api/data")
+@require_login
 def api_data():
     with state_lock:
         bot = {
@@ -389,6 +474,7 @@ def api_data():
     })
 
 @app.route("/api/settings", methods=["GET"])
+@require_login
 def api_settings_get():
     return jsonify(core.public_config())
 

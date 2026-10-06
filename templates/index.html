@@ -58,6 +58,11 @@
             <button onclick="liquidateAll()" class="flex items-center gap-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold px-3 py-1.5 rounded transition">
                 <i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i> VENDI TUTTO
             </button>
+            <form method="post" action="/logout">
+                <button type="submit" title="Esci" class="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-borderSubtle text-xs font-semibold px-3 py-1.5 rounded transition">
+                    <i data-lucide="log-out" class="w-3.5 h-3.5"></i> ESCI
+                </button>
+            </form>
         </div>
     </header>
 
@@ -318,8 +323,13 @@
             if (body !== undefined) headers['Content-Type'] = 'application/json';
             const res = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
             const data = await res.json().catch(() => ({}));
-            if (res.status === 401 && !data.message) data.message = 'Non autorizzato: ricarica la pagina.';
+            if (res.status === 401) redirectToLogin();
             return { res, data };
+        }
+
+        // Sessione scaduta: torna alla pagina di login
+        function redirectToLogin() {
+            window.location.href = '/login';
         }
 
         // ---------------- Impostazioni ----------------
@@ -383,6 +393,7 @@
         async function loadSettings() {
             try {
                 const res = await fetch('/api/settings');
+                if (res.status === 401) return redirectToLogin();
                 if (!res.ok) throw new Error(`HTTP status ${res.status}`);
                 applySettings(await res.json());
             } catch (err) {
@@ -521,6 +532,7 @@
         async function fetchStatus() {
             try {
                 const res = await fetch('/api/data');
+                if (res.status === 401) return redirectToLogin();
                 if (!res.ok) throw new Error(`HTTP status ${res.status}`);
 
                 const data = await res.json();

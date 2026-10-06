@@ -39,6 +39,13 @@ CONFIG_PATH = os.getenv("BOT_CONFIG_PATH", os.path.join(os.path.dirname(os.path.
 
 # Valore segnaposto: se presente viene sostituito da un token casuale
 PLACEHOLDER_TOKEN = "default-secret-token"
+# Segreti salvati in config.json, mai esposti né modificabili dalla dashboard.
+# Se la variabile d'ambiente corrispondente è impostata, ha la precedenza.
+SECRET_FIELDS = {
+    "bot_api_token": "BOT_API_TOKEN",
+    "dashboard_password": "DASHBOARD_PASSWORD",
+    "flask_secret_key": "FLASK_SECRET_KEY",
+}
 AI_PROVIDERS = ("gemini", "claude", "hybrid")
 _TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,15}$")
 
@@ -104,8 +111,9 @@ def _validate_config(data, base):
             raise ValueError(f"ai_provider deve essere uno tra {', '.join(AI_PROVIDERS)}")
         cfg["ai_provider"] = provider
 
-    if "bot_api_token" in data and data["bot_api_token"]:
-        cfg["bot_api_token"] = str(data["bot_api_token"])
+    for key in SECRET_FIELDS:
+        if data.get(key):
+            cfg[key] = str(data[key])
 
     return cfg
 
@@ -126,9 +134,12 @@ def _load_config():
                 cfg = _validate_config(json.load(f), DEFAULT_CONFIG)
         except (OSError, ValueError) as e:
             print(f"[!] config.json non valido ({e}): uso i valori di default.")
-    if not os.getenv("BOT_API_TOKEN") and cfg.get("bot_api_token") in (None, "", PLACEHOLDER_TOKEN):
-        cfg["bot_api_token"] = secrets.token_urlsafe(24)
-        dirty = True
+    for key, env_name in SECRET_FIELDS.items():
+        if not os.getenv(env_name) and cfg.get(key) in (None, "", PLACEHOLDER_TOKEN):
+            cfg[key] = secrets.token_urlsafe(32 if key == "flask_secret_key" else 12 if key == "dashboard_password" else 24)
+            dirty = True
+            if key == "dashboard_password":
+                print(f"[!] DASHBOARD_PASSWORD non impostata: generata password '{cfg[key]}' (salvata in {CONFIG_PATH}).", flush=True)
     if dirty:
         try:
             _save_config(cfg)
@@ -149,7 +160,7 @@ def get_config():
 def update_config(changes):
     """Valida, applica e salva le modifiche. Restituisce la nuova configurazione."""
     global _config
-    changes = {k: v for k, v in changes.items() if k != "bot_api_token"}  # il token non si cambia da UI
+    changes = {k: v for k, v in changes.items() if k not in SECRET_FIELDS}  # i segreti non si cambiano da UI
     current = get_config()
     new_cfg = _validate_config(changes, current)
     with _config_lock:
@@ -161,13 +172,28 @@ def update_config(changes):
 def public_config():
     """Configurazione senza segreti, per la dashboard."""
     cfg = get_config()
-    cfg.pop("bot_api_token", None)
+    for key in SECRET_FIELDS:
+        cfg.pop(key, None)
     return cfg
 
 
 def get_api_token():
     """Token degli endpoint di controllo: variabile d'ambiente, altrimenti config.json."""
-    return os.getenv("BOT_API_TOKEN") or get_config()["bot_api_token"]
+    return _secret("bot_api_token")
+
+
+def get_dashboard_password():
+    """Password della dashboard: DASHBOARD_PASSWORD, altrimenti generata in config.json."""
+    return _secret("dashboard_password")
+
+
+def get_secret_key():
+    """Chiave per firmare i cookie di sessione Flask."""
+    return _secret("flask_secret_key")
+
+
+def _secret(key):
+    return os.getenv(SECRET_FIELDS[key]) or get_config()[key]
 
 alpaca_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True) if ALPACA_KEY and ALPACA_SECRET else None
 
