@@ -98,6 +98,82 @@
             </div>
         </div>
 
+        <!-- SEZIONE IMPOSTAZIONI BOT -->
+        <div class="bg-surface border border-borderSubtle rounded-lg overflow-hidden">
+            <div class="px-5 py-3 border-b border-borderSubtle flex items-center justify-between bg-zinc-950/40">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="settings" class="w-4 h-4 text-zinc-400"></i>
+                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">⚙️ Impostazioni Bot</span>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span id="settingsNotice" class="text-xs font-mono hidden"></span>
+                    <button onclick="saveSettings()" id="btnSaveSettings" class="flex items-center gap-2 bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold px-3 py-1.5 rounded transition disabled:opacity-50">
+                        💾 Salva Impostazioni
+                    </button>
+                </div>
+            </div>
+
+            <div class="p-5 grid grid-cols-1 lg:grid-cols-3 gap-6 text-xs">
+                <!-- Watchlist -->
+                <div class="lg:col-span-1">
+                    <div class="text-[10px] text-zinc-400 uppercase mb-2">Watchlist</div>
+                    <div id="watchlistChips" class="flex flex-wrap gap-2 mb-3"></div>
+                    <form onsubmit="addTicker(event)" class="flex gap-2">
+                        <input id="tickerInput" type="text" maxlength="15" placeholder="Es. GOOGL o DOGE-USD" autocomplete="off"
+                               class="flex-1 min-w-0 bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono uppercase text-zinc-200 focus:outline-none focus:border-cyan-700">
+                        <button type="submit" class="bg-zinc-800 hover:bg-zinc-700 border border-borderSubtle text-zinc-200 px-3 py-1.5 rounded font-semibold">+ Aggiungi</button>
+                    </form>
+                </div>
+
+                <!-- Parametri numerici -->
+                <div class="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-1 gap-3">
+                    <label class="block">
+                        <span class="text-[10px] text-zinc-400 uppercase">Stop Loss %</span>
+                        <input id="setStopLoss" type="number" step="0.5" min="-50" max="-0.5"
+                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
+                    </label>
+                    <label class="block">
+                        <span class="text-[10px] text-zinc-400 uppercase">% Allocazione Capitale (per ordine)</span>
+                        <input id="setAllocation" type="number" step="0.5" min="0.5" max="100"
+                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
+                    </label>
+                    <label class="block">
+                        <span class="text-[10px] text-zinc-400 uppercase">Intervallo di Scansione (minuti)</span>
+                        <input id="setInterval" type="number" step="1" min="1" max="1440"
+                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
+                    </label>
+                </div>
+
+                <!-- Modalità e motore IA -->
+                <div class="space-y-3">
+                    <label class="flex items-center justify-between gap-3 p-2 rounded bg-zinc-900/40 border border-zinc-800 cursor-pointer">
+                        <span>
+                            <span class="block text-zinc-200 font-semibold">Auto-Trading</span>
+                            <span id="autoTradeHint" class="block text-[10px] text-zinc-500">Esegue gli ordini automaticamente</span>
+                        </span>
+                        <input id="setAutoTrade" type="checkbox" class="sr-only peer" onchange="updateToggleHints()">
+                        <span class="relative w-9 h-5 shrink-0 rounded-full bg-zinc-700 peer-checked:bg-emerald-600 transition after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition peer-checked:after:translate-x-4"></span>
+                    </label>
+                    <label class="flex items-center justify-between gap-3 p-2 rounded bg-zinc-900/40 border border-zinc-800 cursor-pointer">
+                        <span>
+                            <span class="block text-zinc-200 font-semibold">Anti-Sleep (Keep-Alive)</span>
+                            <span class="block text-[10px] text-zinc-500">Self-ping ogni 10 minuti</span>
+                        </span>
+                        <input id="setKeepAlive" type="checkbox" class="sr-only peer">
+                        <span class="relative w-9 h-5 shrink-0 rounded-full bg-zinc-700 peer-checked:bg-emerald-600 transition after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition peer-checked:after:translate-x-4"></span>
+                    </label>
+                    <label class="block">
+                        <span class="text-[10px] text-zinc-400 uppercase">Motore IA</span>
+                        <select id="setAiProvider" class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
+                            <option value="gemini">Gemini</option>
+                            <option value="claude">Claude</option>
+                            <option value="hybrid">Ibrido (Gemini + Claude, opera solo se concordano)</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+        </div>
+
         <!-- SEZIONE 1: ANALISI IN TEMPO REALE & FONTI DATI CONSULTATE -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <!-- Focus Analisi IA Live -->
@@ -209,30 +285,237 @@
     <script>
         lucide.createIcons();
 
-        let isRunning = true;
+        // Token degli endpoint di controllo, inserito dal server
+        const API_TOKEN = {{ api_token|tojson }};
 
-        function addLog(message, type = 'info') {
+        let isRunning = true;
+        let watchlist = [];
+        // Log locali (feedback azioni) uniti a quelli del server in ordine cronologico
+        let localLogs = [];
+        let clearedServerId = 0;
+        let clearedTs = 0;
+        let lastServerLogs = [];
+        let lastRenderKey = '';
+
+        const LOG_COLORS = {
+            info: 'text-zinc-300',
+            error: 'text-rose-400',
+            success: 'text-emerald-400',
+            warn: 'text-amber-400',
+            system: 'text-cyan-400'
+        };
+
+        function el(tag, className, text) {
+            const node = document.createElement(tag);
+            if (className) node.className = className;
+            if (text !== undefined && text !== null) node.textContent = String(text);
+            return node;
+        }
+
+        // Richiesta autenticata verso gli endpoint di controllo
+        async function apiRequest(url, method = 'POST', body = undefined) {
+            const headers = { 'X-API-Key': API_TOKEN };
+            if (body !== undefined) headers['Content-Type'] = 'application/json';
+            const res = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
+            const data = await res.json().catch(() => ({}));
+            if (res.status === 401 && !data.message) data.message = 'Non autorizzato: ricarica la pagina.';
+            return { res, data };
+        }
+
+        // ---------------- Impostazioni ----------------
+        function renderWatchlist() {
+            const box = document.getElementById('watchlistChips');
+            box.replaceChildren();
+            for (const ticker of watchlist) {
+                const chip = el('span', 'inline-flex items-center gap-1.5 pl-2 pr-1 py-0.5 rounded bg-zinc-800 border border-zinc-700 font-mono text-zinc-200');
+                chip.appendChild(document.createTextNode(ticker));
+                const remove = el('button', 'text-zinc-400 hover:text-rose-400 px-1 rounded', '×');
+                remove.type = 'button';
+                remove.title = `Rimuovi ${ticker}`;
+                remove.onclick = () => { watchlist = watchlist.filter(t => t !== ticker); renderWatchlist(); };
+                chip.appendChild(remove);
+                box.appendChild(chip);
+            }
+            if (watchlist.length === 0) box.appendChild(el('span', 'text-zinc-500', 'Watchlist vuota'));
+        }
+
+        function addTicker(event) {
+            event.preventDefault();
+            const input = document.getElementById('tickerInput');
+            const ticker = input.value.trim().toUpperCase();
+            if (!/^[A-Z0-9.\-]{1,15}$/.test(ticker)) {
+                showSettingsNotice('Ticker non valido', 'error');
+                return;
+            }
+            if (!watchlist.includes(ticker)) watchlist.push(ticker);
+            input.value = '';
+            renderWatchlist();
+        }
+
+        function updateToggleHints() {
+            const auto = document.getElementById('setAutoTrade').checked;
+            document.getElementById('autoTradeHint').textContent = auto
+                ? 'Auto: esegue gli ordini automaticamente'
+                : 'Advisor: registra solo i suggerimenti';
+        }
+
+        function applySettings(cfg) {
+            watchlist = Array.isArray(cfg.watchlist) ? [...cfg.watchlist] : [];
+            renderWatchlist();
+            document.getElementById('setStopLoss').value = cfg.stop_loss_pct;
+            document.getElementById('setAllocation').value = cfg.max_allocation_pct;
+            document.getElementById('setInterval').value = cfg.scan_interval_min;
+            document.getElementById('setAutoTrade').checked = Boolean(cfg.auto_execute_trades);
+            document.getElementById('setKeepAlive').checked = Boolean(cfg.keep_alive_enabled);
+            document.getElementById('setAiProvider').value = cfg.ai_provider || 'gemini';
+            updateToggleHints();
+        }
+
+        let noticeTimer = null;
+        function showSettingsNotice(message, type) {
+            const notice = document.getElementById('settingsNotice');
+            notice.textContent = message;
+            notice.className = `text-xs font-mono ${type === 'error' ? 'text-rose-400' : 'text-emerald-400'}`;
+            clearTimeout(noticeTimer);
+            noticeTimer = setTimeout(() => notice.classList.add('hidden'), 4000);
+        }
+
+        async function loadSettings() {
+            try {
+                const res = await fetch('/api/settings');
+                if (!res.ok) throw new Error(`HTTP status ${res.status}`);
+                applySettings(await res.json());
+            } catch (err) {
+                showSettingsNotice('Errore caricamento impostazioni', 'error');
+            }
+        }
+
+        async function saveSettings() {
+            const btn = document.getElementById('btnSaveSettings');
+            const payload = {
+                watchlist,
+                stop_loss_pct: Number(document.getElementById('setStopLoss').value),
+                max_allocation_pct: Number(document.getElementById('setAllocation').value),
+                scan_interval_min: Number(document.getElementById('setInterval').value),
+                auto_execute_trades: document.getElementById('setAutoTrade').checked,
+                keep_alive_enabled: document.getElementById('setKeepAlive').checked,
+                ai_provider: document.getElementById('setAiProvider').value
+            };
+            btn.disabled = true;
+            try {
+                const { res, data } = await apiRequest('/api/settings', 'POST', payload);
+                if (res.ok && data.settings) {
+                    applySettings(data.settings);
+                    showSettingsNotice('✓ Impostazioni salvate', 'success');
+                    addLog('Impostazioni salvate', 'success');
+                } else {
+                    showSettingsNotice(data.message || 'Errore salvataggio', 'error');
+                }
+            } catch (err) {
+                showSettingsNotice('Errore salvataggio: ' + err.message, 'error');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function renderLogs(force = false) {
             const container = document.getElementById('terminalContainer');
             if (!container) return;
-            const row = document.createElement('div');
-            
-            let color = 'text-zinc-300';
-            if (type === 'error') color = 'text-rose-400';
-            if (type === 'success') color = 'text-emerald-400';
-            if (type === 'warn') color = 'text-amber-400';
-            if (type === 'system') color = 'text-cyan-400';
 
+            const entries = lastServerLogs
+                .filter(l => l.id > clearedServerId)
+                .map(l => ({ ts: l.ts, text: l.text, type: 'info' }))
+                .concat(localLogs.filter(l => l.ts > clearedTs))
+                .sort((a, b) => a.ts - b.ts);
+
+            const renderKey = entries.length + ':' + (entries.length ? entries[entries.length - 1].ts + entries[entries.length - 1].text : '');
+            if (!force && renderKey === lastRenderKey) return;
+            lastRenderKey = renderKey;
+
+            // Autoscroll solo se l'utente è già in fondo
+            const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 40;
+            container.replaceChildren();
+            if (entries.length === 0) {
+                container.appendChild(el('div', 'text-zinc-500', '[SYSTEM] Nessun log.'));
+            }
+            for (const entry of entries) {
+                container.appendChild(el('div', `${LOG_COLORS[entry.type] || LOG_COLORS.info} leading-relaxed break-all`, entry.text));
+            }
+            if (atBottom || force) container.scrollTop = container.scrollHeight;
+        }
+
+        function addLog(message, type = 'info') {
             const time = new Date().toLocaleTimeString('it-IT');
-            row.className = `${color} leading-relaxed break-all`;
-            row.textContent = `[${time}] ${message}`;
-
-            container.appendChild(row);
-            container.scrollTop = container.scrollHeight;
+            localLogs.push({ ts: Date.now() / 1000, text: `[${time}] ${message}`, type });
+            if (localLogs.length > 30) localLogs.shift();
+            renderLogs(true);
         }
 
         function clearLogs() {
-            const container = document.getElementById('terminalContainer');
-            if (container) container.innerHTML = '<div class="text-zinc-500">[SYSTEM] Log puliti.</div>';
+            clearedServerId = lastServerLogs.reduce((max, l) => Math.max(max, l.id), clearedServerId);
+            clearedTs = Date.now() / 1000;
+            localLogs = [];
+            renderLogs(true);
+        }
+
+        function formatUsd(value) {
+            return `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+        }
+
+        function renderPositions(positions) {
+            const tbody = document.getElementById('positionsTableBody');
+            document.getElementById('posCount').textContent = `${positions.length} Posizioni Attive`;
+            if (!tbody) return;
+
+            tbody.replaceChildren();
+            if (positions.length === 0) {
+                const row = el('tr');
+                const cell = el('td', 'py-4 text-center text-zinc-500', 'Nessuna posizione aperta al momento.');
+                cell.colSpan = 6;
+                row.appendChild(cell);
+                tbody.appendChild(row);
+                return;
+            }
+
+            for (const p of positions) {
+                const pl = Number(p.unrealized_pl);
+                const row = el('tr', 'hover:bg-zinc-900/50 transition');
+
+                const symCell = el('td', 'py-3 px-4 font-bold text-white flex items-center gap-2');
+                symCell.appendChild(el('span', 'w-2 h-2 rounded-full bg-emerald-500'));
+                symCell.appendChild(document.createTextNode(' ' + p.symbol));
+                row.appendChild(symCell);
+
+                const sideCell = el('td', 'py-3 px-4');
+                sideCell.appendChild(el('span', 'px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 text-[10px]', p.side || 'LONG'));
+                row.appendChild(sideCell);
+
+                row.appendChild(el('td', 'py-3 px-4', p.qty));
+                row.appendChild(el('td', 'py-3 px-4', `$${Number(p.current_price).toFixed(2)}`));
+                row.appendChild(el('td', 'py-3 px-4', formatUsd(p.market_value)));
+                row.appendChild(el('td', `py-3 px-4 font-bold ${pl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`, `${pl >= 0 ? '+' : '-'}$${Math.abs(pl).toFixed(2)}`));
+                tbody.appendChild(row);
+            }
+        }
+
+        function renderAiAnalysis(ai) {
+            if (ai.symbol) document.getElementById('aiTargetSymbol').textContent = ai.symbol;
+            if (ai.rsi) document.getElementById('aiRsi').textContent = ai.rsi;
+            if (ai.sentiment) document.getElementById('aiSentiment').textContent = ai.sentiment;
+            if (ai.ai_verdict) {
+                const verdict = document.getElementById('aiVerdict');
+                verdict.textContent = ai.ai_verdict;
+                const v = ai.ai_verdict.toUpperCase();
+                verdict.className = 'text-sm font-mono font-bold mt-1 ' +
+                    (v.startsWith('SELL') ? 'text-rose-400' : v.startsWith('BUY') ? 'text-emerald-400' : 'text-cyan-400');
+            }
+            if (ai.reasoning) {
+                const box = document.getElementById('aiReasoning');
+                box.replaceChildren(
+                    el('span', 'text-cyan-400 font-bold', '[RAGIONAMENTO IA]:'),
+                    document.createTextNode(' ' + ai.reasoning)
+                );
+            }
         }
 
         async function fetchStatus() {
@@ -244,66 +527,24 @@
 
                 // 1. Account Metrics
                 const account = data.account || {};
-                if (account.portfolio !== undefined) {
-                    document.getElementById('portfolioValue').textContent = `$${Number(account.portfolio).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-                }
-                if (account.cash !== undefined) {
-                    document.getElementById('cashBalance').textContent = `$${Number(account.cash).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-                }
-                if (account.buying_power !== undefined) {
-                    document.getElementById('cashRatio').textContent = `Buying Power: $${Number(account.buying_power).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-                }
+                if (account.portfolio !== undefined) document.getElementById('portfolioValue').textContent = formatUsd(account.portfolio);
+                if (account.cash !== undefined) document.getElementById('cashBalance').textContent = formatUsd(account.cash);
+                if (account.buying_power !== undefined) document.getElementById('cashRatio').textContent = `Buying Power: ${formatUsd(account.buying_power)}`;
 
-                // 2. Stato Bot & Log
+                // 2. Stato Bot & Log (ordine cronologico, il più recente in fondo)
                 const bot = data.bot || {};
                 if (bot.last_scan) document.getElementById('lastScanTime').textContent = bot.last_scan;
                 if (bot.status) document.getElementById('lastScanStatus').textContent = `Stato: ${bot.status}`;
-
-                if (Array.isArray(bot.logs) && bot.logs.length > 0) {
-                    const container = document.getElementById('terminalContainer');
-                    if (container) {
-                        container.innerHTML = bot.logs.map(l => `<div class="text-zinc-300 leading-relaxed break-all">${l}</div>`).join('');
-                        container.scrollTop = container.scrollHeight;
-                    }
+                if (Array.isArray(bot.logs)) {
+                    lastServerLogs = bot.logs.filter(l => l && typeof l === 'object');
+                    renderLogs();
                 }
 
                 // 3. Posizioni Aperte (Movimentazioni)
-                const positions = data.positions || [];
-                const tbody = document.getElementById('positionsTableBody');
-                document.getElementById('posCount').textContent = `${positions.length} Posizioni Attive`;
-
-                if (tbody) {
-                    if (positions.length === 0) {
-                        tbody.innerHTML = `<tr><td colspan="6" class="py-4 text-center text-zinc-500">Nessuna posizione aperta al momento.</td></tr>`;
-                    } else {
-                        tbody.innerHTML = positions.map(p => {
-                            const pnlClass = p.unrealized_pl >= 0 ? 'text-emerald-400' : 'text-rose-400';
-                            const pnlSign = p.unrealized_pl >= 0 ? '+' : '';
-                            return `
-                                <tr class="hover:bg-zinc-900/50 transition">
-                                    <td class="py-3 px-4 font-bold text-white flex items-center gap-2">
-                                        <span class="w-2 h-2 rounded-full bg-emerald-500"></span> ${p.symbol}
-                                    </td>
-                                    <td class="py-3 px-4"><span class="px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 text-[10px]">${p.side || 'LONG'}</span></td>
-                                    <td class="py-3 px-4">${p.qty}</td>
-                                    <td class="py-3 px-4">$${Number(p.current_price).toFixed(2)}</td>
-                                    <td class="py-3 px-4">$${Number(p.market_value).toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                    <td class="py-3 px-4 font-bold ${pnlClass}">${pnlSign}$${Number(p.unrealized_pl).toFixed(2)}</td>
-                                </tr>
-                            `;
-                        }).join('');
-                    }
-                }
+                renderPositions(Array.isArray(data.positions) ? data.positions : []);
 
                 // 4. Analisi Live dell'IA
-                if (bot.latest_ai_analysis) {
-                    const ai = bot.latest_ai_analysis;
-                    if (ai.symbol) document.getElementById('aiTargetSymbol').textContent = ai.symbol;
-                    if (ai.rsi) document.getElementById('aiRsi').textContent = ai.rsi;
-                    if (ai.sentiment) document.getElementById('aiSentiment').textContent = ai.sentiment;
-                    if (ai.ai_verdict) document.getElementById('aiVerdict').textContent = ai.ai_verdict;
-                    if (ai.reasoning) document.getElementById('aiReasoning').innerHTML = `<span class="text-cyan-400 font-bold">[RAGIONAMENTO IA]:</span> ${ai.reasoning}`;
-                }
+                if (bot.latest_ai_analysis) renderAiAnalysis(bot.latest_ai_analysis);
 
                 if (bot.active !== undefined) isRunning = Boolean(bot.active);
                 updateBotStatusDisplay();
@@ -321,26 +562,38 @@
 
             if (!indicator || !text || !btn) return;
 
+            const wasRunning = btn.dataset.running;
             if (isRunning) {
                 indicator.className = 'h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse';
                 text.textContent = 'ATTIVO';
                 text.className = 'text-xs px-2 py-0.5 rounded border border-emerald-900 bg-emerald-950 text-emerald-400 font-mono';
-                btn.innerHTML = '<i data-lucide="pause" class="w-3.5 h-3.5"></i> PAUSA BOT';
             } else {
                 indicator.className = 'h-2.5 w-2.5 rounded-full bg-amber-500';
                 text.textContent = 'IN PAUSA';
                 text.className = 'text-xs px-2 py-0.5 rounded border border-amber-900 bg-amber-950 text-amber-400 font-mono';
-                btn.innerHTML = '<i data-lucide="play" class="w-3.5 h-3.5"></i> AVVIA BOT';
             }
-            lucide.createIcons();
+            // Ricrea il pulsante solo quando lo stato cambia
+            if (wasRunning !== String(isRunning)) {
+                btn.dataset.running = String(isRunning);
+                btn.innerHTML = isRunning
+                    ? '<i data-lucide="pause" class="w-3.5 h-3.5"></i> PAUSA BOT'
+                    : '<i data-lucide="play" class="w-3.5 h-3.5"></i> AVVIA BOT';
+                lucide.createIcons();
+            }
+        }
+
+        function logResult(res, data, fallback) {
+            const ok = res.ok && data.status !== 'error';
+            const type = !ok ? 'error' : data.status === 'warning' ? 'warn' : 'success';
+            addLog(data.message || fallback, type);
+            return ok;
         }
 
         async function triggerScan() {
             addLog('Avvio scansione manuale...', 'system');
             try {
-                const res = await fetch('/api/scan', { method: 'POST' });
-                const data = await res.json();
-                addLog(data.message || 'Scansione completata', 'success');
+                const { res, data } = await apiRequest('/api/scan');
+                logResult(res, data, 'Scansione avviata');
                 fetchStatus();
             } catch (err) {
                 addLog('Errore durante la scansione: ' + err.message, 'error');
@@ -349,9 +602,12 @@
 
         async function toggleBot() {
             try {
-                const res = await fetch('/api/toggle', { method: 'POST' });
-                const data = await res.json();
-                isRunning = data.active !== undefined ? data.active : !isRunning;
+                const { res, data } = await apiRequest('/api/toggle');
+                if (!res.ok) {
+                    logResult(res, data, 'Errore cambio stato bot');
+                    return;
+                }
+                isRunning = Boolean(data.active);
                 updateBotStatusDisplay();
                 addLog(isRunning ? 'Bot riavviato' : 'Bot in pausa', 'warn');
             } catch (err) {
@@ -363,15 +619,15 @@
             if (!confirm('SEI SICURO? Questa azione chiuderà TUTTE le posizioni aperte.')) return;
             addLog('INVIO ORDINE DI LIQUIDAZIONE TOTALE...', 'error');
             try {
-                const res = await fetch('/api/liquidate', { method: 'POST' });
-                const data = await res.json();
-                addLog(data.message || 'Liquidazione completata.', 'success');
+                const { res, data } = await apiRequest('/api/liquidate');
+                logResult(res, data, 'Liquidazione completata.');
                 fetchStatus();
             } catch (err) {
                 addLog('Errore liquidazione: ' + err.message, 'error');
             }
         }
 
+        loadSettings();
         fetchStatus();
         setInterval(fetchStatus, 3000);
     </script>

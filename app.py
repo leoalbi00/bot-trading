@@ -1,34 +1,34 @@
 import os
 import time
+import hmac
 import threading
 import datetime
-import dotenv
-import pandas as pd
-import yfinance as yf
-import ta
+import itertools
+from collections import deque
+from functools import wraps
+import requests
 from flask import Flask, jsonify, render_template, request
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
 
-dotenv.load_dotenv()
+import trading_core as core
+from trading_core import alpaca_client
 
-ALPACA_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+KEEP_ALIVE_INTERVAL = 600  # secondi tra un self-ping e l'altro
+DATA_CACHE_TTL = 5  # secondi: limita le chiamate ad Alpaca dal polling della dashboard
 
-alpaca_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True) if ALPACA_KEY else None
-
-WATCHLIST = ["BTC-USD", "ETH-USD", "SOL-USD", "NVDA", "AAPL", "TSLA", "MSFT", "AMD"]
-
-# Aggiunto Lock per impedire scansioni multiple simultanee
+# Lock per impedire scansioni multiple simultanee
 scan_lock = threading.Lock()
+# Lock per lo stato condiviso tra thread (log e analisi IA)
+state_lock = threading.Lock()
+# Evento per risvegliare il loop quando il bot viene riattivato
+wake_event = threading.Event()
+
+_log_ids = itertools.count(1)
 
 bot_state = {
     "active": True,
     "last_scan": "In attesa del primo scan...",
     "status": "Inizializzato",
-    "logs": [],
+    "logs": deque(maxlen=60),  # ordine cronologico: il più recente è in fondo
     "latest_ai_analysis": {
         "symbol": "INIZIALIZZO...",
         "rsi": "--",
@@ -39,12 +39,32 @@ bot_state = {
 }
 
 def log_message(msg):
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    entry = f"[{timestamp}] {msg}"
-    print(entry)
-    bot_state["logs"].insert(0, entry)
-    if len(bot_state["logs"]) > 60:
-        bot_state["logs"].pop()
+    now = datetime.datetime.now()
+    entry = f"[{now.strftime('%H:%M:%S')}] {msg}"
+    print(entry, flush=True)
+    with state_lock:
+        bot_state["logs"].append({"id": next(_log_ids), "ts": now.timestamp(), "text": entry})
+
+def set_ai_analysis(**analysis):
+    with state_lock:
+        bot_state["latest_ai_analysis"] = analysis
+
+def short_text(text, limit=80):
+    return text[:limit] + "..." if len(text) > limit else text
+
+_cache = {}
+_cache_lock = threading.Lock()
+
+def cached(key, fn):
+    """Cache breve per i dati Alpaca richiesti dalla dashboard ogni 3 secondi."""
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < DATA_CACHE_TTL:
+            return hit[1]
+    value = fn()
+    with _cache_lock:
+        _cache[key] = (time.time(), value)
+    return value
 
 def get_account_summary():
     if not alpaca_client:
@@ -67,53 +87,40 @@ def get_open_positions():
         positions = alpaca_client.get_all_positions()
         res = []
         for p in positions:
+            crypto = "crypto" in str(getattr(p, "asset_class", "")).lower()
             res.append({
                 "symbol": p.symbol,
+                "yf_symbol": core.to_yf_symbol(p.symbol, crypto=crypto),
+                "is_crypto": crypto,
                 "qty": float(p.qty),
                 "market_value": float(p.market_value),
                 "current_price": float(p.current_price),
                 "unrealized_pl": float(p.unrealized_pl),
-                "side": getattr(p, 'side', 'long').upper()
+                "unrealized_plpc": float(p.unrealized_plpc) * 100,
+                "side": str(getattr(getattr(p, "side", None), "value", getattr(p, "side", "long"))).upper()
             })
         return res
     except Exception as e:
         log_message(f"Errore recupero posizioni: {e}")
         return []
 
-def get_recent_news(ticker):
-    """Recupera le ultime notizie per un asset tramite yfinance."""
-    try:
-        t = yf.Ticker(ticker)
-        news = t.news
-        if news:
-            titles = [item.get('title', '') for item in news[:3] if item.get('title')]
-            if titles:
-                return " | ".join(titles)
-    except Exception:
-        pass
-    return "Nessuna notizia rilevante recente."
+def require_token(fn):
+    """Protegge gli endpoint di controllo con header X-API-Key = BOT_API_TOKEN (env o config.json)."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        provided = request.headers.get("X-API-Key", "")
+        if not hmac.compare_digest(provided.encode(), core.get_api_token().encode()):
+            return jsonify({"status": "error", "message": "Non autorizzato: chiave API mancante o errata"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
-def query_gemini_ai(prompt):
-    if not GEMINI_KEY:
-        log_message("⚠️ GEMINI_API_KEY non trovata.")
-        return "DECISIONE: HOLD | MOTIVO: API Key non configurata"
+def should_abort():
+    if not bot_state["active"]:
+        log_message("⏸️ Bot messo in pausa: interrompo il ciclo corrente.")
+        return True
+    return False
 
-    try:
-        from google import genai
-        client = genai.Client(api_key=GEMINI_KEY)
-        for m in ['gemini-2.0-flash', 'gemini-1.5-flash']:
-            try:
-                res = client.models.generate_content(model=m, contents=prompt)
-                if res and res.text:
-                    return res.text
-            except Exception:
-                continue
-    except Exception as e:
-        log_message(f"Errore chiamata Gemini: {e}")
-
-    return "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API"
-
-def run_trading_cycle():
+def run_trading_cycle(manual=False):
     # Verifica che non ci sia un'altra scansione in corso
     if not scan_lock.acquire(blocking=False):
         log_message("⚠️ Scansione già in corso. Attendi il completamento.")
@@ -124,80 +131,98 @@ def run_trading_cycle():
         bot_state["last_scan"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message("=== AVVIO SCANSIONE MERCATO & PORTAFOGLIO ===")
 
+        cfg = core.get_config()
+        auto_trade = cfg["auto_execute_trades"]
+        if not auto_trade:
+            log_message("🧭 Modalità Advisor: le decisioni vengono solo registrate, nessun ordine inviato.")
+
+        if not alpaca_client:
+            log_message("⚠️ Credenziali Alpaca non configurate: nessun ordine verrà inviato.")
+
+        # Ordini già aperti: evitano duplicati e accumuli a mercato chiuso
+        pending = core.get_pending_order_symbols(log=log_message)
+        if pending is None:
+            log_message("⚠️ Stato ordini pendenti sconosciuto: salto l'invio di ordini in questo ciclo.")
+        elif pending:
+            log_message(f"Ordini pendenti su: {sorted(pending)}")
+        market_open = core.is_market_open(log=log_message)
+
         # ---------------------------------------------------------
         # 1. VALUTAZIONE PREDITTIVA DI VENDITA SULLE POSIZIONI APERTE
         # ---------------------------------------------------------
         open_positions = get_open_positions()
+        held = {core.normalize_symbol(p["symbol"]) for p in open_positions}
+
         for pos in open_positions:
+            if not manual and should_abort():
+                return
             sym = pos["symbol"]
+            yf_sym = pos["yf_symbol"]
             qty = pos["qty"]
             unrealized_pl = pos["unrealized_pl"]
             mkt_val = pos["market_value"]
-            pl_percent = (unrealized_pl / (mkt_val - unrealized_pl)) * 100 if mkt_val != unrealized_pl else 0
+            pl_percent = pos["unrealized_plpc"]
 
-            # Aggiornamento intermedio per interfaccia grafica
-            bot_state["latest_ai_analysis"] = {
-                "symbol": sym,
-                "rsi": "Calcolo...",
-                "sentiment": "Recupero news...",
-                "ai_verdict": "VALUTAZIONE VENDITA",
-                "reasoning": f"Analisi del rischio in corso per la posizione aperta su {sym}..."
-            }
+            if pending is None or core.normalize_symbol(sym) in pending:
+                log_message(f"{sym}: ordine già pendente o stato ordini ignoto, salto la valutazione di vendita.")
+                continue
 
-            news_summary = get_recent_news(sym)
-            rsi_val = "N/A"
-            try:
-                df = yf.Ticker(sym).history(period="1mo", interval="1h")
-                if len(df) >= 20:
-                    rsi_val = round(float(ta.momentum.RSIIndicator(df['Close'], window=14).rsi().iloc[-1]), 2)
-            except Exception:
-                pass
+            set_ai_analysis(
+                symbol=sym,
+                rsi="Calcolo...",
+                sentiment="Recupero news...",
+                ai_verdict="VALUTAZIONE VENDITA",
+                reasoning=f"Analisi del rischio in corso per la posizione aperta su {sym}..."
+            )
+
+            news_summary = core.get_recent_news(yf_sym)
+            rsi, _ = core.get_rsi_and_price(yf_sym)
+            rsi_val = rsi if rsi is not None else "N/A"
 
             log_message(f"Verifica Posizione {sym}: PnL ${unrealized_pl:.2f} ({pl_percent:.2f}%) | RSI: {rsi_val}")
 
-            prompt = f"""
-            Sei un agente di risk management per un bot quantitativo.
-            Analizza la posizione aperta per l'asset {sym}:
-            - Quantità detenuta: {qty}
-            - Valore di mercato attuale: ${mkt_val:.2f}
-            - Profit/Loss attuale: ${unrealized_pl:.2f} ({pl_percent:.2f}%)
-            - RSI (1h): {rsi_val}
-            - Ultime notizie/headlines sul titolo: "{news_summary}"
+            if pl_percent <= cfg["stop_loss_pct"]:
+                # Lo stop loss ha la precedenza: nessuna chiamata IA
+                decision = "SELL"
+                ai_res = f"Stop Loss di sicurezza ({cfg['stop_loss_pct']:.1f}%) raggiunto: PnL {pl_percent:.2f}%"
+                verdict = "SELL (Stop Loss)"
+            else:
+                prompt = f"""
+                Sei un agente di risk management per un bot quantitativo.
+                Analizza la posizione aperta per l'asset {yf_sym}:
+                - Quantità detenuta: {qty}
+                - Valore di mercato attuale: ${mkt_val:.2f}
+                - Profit/Loss attuale: ${unrealized_pl:.2f} ({pl_percent:.2f}%)
+                - RSI (1h): {rsi_val}
+                - Ultime notizie/headlines sul titolo: "{news_summary}"
 
-            Valuta se esistono rischi imminenti di ribasso, perdita di momentum o se le notizie indicano un sentiment negativo.
-            Devi decidere se VENDERE SUBITO per proteggere il capitale o incassare il profitto, oppure MANTENERE.
-            
-            Rispondi includendo 'DECISIONE: SELL' oppure 'DECISIONE: HOLD' seguiti da una breve motivazione.
-            """
+                Valuta se esistono rischi imminenti di ribasso, perdita di momentum o se le notizie indicano un sentiment negativo.
+                Devi decidere se VENDERE SUBITO per proteggere il capitale o incassare il profitto, oppure MANTENERE.
 
-            log_message(f"Interrogazione Gemini per vendita {sym}...")
-            ai_res = query_gemini_ai(prompt)
-            should_sell = "SELL" in ai_res.upper()
-            
-            # Aggiorna monitoraggio IA con il verdetto finale
-            bot_state["latest_ai_analysis"] = {
-                "symbol": sym,
-                "rsi": str(rsi_val),
-                "sentiment": news_summary[:80] + "..." if len(news_summary) > 80 else news_summary,
-                "ai_verdict": "SELL (Vendita)" if should_sell else "HOLD (Mantiene)",
-                "reasoning": ai_res
-            }
-            
-            if pl_percent <= -5.0:
-                should_sell = True
-                ai_res = "Stop Loss di sicurezza estrema (-5%)"
+                Inizia la risposta con esattamente 'DECISIONE: SELL' oppure 'DECISIONE: HOLD', seguito da una breve motivazione.
+                """
+                log_message(f"Interrogazione Gemini per vendita {sym}...")
+                ai_res = core.query_ai(prompt, log=log_message)
+                decision = core.parse_decision(ai_res, allowed=("SELL", "HOLD"))
+                verdict = "SELL (Vendita)" if decision == "SELL" else "HOLD (Mantiene)"
 
-            if should_sell:
+            set_ai_analysis(
+                symbol=sym,
+                rsi=str(rsi_val),
+                sentiment=short_text(news_summary),
+                ai_verdict=verdict,
+                reasoning=ai_res
+            )
+
+            if decision == "SELL" and not auto_trade:
+                log_message(f"🧭 [Advisor] Suggerita VENDITA di {sym} ({qty} quote): ordine non inviato.")
+            elif decision == "SELL" and alpaca_client:
                 try:
                     log_message(f"🚨 VENDITA PREDITTIVA {sym} ({qty} quote): {ai_res}")
-                    order_data = MarketOrderRequest(
-                        symbol=sym,
-                        qty=qty,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.GTC
-                    )
-                    order = alpaca_client.submit_order(order_data)
-                    log_message(f"ORDINE VENDITA ESEGUITO: {sym} (ID: {order.id})")
+                    order = core.close_position(sym)
+                    pending.add(core.normalize_symbol(sym))
+                    note = "" if market_open or pos["is_crypto"] else " (mercato chiuso: eseguito all'apertura)"
+                    log_message(f"ORDINE VENDITA INVIATO: {sym} (ID: {order.id}){note}")
                 except Exception as e:
                     log_message(f"Errore Vendita {sym}: {e}")
 
@@ -206,96 +231,136 @@ def run_trading_cycle():
         # ---------------------------------------------------------
         log_message("Avvio scansione Watchlist per nuove opportunità...")
         candidates = []
-        for ticker in WATCHLIST:
-            try:
-                df = yf.Ticker(ticker).history(period="1mo", interval="1h")
-                if len(df) >= 20:
-                    rsi = float(ta.momentum.RSIIndicator(df['Close'], window=14).rsi().iloc[-1])
-                    price = float(df['Close'].iloc[-1])
-                    score = 50 + (30 if rsi < 45 else -20 if rsi > 70 else 0)
-                    candidates.append({"symbol": ticker, "price": price, "rsi": round(rsi, 2), "score": score})
-            except Exception:
+        for ticker in cfg["watchlist"]:
+            rsi, price = core.get_rsi_and_price(ticker)
+            if rsi is None:
                 continue
+            score = 50 + (30 if rsi < 45 else -20 if rsi > 70 else 0)
+            candidates.append({"symbol": ticker, "price": price, "rsi": rsi, "score": score})
 
         candidates.sort(key=lambda x: x['score'], reverse=True)
         top_3 = candidates[:3]
         log_message(f"Asset selezionati per analisi BUY: {[c['symbol'] for c in top_3]}")
 
         acc = get_account_summary()
-        if acc["cash"] < 10:
-            log_message("Liquidità Cash insufficiente (< $10) per nuovi acquisti.")
+        allocation = acc["cash"] * cfg["max_allocation_pct"] / 100
+        if allocation < core.MIN_ORDER_USD:
+            log_message(f"Liquidità insufficiente: allocazione ${allocation:.2f} < ${core.MIN_ORDER_USD:.0f}.")
         else:
             for asset in top_3:
-                # Aggiornamento intermedio per interfaccia grafica
-                bot_state["latest_ai_analysis"] = {
-                    "symbol": asset['symbol'],
-                    "rsi": str(asset['rsi']),
-                    "sentiment": "Download notizie in corso...",
-                    "ai_verdict": "VALUTAZIONE ACQUISTO",
-                    "reasoning": f"Analisi ingresso mercato per {asset['symbol']}..."
-                }
+                if not manual and should_abort():
+                    return
+                sym = asset['symbol']
+                key = core.normalize_symbol(sym)
+                if key in held:
+                    log_message(f"{sym}: posizione già aperta, nessun nuovo acquisto.")
+                    continue
+                if pending is None or key in pending:
+                    log_message(f"{sym}: ordine già pendente o stato ordini ignoto, salto.")
+                    continue
+                if not core.is_crypto(sym) and not market_open:
+                    log_message(f"{sym}: mercato azionario chiuso, nessun ordine accodato.")
+                    continue
 
-                news = get_recent_news(asset['symbol'])
-                log_message(f"Analisi AI in corso per {asset['symbol']} (${asset['price']:.2f})...")
-                
-                prompt = f"Analizza {asset['symbol']}: Prezzo ${asset['price']:.2f}, RSI {asset['rsi']}. Notizie: '{news}'. Rispondi 'DECISIONE: BUY' se reputi opportuno acquistare oppure 'DECISIONE: HOLD'."
-                ai_res = query_gemini_ai(prompt)
+                set_ai_analysis(
+                    symbol=sym,
+                    rsi=str(asset['rsi']),
+                    sentiment="Download notizie in corso...",
+                    ai_verdict="VALUTAZIONE ACQUISTO",
+                    reasoning=f"Analisi ingresso mercato per {sym}..."
+                )
 
-                is_buy = "BUY" in ai_res.upper()
+                news = core.get_recent_news(sym)
+                log_message(f"Analisi AI in corso per {sym} (${asset['price']:.2f})...")
 
-                # Aggiorna monitoraggio IA con il verdetto
-                bot_state["latest_ai_analysis"] = {
-                    "symbol": asset['symbol'],
-                    "rsi": str(asset['rsi']),
-                    "sentiment": news[:80] + "..." if len(news) > 80 else news,
-                    "ai_verdict": "BUY (Acquisto)" if is_buy else "HOLD (Monitora)",
-                    "reasoning": ai_res
-                }
+                prompt = (
+                    f"Analizza {sym}: Prezzo ${asset['price']:.2f}, RSI {asset['rsi']}. Notizie: '{news}'. "
+                    f"Inizia la risposta con esattamente 'DECISIONE: BUY' se reputi opportuno acquistare "
+                    f"oppure 'DECISIONE: HOLD', seguito da una breve motivazione."
+                )
+                ai_res = core.query_ai(prompt, log=log_message)
+                is_buy = core.parse_decision(ai_res, allowed=("BUY", "HOLD")) == "BUY"
 
-                if is_buy:
-                    allocation = acc["cash"] * 0.15
-                    if allocation >= 10:
-                        qty = max(1, int(allocation / asset['price']))
-                        sym = asset['symbol'].replace("-", "")
-                        try:
-                            order_data = MarketOrderRequest(
-                                symbol=sym,
-                                qty=qty,
-                                side=OrderSide.BUY,
-                                time_in_force=TimeInForce.GTC
-                            )
-                            order = alpaca_client.submit_order(order_data)
-                            log_message(f"ORDINE ESEGUITO ACQUISTO: {qty} x {sym} (ID: {order.id})")
-                        except Exception as e:
-                            log_message(f"Errore Ordine Acquisto {sym}: {e}")
+                set_ai_analysis(
+                    symbol=sym,
+                    rsi=str(asset['rsi']),
+                    sentiment=short_text(news),
+                    ai_verdict="BUY (Acquisto)" if is_buy else "HOLD (Monitora)",
+                    reasoning=ai_res
+                )
 
-        bot_state["status"] = "Attivo (In attesa ciclo)"
+                if is_buy and not auto_trade:
+                    log_message(f"🧭 [Advisor] Suggerito ACQUISTO di ${allocation:.2f} di {sym}: ordine non inviato.")
+                elif is_buy and alpaca_client:
+                    try:
+                        order = core.submit_notional_buy(sym, allocation)
+                        pending.add(key)
+                        log_message(f"ORDINE ACQUISTO INVIATO: ${allocation:.2f} di {sym} (ID: {order.id})")
+                    except Exception as e:
+                        log_message(f"Errore Ordine Acquisto {sym}: {e}")
+
+        bot_state["status"] = "Attivo (In attesa ciclo)" if bot_state["active"] else "In pausa"
         log_message("=== SCANSIONE COMPLETATA ===")
-        
+
     finally:
+        if bot_state["status"].startswith("Scansione"):
+            bot_state["status"] = "In pausa" if not bot_state["active"] else "Attivo (In attesa ciclo)"
         # Rilascia sempre il lock alla fine della scansione
         scan_lock.release()
 
 def background_loop():
-    time.sleep(3) # Pausa di 3 secondi all'avvio per caricamento server
+    time.sleep(3)  # Pausa di 3 secondi all'avvio per caricamento server
+    last_run = 0.0
     while True:
-        if bot_state["active"]:
+        # L'intervallo viene riletto da config.json a ogni giro
+        interval = core.get_config()["scan_interval_min"] * 60
+        if bot_state["active"] and time.time() - last_run >= interval:
+            last_run = time.time()
             try:
                 run_trading_cycle()
             except Exception as e:
                 log_message(f"Errore loop background: {e}")
-        time.sleep(900)
+        # Controlla ogni 30s; si risveglia subito se il bot viene riattivato
+        if wake_event.wait(30):
+            wake_event.clear()
+            last_run = 0.0
+
+def keep_alive_url():
+    base = os.getenv("RENDER_EXTERNAL_URL")
+    if base:
+        return base.rstrip("/") + "/ping"
+    return f"http://127.0.0.1:{os.getenv('PORT', '5000')}/ping"
+
+def keep_alive_loop():
+    """Anti-Sleep: self-ping periodico per evitare lo spegnimento per inattività (es. Render free)."""
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL)
+        if not core.get_config()["keep_alive_enabled"]:
+            continue
+        url = keep_alive_url()
+        try:
+            r = requests.get(url, timeout=5)
+            if r.ok:
+                log_message("[Keep-Alive] Self-ping completato")
+            else:
+                log_message(f"[Keep-Alive] Self-ping fallito: HTTP {r.status_code} ({url})")
+        except Exception as e:
+            log_message(f"[Keep-Alive] Errore self-ping verso {url}: {e}")
 
 app = Flask(__name__)
 
-if not hasattr(app, 'bot_started'):
-    app.bot_started = True
-    bg_thread = threading.Thread(target=background_loop, daemon=True)
-    bg_thread.start()
+# NB: lo stato è in memoria nel processo. Avviare con UN solo worker
+# (vedi Procfile), altrimenti ogni worker eseguirebbe il proprio loop di trading.
+bg_thread = threading.Thread(target=background_loop, daemon=True)
+bg_thread.start()
+keep_alive_thread = threading.Thread(target=keep_alive_loop, daemon=True)
+keep_alive_thread.start()
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # Il token viene inserito nella pagina così i pulsanti funzionano senza configurazione.
+    # NB: chiunque possa aprire la dashboard può quindi usare i comandi.
+    return render_template("index.html", api_token=core.get_api_token())
 
 @app.route("/ping")
 def ping():
@@ -303,10 +368,18 @@ def ping():
 
 @app.route("/api/data")
 def api_data():
+    with state_lock:
+        bot = {
+            "active": bot_state["active"],
+            "last_scan": bot_state["last_scan"],
+            "status": bot_state["status"],
+            "logs": list(bot_state["logs"]),
+            "latest_ai_analysis": dict(bot_state["latest_ai_analysis"]),
+        }
     return jsonify({
-        "account": get_account_summary(),
-        "positions": get_open_positions(),
-        "bot": bot_state,
+        "account": cached("account", get_account_summary),
+        "positions": cached("positions", get_open_positions),
+        "bot": bot,
         "sources": {
             "yfinance": "Yahoo Finance API (News & Historical)",
             "alpaca": "Alpaca Paper Trading v2 API",
@@ -315,46 +388,77 @@ def api_data():
         }
     })
 
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    return jsonify(core.public_config())
+
+@app.route("/api/settings", methods=["POST"])
+@require_token
+def api_settings_post():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "Corpo JSON non valido"}), 400
+    try:
+        core.update_config(data)
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except OSError as e:
+        return jsonify({"status": "error", "message": f"Impossibile salvare config.json: {e}"}), 500
+    log_message("⚙️ Impostazioni aggiornate da Dashboard Web.")
+    return jsonify({"status": "success", "message": "Impostazioni salvate", "settings": core.public_config()})
+
 @app.route("/api/scan", methods=["POST"])
 @app.route("/api/trigger", methods=["POST"])
+@require_token
 def api_trigger():
     if scan_lock.locked():
         return jsonify({"status": "warning", "message": "Scansione già in corso!"})
-        
+
     log_message("⚡ Avvio manuale scansione da Dashboard Web...")
-    threading.Thread(target=run_trading_cycle, daemon=True).start()
+    threading.Thread(target=run_trading_cycle, kwargs={"manual": True}, daemon=True).start()
     return jsonify({"status": "success", "message": "Scansione avviata con successo"})
 
 @app.route("/api/toggle", methods=["POST"])
+@require_token
 def api_toggle():
     bot_state["active"] = not bot_state["active"]
+    if bot_state["active"]:
+        wake_event.set()  # riparte subito senza attendere l'intervallo
+    elif not scan_lock.locked():
+        bot_state["status"] = "In pausa"
     log_message(f"Stato Bot impostato a: Active={bot_state['active']}")
     return jsonify({"active": bot_state["active"], "is_running": bot_state["active"]})
 
 @app.route("/api/liquidate", methods=["POST"])
+@require_token
 def api_liquidate():
+    if not alpaca_client:
+        return jsonify({"status": "error", "message": "Credenziali Alpaca non configurate."}), 503
+
     positions = get_open_positions()
     if not positions:
         return jsonify({"status": "warning", "message": "Nessuna posizione aperta da liquidare."})
+
+    # Annulla gli ordini aperti: altrimenti le quote sono bloccate e la vendita fallisce
+    try:
+        alpaca_client.cancel_orders()
+    except Exception as e:
+        log_message(f"Errore annullamento ordini aperti: {e}")
 
     count = 0
     for pos in positions:
         sym = pos["symbol"]
         qty = pos["qty"]
         try:
-            order_data = MarketOrderRequest(
-                symbol=sym,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC
-            )
-            alpaca_client.submit_order(order_data)
+            core.close_position(sym)
             log_message(f"🚨 LIQUIDAZIONE MANUALE: Vendita {qty} x {sym}")
             count += 1
         except Exception as e:
             log_message(f"Errore vendita manuale {sym}: {e}")
 
-    return jsonify({"status": "success", "message": f"Liquidazione completata. Chiusi {count} ordini."})
+    with _cache_lock:
+        _cache.clear()
+    return jsonify({"status": "success", "message": f"Liquidazione inviata: {count}/{len(positions)} posizioni in chiusura."})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))

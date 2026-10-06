@@ -1,0 +1,10 @@
+{
+  "watchlist": ["BTC-USD", "ETH-USD", "SOL-USD", "NVDA", "AAPL", "TSLA", "MSFT", "AMD"],
+  "max_allocation_pct": 15.0,
+  "stop_loss_pct": -5.0,
+  "scan_interval_min": 15,
+  "auto_execute_trades": true,
+  "ai_provider": "gemini",
+  "keep_alive_enabled": true,
+  "bot_api_token": "default-secret-token"
+}
