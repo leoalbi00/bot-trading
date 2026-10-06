@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quant AI Terminal</title>
+    <title>Quant Desk</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -15,764 +15,585 @@
             darkMode: 'class',
             theme: {
                 extend: {
-                    colors: {
-                        obsidian: '#09090b',
-                        surface: '#121215',
-                        borderSubtle: 'rgba(255, 255, 255, 0.08)',
-                    },
                     fontFamily: {
-                        sans: ['Inter', 'sans-serif'],
-                        mono: ['JetBrains Mono', 'monospace'],
+                        sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
                     }
                 }
             }
         }
     </script>
-
-    <script src="https://unpkg.com/lucide@latest"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+    <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
 
     <style>
-        body { background-color: #09090b; color: #f4f4f5; font-family: 'Inter', sans-serif; }
-        .tabular-nums { font-variant-numeric: tabular-nums; font-family: 'JetBrains Mono', monospace; }
-        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 3px; }
+        [x-cloak] { display: none !important; }
+        body { background-color: #090d16; }
+        .num { font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+        details > summary { list-style: none; }
+        details > summary::-webkit-details-marker { display: none; }
+        .scroll-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+        .scroll-thin::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.2); border-radius: 3px; }
     </style>
 </head>
-<body class="min-h-screen flex flex-col antialiased selection:bg-zinc-800">
+<body class="min-h-screen text-slate-200 font-sans antialiased" x-data="dashboard()" x-init="init()">
 
-    <!-- Navbar -->
-    <header class="border-b border-borderSubtle bg-surface/80 backdrop-blur-md sticky top-0 z-50 px-6 py-3.5 flex items-center justify-between">
-        <div class="flex items-center gap-3">
-            <div id="statusIndicator" class="h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse"></div>
-            <span class="font-semibold text-sm tracking-wide uppercase text-zinc-300">QUANT-AI TERMINAL</span>
-            <span class="text-xs px-2 py-0.5 rounded border border-zinc-800 bg-zinc-900 text-zinc-400 font-mono" id="botStatusText">Inizializzazione...</span>
-        </div>
-        
-        <div class="flex items-center gap-3">
-            <button onclick="triggerScan()" class="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-1.5 rounded transition">
-                <i data-lucide="zap" class="w-3.5 h-3.5"></i> SCAN ORA
-            </button>
-            <button onclick="toggleBot()" id="btnToggle" class="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-borderSubtle text-xs font-semibold px-3 py-1.5 rounded transition">
-                <i data-lucide="pause" class="w-3.5 h-3.5"></i> PAUSA BOT
-            </button>
-            <button onclick="liquidateAll()" class="flex items-center gap-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold px-3 py-1.5 rounded transition">
-                <i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i> VENDI TUTTO
-            </button>
-            <form method="post" action="/logout">
-                <button type="submit" title="Esci" class="flex items-center gap-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-borderSubtle text-xs font-semibold px-3 py-1.5 rounded transition">
-                    <i data-lucide="log-out" class="w-3.5 h-3.5"></i> ESCI
+    <!-- ============ BARRA SUPERIORE ============ -->
+    <header class="border-b border-slate-800 bg-[#090d16]/95 backdrop-blur sticky top-0 z-40">
+        <div class="max-w-[1500px] mx-auto px-4 sm:px-6 h-12 flex items-center justify-between gap-4">
+            <div class="flex items-center gap-3 min-w-0">
+                <span class="h-2 w-2 rounded-full shrink-0" :class="!connected ? 'bg-amber-500' : (bot.active ? 'bg-emerald-500' : 'bg-slate-500')"></span>
+                <span class="text-sm font-semibold tracking-tight text-slate-100 truncate">Quant Desk</span>
+                <span class="hidden sm:inline text-xs text-slate-500" x-text="!connected ? 'Connessione…' : (bot.active ? (settings.auto_execute_trades ? 'Auto-Trading' : 'Advisor') : 'In pausa')"></span>
+                <span class="hidden md:inline text-xs text-slate-600 num" x-text="bot.status || ''"></span>
+            </div>
+            <nav class="flex items-center gap-1.5 text-xs shrink-0">
+                <button @click="scan()" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 inline-flex items-center gap-1.5">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">Scansiona</span>
                 </button>
-            </form>
+                <button @click="toggleBot()" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200"
+                        x-text="bot.active ? 'Pausa' : 'Riprendi'"></button>
+                <button @click="showSettings = true" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 inline-flex items-center gap-1.5">
+                    <i data-lucide="settings-2" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">Impostazioni Bot</span>
+                </button>
+                <button @click="liquidate()" class="h-7 px-2.5 rounded border border-rose-900/70 text-rose-300 hover:bg-rose-950/60 whitespace-nowrap">Vendi tutto</button>
+                <form method="post" action="/logout">
+                    <button type="submit" title="Esci" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center">
+                        <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
+                    </button>
+                </form>
+            </nav>
         </div>
     </header>
 
-    <main class="flex-1 p-6 flex flex-col gap-6 max-w-[1800px] w-full mx-auto">
-        <!-- Metric Cards -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div class="bg-surface border border-borderSubtle rounded-lg p-5">
-                <div class="flex items-center justify-between text-zinc-400">
-                    <span class="text-xs font-semibold uppercase tracking-wider">Valore Portafoglio</span>
-                    <i data-lucide="wallet" class="w-4 h-4 text-zinc-500"></i>
+    <main class="max-w-[1500px] mx-auto px-4 sm:px-6 py-6 space-y-6">
+
+        <!-- ============ INTESTAZIONE FINANZIARIA ============ -->
+        <section class="grid grid-cols-2 lg:grid-cols-5 border border-slate-800 rounded-lg bg-slate-900/40 divide-x divide-y lg:divide-y-0 divide-slate-800">
+            <div class="p-4">
+                <div class="text-[11px] uppercase tracking-wider text-slate-500">Capitale totale</div>
+                <div class="mt-1.5 text-xl num text-slate-100" x-text="usd(account.portfolio)"></div>
+                <div class="mt-1 text-[11px] text-slate-500 num" x-text="account.initial_capital ? 'Iniziale ' + usd(account.initial_capital) : ''"></div>
+            </div>
+            <div class="p-4">
+                <div class="text-[11px] uppercase tracking-wider text-slate-500">Plusvalenza / Minusvalenza netta</div>
+                <div class="mt-1.5 text-xl num" :class="tone(account.net_pnl_usd)" x-text="usd(account.net_pnl_usd, true)"></div>
+                <div class="mt-1 text-[11px] num" :class="tone(account.net_pnl_pct)" x-text="pct(account.net_pnl_pct)"></div>
+            </div>
+            <div class="p-4">
+                <div class="text-[11px] uppercase tracking-wider text-slate-500">P&amp;L di oggi</div>
+                <div class="mt-1.5 text-xl num" :class="tone(account.daily_pnl_usd)" x-text="usd(account.daily_pnl_usd, true)"></div>
+                <div class="mt-1 text-[11px] num" :class="tone(account.daily_pnl_pct)" x-text="pct(account.daily_pnl_pct)"></div>
+            </div>
+            <div class="p-4">
+                <div class="text-[11px] uppercase tracking-wider text-slate-500">Cash disponibile</div>
+                <div class="mt-1.5 text-xl num text-slate-100" x-text="usd(account.cash)"></div>
+                <div class="mt-1 text-[11px] text-slate-500 num" x-text="'Buying power ' + usd(account.buying_power)"></div>
+            </div>
+            <div class="p-4 col-span-2 lg:col-span-1">
+                <div class="text-[11px] uppercase tracking-wider text-slate-500">Esposizione</div>
+                <div class="mt-1.5 text-xl num text-slate-100" x-text="exposurePct()"></div>
+                <div class="mt-1 text-[11px] text-slate-500 num" x-text="'Ultimo ciclo ' + (bot.last_scan || '—')"></div>
+            </div>
+        </section>
+
+        <!-- ============ UFFICIO VIRTUALE ============ -->
+        <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+
+            <!-- 1. Agente Esploratore #1 -->
+            <div class="border border-slate-800 rounded-lg bg-slate-900/40">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Agente Esploratore #1</h2>
+                    <span class="text-[11px] text-slate-500 num" x-text="officeTime()"></span>
                 </div>
-                <div class="mt-4">
-                    <div class="text-2xl font-bold tabular-nums text-white" id="portfolioValue">$0.00</div>
-                    <div class="text-xs text-emerald-400 mt-1 font-mono" id="portfolioPnL">Account Attivo</div>
-                </div>
+                <dl class="p-4 space-y-3 text-sm">
+                    <div>
+                        <dt class="text-[11px] uppercase tracking-wider text-slate-500">Mercato in perlustrazione</dt>
+                        <dd class="mt-0.5 text-slate-100" x-text="office.sector || '—'"></dd>
+                    </div>
+                    <div>
+                        <dt class="text-[11px] uppercase tracking-wider text-slate-500">Ticker ispezionati</dt>
+                        <dd class="mt-0.5 num text-xs text-slate-400 break-words" x-text="(office.tickers_inspected || []).join('  ') || '—'"></dd>
+                    </div>
+                    <div>
+                        <dt class="text-[11px] uppercase tracking-wider text-slate-500">Proposte</dt>
+                        <dd class="mt-1 space-y-1.5">
+                            <template x-if="!(office.discoveries || []).length">
+                                <div class="text-xs text-slate-500">Nessuna anomalia eccezionale nel settore.</div>
+                            </template>
+                            <template x-for="d in (office.discoveries || [])" :key="d.symbol">
+                                <div class="flex items-baseline justify-between gap-3 text-xs">
+                                    <span class="min-w-0">
+                                        <span class="num text-slate-100" x-text="d.symbol"></span>
+                                        <span class="text-slate-500" x-text="' · ' + (d.anomalies || []).join(', ')"></span>
+                                    </span>
+                                    <span class="shrink-0 num px-1.5 py-0.5 rounded text-[10px] border"
+                                          :class="d.verdict === 'APPROVATO' ? 'border-emerald-900 text-emerald-400' : 'border-rose-900 text-rose-400'"
+                                          x-text="d.verdict || 'IN REVISIONE'"></span>
+                                </div>
+                            </template>
+                        </dd>
+                    </div>
+                </dl>
             </div>
 
-            <div class="bg-surface border border-borderSubtle rounded-lg p-5">
-                <div class="flex items-center justify-between text-zinc-400">
-                    <span class="text-xs font-semibold uppercase tracking-wider">Cash Disponibile</span>
-                    <i data-lucide="dollar-sign" class="w-4 h-4 text-zinc-500"></i>
+            <!-- 3. Decisione esecutiva del CIO -->
+            <div class="xl:col-span-2 border border-slate-800 rounded-lg bg-slate-900/40">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Decisione esecutiva CIO</h2>
+                    <span class="text-[11px] text-slate-500 num" x-text="cio.source ? cio.source + ' · ' + (cio.timestamp || '') : ''"></span>
                 </div>
-                <div class="mt-4">
-                    <div class="text-2xl font-bold tabular-nums text-white" id="cashBalance">$0.00</div>
-                    <div class="text-xs text-zinc-400 mt-1 font-mono" id="cashRatio">Buying Power: $0.00</div>
-                </div>
-            </div>
-
-            <div class="bg-surface border border-borderSubtle rounded-lg p-5">
-                <div class="flex items-center justify-between text-zinc-400">
-                    <span class="text-xs font-semibold uppercase tracking-wider">Ultima Scansione</span>
-                    <i data-lucide="clock" class="w-4 h-4 text-zinc-500"></i>
-                </div>
-                <div class="mt-4">
-                    <div class="text-2xl font-bold tabular-nums text-white font-mono" id="lastScanTime">--:--:--</div>
-                    <div class="text-xs text-emerald-400 mt-1 font-mono" id="lastScanStatus">Stato: In ascolto</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- SEZIONE IMPOSTAZIONI BOT -->
-        <div class="bg-surface border border-borderSubtle rounded-lg overflow-hidden">
-            <div class="px-5 py-3 border-b border-borderSubtle flex items-center justify-between bg-zinc-950/40">
-                <div class="flex items-center gap-2">
-                    <i data-lucide="settings" class="w-4 h-4 text-zinc-400"></i>
-                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">⚙️ Impostazioni Bot</span>
-                </div>
-                <div class="flex items-center gap-3">
-                    <span id="settingsNotice" class="text-xs font-mono hidden"></span>
-                    <button onclick="saveSettings()" id="btnSaveSettings" class="flex items-center gap-2 bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold px-3 py-1.5 rounded transition disabled:opacity-50">
-                        💾 Salva Impostazioni
-                    </button>
-                </div>
-            </div>
-
-            <div class="p-5 grid grid-cols-1 lg:grid-cols-3 gap-6 text-xs">
-                <!-- Watchlist -->
-                <div class="lg:col-span-1">
-                    <div class="text-[10px] text-zinc-400 uppercase mb-2">Watchlist</div>
-                    <div id="watchlistChips" class="flex flex-wrap gap-2 mb-3"></div>
-                    <form onsubmit="addTicker(event)" class="flex gap-2">
-                        <input id="tickerInput" type="text" maxlength="15" placeholder="Es. GOOGL o DOGE-USD" autocomplete="off"
-                               class="flex-1 min-w-0 bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono uppercase text-zinc-200 focus:outline-none focus:border-cyan-700">
-                        <button type="submit" class="bg-zinc-800 hover:bg-zinc-700 border border-borderSubtle text-zinc-200 px-3 py-1.5 rounded font-semibold">+ Aggiungi</button>
-                    </form>
-                </div>
-
-                <!-- Parametri numerici -->
-                <div class="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-1 gap-3">
-                    <label class="block">
-                        <span class="text-[10px] text-zinc-400 uppercase">Stop Loss %</span>
-                        <input id="setStopLoss" type="number" step="0.5" min="-50" max="-0.5"
-                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
-                    </label>
-                    <label class="block">
-                        <span class="text-[10px] text-zinc-400 uppercase">% del Capitale per ordine BUY (score 75-84)</span>
-                        <input id="setBaseAllocation" type="number" step="0.5" min="0.5" max="100"
-                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
-                    </label>
-                    <label class="block">
-                        <span class="text-[10px] text-zinc-400 uppercase">% massima per ordine STRONG BUY (score 85-100)</span>
-                        <input id="setAllocation" type="number" step="0.5" min="0.5" max="100"
-                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
-                    </label>
-                    <label class="block">
-                        <span class="text-[10px] text-zinc-400 uppercase">Esposizione massima % del capitale (100 = niente margine)</span>
-                        <input id="setExposure" type="number" step="5" min="10" max="400"
-                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
-                    </label>
-                    <label class="block">
-                        <span class="text-[10px] text-zinc-400 uppercase">Intervallo di Scansione (minuti)</span>
-                        <input id="setInterval" type="number" step="1" min="1" max="1440"
-                               class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
-                    </label>
-                </div>
-
-                <!-- Modalità e motore IA -->
-                <div class="space-y-3">
-                    <label class="flex items-center justify-between gap-3 p-2 rounded bg-zinc-900/40 border border-zinc-800 cursor-pointer">
-                        <span>
-                            <span class="block text-zinc-200 font-semibold">Auto-Trading</span>
-                            <span id="autoTradeHint" class="block text-[10px] text-zinc-500">Esegue gli ordini automaticamente</span>
-                        </span>
-                        <input id="setAutoTrade" type="checkbox" class="sr-only peer" onchange="updateToggleHints()">
-                        <span class="relative w-9 h-5 shrink-0 rounded-full bg-zinc-700 peer-checked:bg-emerald-600 transition after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition peer-checked:after:translate-x-4"></span>
-                    </label>
-                    <label class="flex items-center justify-between gap-3 p-2 rounded bg-zinc-900/40 border border-zinc-800 cursor-pointer">
-                        <span>
-                            <span class="block text-zinc-200 font-semibold">Anti-Sleep (Keep-Alive)</span>
-                            <span class="block text-[10px] text-zinc-500">Self-ping ogni 10 minuti</span>
-                        </span>
-                        <input id="setKeepAlive" type="checkbox" class="sr-only peer">
-                        <span class="relative w-9 h-5 shrink-0 rounded-full bg-zinc-700 peer-checked:bg-emerald-600 transition after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition peer-checked:after:translate-x-4"></span>
-                    </label>
-                    <label class="block">
-                        <span class="text-[10px] text-zinc-400 uppercase">Motore IA</span>
-                        <select id="setAiProvider" class="mt-1 w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 font-mono text-zinc-200 focus:outline-none focus:border-cyan-700">
-                            <option value="gemini">Gemini Flash (Gratis)</option>
-                            <option value="groq">Groq / Llama 3.3 (Gratis)</option>
-                            <option value="hybrid">Ibrido Gemini + Groq (opera solo se concordano)</option>
-                            <option value="quant">Solo Algoritmo Quantitativo (Senza IA)</option>
-                        </select>
-                    </label>
-                </div>
-            </div>
-        </div>
-
-        <!-- SEZIONE 1: ANALISI IN TEMPO REALE & FONTI DATI CONSULTATE -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <!-- Focus Analisi IA Live -->
-            <div class="lg:col-span-2 bg-surface border border-borderSubtle rounded-lg p-5 flex flex-col justify-between">
-                <div>
-                    <div class="flex items-center justify-between border-b border-borderSubtle pb-3 mb-4">
-                        <div class="flex items-center gap-2">
-                            <i data-lucide="cpu" class="w-4 h-4 text-cyan-400"></i>
-                            <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">In Diretta: Focus Analisi IA · Virtual Boardroom</span>
+                <div class="p-4">
+                    <template x-if="!cio.action">
+                        <div class="text-sm text-slate-500">In attesa del primo ciclo del comitato.</div>
+                    </template>
+                    <template x-if="cio.action">
+                        <div class="space-y-4">
+                            <div class="flex flex-wrap items-center gap-x-6 gap-y-3">
+                                <span class="num text-xs font-medium px-2 py-1 rounded border" :class="actionStyle(cio.action)" x-text="cio.action"></span>
+                                <div>
+                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Ticker</div>
+                                    <div class="num text-slate-100" x-text="cioTarget()"></div>
+                                </div>
+                                <div>
+                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Allocazione</div>
+                                    <div class="num text-slate-100" x-text="cio.allocation_pct != null ? cio.allocation_pct + '%' : '—'"></div>
+                                </div>
+                                <div>
+                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Stop loss</div>
+                                    <div class="num text-slate-100" x-text="cio.stop_pct != null ? cio.stop_pct + '%' : '—'"></div>
+                                </div>
+                                <div>
+                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Regime macro</div>
+                                    <div class="num text-xs text-slate-300" x-text="cio.macro ? 'Azioni ' + cio.macro.stock + ' · Crypto ' + cio.macro.crypto : '—'"></div>
+                                </div>
+                            </div>
+                            <p class="text-sm leading-relaxed text-slate-300 border-l-2 border-slate-700 pl-3" x-text="cio.reason"></p>
+                            <div class="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
+                                <span x-show="cio.proposal && cio.proposal !== cioDescription()" x-text="'Proposta originale: ' + cio.proposal"></span>
+                                <span x-show="cio.suspended" class="text-amber-400/90">Sospesa: ciclo di avvio dopo il deploy</span>
+                                <span x-show="(office.discoveries || []).length" :class="cio.scout_approved ? 'text-emerald-400/90' : ''"
+                                      x-text="cio.scout_approved ? 'Scoperta dell\'Esploratore approvata' : 'Scoperta dell\'Esploratore non selezionata'"></span>
+                            </div>
                         </div>
-                        <span id="aiTargetSymbol" class="text-xs font-mono font-bold px-2.5 py-1 bg-cyan-950 border border-cyan-800 text-cyan-300 rounded">--</span>
-                    </div>
-
-                    <div class="grid grid-cols-2 sm:grid-cols-3 gap-4 mb-4">
-                        <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
-                            <div class="text-[10px] text-zinc-400 uppercase">RSI (1h)</div>
-                            <div id="aiRsi" class="text-sm font-mono font-semibold text-zinc-200 mt-1">--</div>
-                        </div>
-                        <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
-                            <div class="text-[10px] text-zinc-400 uppercase">Notizie / Sentiment</div>
-                            <div id="aiSentiment" class="text-xs font-mono font-semibold text-zinc-300 mt-1 truncate">--</div>
-                        </div>
-                        <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
-                            <div class="text-[10px] text-zinc-400 uppercase">Verdetto IA</div>
-                            <div id="aiVerdict" class="text-sm font-mono font-bold text-cyan-400 mt-1">--</div>
-                        </div>
-                    </div>
-
-                    <div id="boardroomBadges" class="flex flex-wrap gap-2 mb-4"></div>
-
-                    <div class="bg-black/40 border border-zinc-800/80 p-3 rounded text-xs font-mono text-zinc-300 leading-relaxed" id="aiReasoning">
-                        <span class="text-cyan-400 font-bold">[RAGIONAMENTO IA]:</span> In attesa dell'avvio della prima scansione.
-                    </div>
+                    </template>
                 </div>
             </div>
+        </section>
 
-            <!-- Fonti Dati Consultate -->
-            <div class="bg-surface border border-borderSubtle rounded-lg p-5">
-                <div class="flex items-center gap-2 border-b border-borderSubtle pb-3 mb-4">
-                    <i data-lucide="database" class="w-4 h-4 text-emerald-400"></i>
-                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">Fonti & Informazioni Consultate</span>
-                </div>
-                
-                <div class="space-y-3 text-xs font-mono">
-                    <div class="flex items-center justify-between p-2 rounded bg-zinc-900/40 border border-zinc-800">
-                        <span class="text-zinc-400">1. News Sentiment</span>
-                        <span class="text-emerald-400 flex items-center gap-1"><i data-lucide="check-circle" class="w-3 h-3"></i> Yahoo Finance</span>
-                    </div>
-                    <div class="flex items-center justify-between p-2 rounded bg-zinc-900/40 border border-zinc-800">
-                        <span class="text-zinc-400">2. Prezzi & Ordini</span>
-                        <span class="text-emerald-400 flex items-center gap-1"><i data-lucide="check-circle" class="w-3 h-3"></i> Alpaca Paper API</span>
-                    </div>
-                    <div class="flex items-center justify-between p-2 rounded bg-zinc-900/40 border border-zinc-800">
-                        <span class="text-zinc-400">3. Indicatori Tecnici</span>
-                        <span class="text-cyan-400">RSI(14), Momentum</span>
-                    </div>
-                    <div class="flex items-center justify-between p-2 rounded bg-zinc-900/40 border border-zinc-800">
-                        <span class="text-zinc-400">4. Motore IA</span>
-                        <span class="text-purple-400">Gemini / Groq + Quant</span>
-                    </div>
-                </div>
+        <!-- 2. Reparto Revisione -->
+        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
+            <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Reparto Revisione</h2>
+                <span class="text-[11px] text-slate-500">Parere dei 5 agenti sugli asset valutati</span>
             </div>
-        </div>
-
-        <!-- SEZIONE UFFICIO VIRTUALE & ESPLORAZIONE -->
-        <div class="bg-surface border border-borderSubtle rounded-lg overflow-hidden">
-            <div class="px-5 py-3 border-b border-borderSubtle flex items-center justify-between bg-zinc-950/40">
-                <div class="flex items-center gap-2">
-                    <i data-lucide="telescope" class="w-4 h-4 text-violet-400"></i>
-                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">🔍 Ufficio Virtuale & Esplorazione</span>
-                </div>
-                <span id="officeTimestamp" class="text-xs font-mono text-zinc-500">In attesa della prima esplorazione</span>
-            </div>
-            <div class="p-5 grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs font-mono">
-                <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
-                    <div class="text-[10px] text-zinc-400 uppercase">Esploratore #1 · Mercato perlustrato</div>
-                    <div id="officeSector" class="text-sm font-semibold text-violet-300 mt-1">--</div>
-                    <div id="officeTickers" class="text-zinc-500 mt-2 break-words">--</div>
-                </div>
-                <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
-                    <div class="text-[10px] text-zinc-400 uppercase mb-2">Proposte → Reparto Revisione</div>
-                    <div id="officeDiscoveries" class="space-y-2 text-zinc-300">--</div>
-                </div>
-                <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
-                    <div class="text-[10px] text-zinc-400 uppercase">Decisione del CIO</div>
-                    <div id="officeCioVerdict" class="text-sm font-bold mt-1 text-zinc-300">--</div>
-                    <div id="officeCioReason" class="text-zinc-400 mt-2 leading-relaxed">--</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- SEZIONE 2: REGISTRO MOVIMENTAZIONI E POSIZIONI APERTE -->
-        <div class="bg-surface border border-borderSubtle rounded-lg overflow-hidden">
-            <div class="px-5 py-3 border-b border-borderSubtle flex items-center justify-between bg-zinc-950/40">
-                <div class="flex items-center gap-2">
-                    <i data-lucide="arrow-right-left" class="w-4 h-4 text-emerald-400"></i>
-                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">Posizioni Aperte & Movimentazioni</span>
-                </div>
-                <span class="text-xs font-mono text-zinc-400" id="posCount">0 Posizioni Attive</span>
-            </div>
-
-            <div class="overflow-x-auto">
-                <table class="w-full text-left text-xs font-mono">
-                    <thead class="bg-zinc-900/80 text-zinc-400 uppercase text-[10px] border-b border-borderSubtle">
-                        <tr>
-                            <th class="py-3 px-4">Asset</th>
-                            <th class="py-3 px-4">Tipo</th>
-                            <th class="py-3 px-4">Quantità</th>
-                            <th class="py-3 px-4">Prezzo Corrente</th>
-                            <th class="py-3 px-4">Valore di Mercato</th>
-                            <th class="py-3 px-4">PnL Non Realizzato</th>
+            <div class="overflow-x-auto scroll-thin">
+                <template x-if="!review.length">
+                    <div class="p-4 text-sm text-slate-500">Nessun asset in revisione.</div>
+                </template>
+                <table x-show="review.length" class="w-full text-xs">
+                    <thead>
+                        <tr class="border-b border-slate-800 text-slate-500">
+                            <th class="text-left font-medium px-4 py-2.5 w-48">Agente</th>
+                            <template x-for="r in review" :key="r.symbol">
+                                <th class="text-left font-medium px-4 py-2.5">
+                                    <div class="num text-slate-100" x-text="r.symbol"></div>
+                                    <div class="mt-0.5 flex items-center gap-2 font-normal">
+                                        <span x-text="r.origin"></span>
+                                        <span class="num text-[10px]" :class="verdictStyle(r.verdict)" x-text="r.verdict"></span>
+                                    </div>
+                                    <div class="mt-0.5 font-normal text-[10px] text-slate-500 max-w-[16rem] truncate" :title="r.detail" x-text="r.verdict === 'RESPINTO' ? r.detail.split(';')[0] : ''"></div>
+                                </th>
+                            </template>
                         </tr>
                     </thead>
-                    <tbody id="positionsTableBody" class="divide-y divide-zinc-800/50 text-zinc-300">
-                        <tr><td colspan="6" class="py-4 text-center text-zinc-500">Nessuna posizione aperta al momento.</td></tr>
+                    <tbody class="divide-y divide-slate-800/70 num">
+                        <tr>
+                            <td class="px-4 py-2.5 font-sans text-slate-400">Analista Tecnico</td>
+                            <template x-for="r in review" :key="r.symbol + '-t'">
+                                <td class="px-4 py-2.5 text-slate-300">
+                                    <span class="text-slate-100" x-text="'Score ' + r.technical.score"></span>
+                                    <span class="text-slate-500" x-text="' · RSI ' + r.technical.rsi + ' · MACD ' + r.technical.macd_hist + ' · ROC ' + r.technical.roc + '%'"></span>
+                                    <span x-show="r.technical.audit_penalty" class="text-amber-400"> · penalità</span>
+                                </td>
+                            </template>
+                        </tr>
+                        <tr>
+                            <td class="px-4 py-2.5 font-sans text-slate-400">News &amp; Sentiment</td>
+                            <template x-for="r in review" :key="r.symbol + '-s'">
+                                <td class="px-4 py-2.5">
+                                    <template x-if="r.sentiment">
+                                        <span>
+                                            <span :class="tone(r.sentiment.score)" x-text="(r.sentiment.score > 0 ? '+' : '') + r.sentiment.score"></span>
+                                            <span class="text-slate-500"> · Veto </span>
+                                            <span :class="r.sentiment.veto ? 'text-rose-400' : 'text-slate-300'" x-text="r.sentiment.veto ? 'Sì' : 'No'"></span>
+                                        </span>
+                                    </template>
+                                    <span x-show="!r.sentiment" class="text-slate-600">—</span>
+                                </td>
+                            </template>
+                        </tr>
+                        <tr>
+                            <td class="px-4 py-2.5 font-sans text-slate-400">Volatilità ATR</td>
+                            <template x-for="r in review" :key="r.symbol + '-a'">
+                                <td class="px-4 py-2.5 text-slate-300">
+                                    <span x-text="r.atr ? 'ATR ' + r.atr.atr_pct + '% · stop ' + r.atr.stop_pct + '%' : '—'"></span>
+                                    <span class="text-slate-500" x-text="r.volume && r.volume.ratio != null ? ' · vol ' + r.volume.ratio + 'x' : ''"></span>
+                                </td>
+                            </template>
+                        </tr>
+                        <tr>
+                            <td class="px-4 py-2.5 font-sans text-slate-400">Drawdown Risk</td>
+                            <template x-for="r in review" :key="r.symbol + '-d'">
+                                <td class="px-4 py-2.5">
+                                    <span :class="r.drawdown.blocked ? 'text-rose-400' : 'text-slate-300'"
+                                          x-text="(r.drawdown.blocked ? 'Acquisti bloccati' : 'Rischio nella norma') + ' · ' + pct(r.drawdown.pct)"></span>
+                                </td>
+                            </template>
+                        </tr>
+                        <tr>
+                            <td class="px-4 py-2.5 font-sans text-slate-400">Auditor</td>
+                            <template x-for="r in review" :key="r.symbol + '-w'">
+                                <td class="px-4 py-2.5 text-slate-300"
+                                    x-text="r.auditor ? 'Win rate ' + r.auditor.win_rate + '% su ' + r.auditor.trades + ' trade' : 'Nessuno storico'"></td>
+                            </template>
+                        </tr>
                     </tbody>
                 </table>
             </div>
-        </div>
+        </section>
 
-        <!-- SEZIONE 3: TERMINAL LOG LIVE -->
-        <div class="bg-surface border border-borderSubtle rounded-lg flex flex-col min-h-[300px] overflow-hidden">
-            <div class="px-5 py-3 border-b border-borderSubtle flex items-center justify-between bg-zinc-950/40">
-                <div class="flex items-center gap-2">
-                    <i data-lucide="terminal" class="w-4 h-4 text-zinc-400"></i>
-                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">Terminal Log Live</span>
+        <!-- ============ POSIZIONI ============ -->
+        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
+            <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Posizioni aperte</h2>
+                <span class="text-[11px] text-slate-500 num" x-text="positions.length + ' posizioni'"></span>
+            </div>
+            <div class="overflow-x-auto scroll-thin">
+                <table class="w-full text-xs">
+                    <thead>
+                        <tr class="border-b border-slate-800 text-slate-500 text-left">
+                            <th class="font-medium px-4 py-2.5">Asset</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Quantità</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Prezzo medio</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Prezzo</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Valore</th>
+                            <th class="font-medium px-4 py-2.5 text-right">P&amp;L</th>
+                            <th class="font-medium px-4 py-2.5 text-right">%</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800/70 num">
+                        <template x-if="!positions.length">
+                            <tr><td colspan="7" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
+                        </template>
+                        <template x-for="p in positions" :key="p.symbol">
+                            <tr class="hover:bg-slate-800/30">
+                                <td class="px-4 py-2.5 text-slate-100" x-text="p.symbol"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="qty(p.qty)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="usd(p.avg_entry_price)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.current_price)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.market_value)"></td>
+                                <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></td>
+                                <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- ============ LOG DI SISTEMA (chiusi di default) ============ -->
+        <details class="border border-slate-800 rounded-lg bg-slate-900/40 group">
+            <summary class="px-4 py-3 flex items-center justify-between cursor-pointer select-none">
+                <span class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                    <i data-lucide="chevron-right" class="w-3.5 h-3.5 transition-transform group-open:rotate-90"></i>
+                    Log di sistema
+                </span>
+                <span class="text-[11px] text-slate-500 num" x-text="visibleLogs().length + ' righe'"></span>
+            </summary>
+            <div class="border-t border-slate-800">
+                <div class="flex justify-end px-4 pt-2">
+                    <button @click="clearLogs()" class="text-[11px] text-slate-500 hover:text-slate-300">Pulisci</button>
                 </div>
-                <button onclick="clearLogs()" class="text-xs text-zinc-400 hover:text-zinc-200 px-2 py-1 rounded hover:bg-zinc-800 transition">
-                    Pulisci
-                </button>
+                <div class="max-h-96 overflow-y-auto scroll-thin px-4 pb-4 pt-1 num text-[11px] leading-relaxed space-y-0.5">
+                    <template x-for="l in visibleLogs()" :key="l.key">
+                        <div class="break-words" :class="l.cls" x-text="l.text"></div>
+                    </template>
+                </div>
             </div>
-            <div id="terminalContainer" class="flex-1 p-4 font-mono text-xs overflow-y-auto custom-scrollbar bg-black/60 text-zinc-300 space-y-1.5 selection:bg-zinc-700">
-                <div class="text-zinc-500">[SYSTEM] Connessione al terminale stabilita...</div>
-            </div>
-        </div>
+        </details>
     </main>
 
-    <script>
-        lucide.createIcons();
+    <!-- ============ IMPOSTAZIONI (nascoste di default) ============ -->
+    <div x-cloak x-show="showSettings" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
+         @keydown.escape.window="showSettings = false">
+        <div class="absolute inset-0 bg-black/60" @click="showSettings = false"></div>
+        <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin border border-slate-800 rounded-lg bg-[#0d1220] shadow-xl">
+            <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between sticky top-0 bg-[#0d1220]">
+                <h2 class="text-sm font-semibold text-slate-100">Impostazioni Bot</h2>
+                <button @click="showSettings = false" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
+            </div>
 
-        // Token degli endpoint di controllo, inserito dal server
+            <div class="p-5 space-y-5 text-xs">
+                <div>
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-2">Watchlist</div>
+                    <div class="flex flex-wrap gap-1.5 mb-2">
+                        <template x-for="t in settings.watchlist || []" :key="t">
+                            <span class="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded border border-slate-700 num text-slate-200">
+                                <span x-text="t"></span>
+                                <button type="button" @click="removeTicker(t)" :disabled="locked('watchlist')" class="px-1 text-slate-500 hover:text-rose-400 disabled:opacity-40">×</button>
+                            </span>
+                        </template>
+                    </div>
+                    <form @submit.prevent="addTicker()" class="flex gap-2">
+                        <input x-model="tickerInput" :disabled="locked('watchlist')" maxlength="15" placeholder="Es. GOOGL o DOGE-USD"
+                               class="flex-1 min-w-0 h-8 bg-slate-950 border border-slate-800 rounded px-2 num uppercase text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                        <button type="submit" :disabled="locked('watchlist')" class="h-8 px-3 rounded border border-slate-700 hover:bg-slate-800 disabled:opacity-50">Aggiungi</button>
+                    </form>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <template x-for="f in numberFields" :key="f.key">
+                        <label class="block" :title="lockTitle(f.key)">
+                            <span class="text-[11px] uppercase tracking-wider text-slate-500" x-text="f.label"></span>
+                            <input type="number" :step="f.step" :min="f.min" :max="f.max" x-model.number="settings[f.key]" :disabled="locked(f.key)"
+                                   class="mt-1 w-full h-8 bg-slate-950 border border-slate-800 rounded px-2 num text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                        </label>
+                    </template>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-slate-800" :title="lockTitle('auto_execute_trades')">
+                        <span>
+                            <span class="text-slate-200">Auto-Trading</span>
+                            <span class="block text-[11px] text-slate-500" x-text="settings.auto_execute_trades ? 'Esegue gli ordini' : 'Advisor: solo suggerimenti'"></span>
+                        </span>
+                        <input type="checkbox" x-model="settings.auto_execute_trades" :disabled="locked('auto_execute_trades')" class="h-4 w-4 accent-emerald-500">
+                    </label>
+                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-slate-800" :title="lockTitle('keep_alive_enabled')">
+                        <span>
+                            <span class="text-slate-200">Anti-Sleep</span>
+                            <span class="block text-[11px] text-slate-500">Self-ping ogni 10 minuti</span>
+                        </span>
+                        <input type="checkbox" x-model="settings.keep_alive_enabled" :disabled="locked('keep_alive_enabled')" class="h-4 w-4 accent-emerald-500">
+                    </label>
+                </div>
+
+                <label class="block" :title="lockTitle('ai_provider')">
+                    <span class="text-[11px] uppercase tracking-wider text-slate-500">Motore IA</span>
+                    <select x-model="settings.ai_provider" :disabled="locked('ai_provider')"
+                            class="mt-1 w-full h-8 bg-slate-950 border border-slate-800 rounded px-2 text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                        <option value="gemini">Gemini Flash</option>
+                        <option value="groq">Groq</option>
+                        <option value="hybrid">Ibrido Gemini + Groq</option>
+                        <option value="quant">Solo algoritmo quantitativo</option>
+                    </select>
+                </label>
+
+                <p x-show="Object.keys(envLocked).length" class="text-[11px] text-slate-500">
+                    I campi disattivati sono fissati da variabili d'ambiente su Render.
+                </p>
+            </div>
+
+            <div class="px-5 py-3 border-t border-slate-800 flex items-center justify-between gap-3 sticky bottom-0 bg-[#0d1220]">
+                <span class="text-[11px] num" :class="noticeError ? 'text-rose-400' : 'text-emerald-400'" x-text="notice"></span>
+                <div class="flex gap-2">
+                    <button @click="showSettings = false" class="h-8 px-3 rounded border border-slate-700 hover:bg-slate-800 text-xs">Chiudi</button>
+                    <button @click="saveSettings()" :disabled="saving" class="h-8 px-3 rounded bg-slate-100 text-slate-900 hover:bg-white text-xs font-medium disabled:opacity-50">Salva impostazioni</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Token degli endpoint di controllo, inserito dal server dopo il login
         const API_TOKEN = {{ api_token|tojson }};
 
-        let isRunning = true;
-        let watchlist = [];
-        // Log locali (feedback azioni) uniti a quelli del server in ordine cronologico
-        let localLogs = [];
-        let clearedServerId = 0;
-        let clearedTs = 0;
-        let lastServerLogs = [];
-        let lastRenderKey = '';
+        function dashboard() {
+            return {
+                connected: true,
+                account: {}, positions: [], bot: { logs: [] },
+                office: {}, review: [], cio: {},
+                settings: { watchlist: [] }, envLocked: {},
+                showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
+                localLogs: [], clearedId: 0, clearedTs: 0,
+                numberFields: [
+                    { key: 'stop_loss_pct', label: 'Stop loss di riserva %', step: 0.5, min: -50, max: -0.5 },
+                    { key: 'scan_interval_min', label: 'Intervallo di scansione (min)', step: 1, min: 1, max: 1440 },
+                    { key: 'base_allocation_pct', label: 'Capitale per ordine BUY %', step: 0.5, min: 0.5, max: 100 },
+                    { key: 'max_allocation_pct', label: 'Capitale massimo per ordine %', step: 0.5, min: 0.5, max: 100 },
+                    { key: 'max_exposure_pct', label: 'Esposizione massima %', step: 5, min: 10, max: 400 },
+                ],
 
-        const LOG_COLORS = {
-            info: 'text-zinc-300',
-            error: 'text-rose-400',
-            success: 'text-emerald-400',
-            warn: 'text-amber-400',
-            system: 'text-cyan-400'
-        };
+                init() {
+                    this.fetchStatus();
+                    this.loadSettings();
+                    setInterval(() => this.fetchStatus(), 3000);
+                    this.$nextTick(() => window.lucide && lucide.createIcons());
+                },
 
-        function el(tag, className, text) {
-            const node = document.createElement(tag);
-            if (className) node.className = className;
-            if (text !== undefined && text !== null) node.textContent = String(text);
-            return node;
-        }
+                // ---------- formattazione ----------
+                usd(v, signed = false) {
+                    if (v === null || v === undefined || isNaN(v)) return '—';
+                    const n = Number(v);
+                    const s = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                    return (signed ? (n > 0 ? '+' : n < 0 ? '−' : '') : (n < 0 ? '−' : '')) + '$' + s;
+                },
+                pct(v) {
+                    if (v === null || v === undefined || isNaN(v)) return '—';
+                    const n = Number(v);
+                    return (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n).toFixed(2) + '%';
+                },
+                qty(v) { return Number(v).toLocaleString('en-US', { maximumFractionDigits: 6 }); },
+                tone(v) {
+                    if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return 'text-slate-300';
+                    return Number(v) > 0 ? 'text-emerald-400' : 'text-rose-400';
+                },
+                exposurePct() {
+                    const eq = Number(this.account.portfolio);
+                    if (!eq || this.account.exposure === undefined) return '—';
+                    return (this.account.exposure / eq * 100).toFixed(1) + '%';
+                },
+                officeTime() {
+                    return this.office.timestamp ? String(this.office.timestamp).replace('T', ' ').slice(0, 19) : '';
+                },
+                actionStyle(a) {
+                    return {
+                        BUY: 'border-emerald-800 text-emerald-400 bg-emerald-950/40',
+                        SELL: 'border-rose-800 text-rose-400 bg-rose-950/40',
+                        ROTATE: 'border-sky-800 text-sky-400 bg-sky-950/40',
+                    }[a] || 'border-slate-700 text-slate-300 bg-slate-800/40';
+                },
+                verdictStyle(v) {
+                    return v === 'APPROVATO' ? 'text-emerald-400' : v === 'RESPINTO' ? 'text-rose-400' : 'text-slate-500';
+                },
+                cioTarget() {
+                    const c = this.cio;
+                    if (c.action === 'ROTATE') return `${c.sell_symbol} → ${c.buy_symbol}`;
+                    return c.buy_symbol || c.sell_symbol || '—';
+                },
+                cioDescription() {
+                    const c = this.cio;
+                    if (c.action === 'ROTATE') return `ROTATE ${c.sell_symbol} → ${c.buy_symbol}`;
+                    if (c.action === 'BUY') return `BUY ${c.buy_symbol}`;
+                    if (c.action === 'SELL') return `SELL ${c.sell_symbol}`;
+                    return 'HOLD';
+                },
 
-        // Richiesta autenticata verso gli endpoint di controllo
-        async function apiRequest(url, method = 'POST', body = undefined) {
-            const headers = { 'X-API-Key': API_TOKEN };
-            if (body !== undefined) headers['Content-Type'] = 'application/json';
-            const res = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
-            const data = await res.json().catch(() => ({}));
-            if (res.status === 401) redirectToLogin();
-            return { res, data };
-        }
+                // ---------- log ----------
+                logClass(text) {
+                    if (/❌|Errore|🚨|🛑|VETO|BLOCCATI/.test(text)) return 'text-rose-300/90';
+                    if (/✅|ORDINE ACQUISTO/.test(text)) return 'text-emerald-300/90';
+                    if (/⚠️|⛔|🌅|🧭/.test(text)) return 'text-amber-300/80';
+                    if (/━━━|===/.test(text)) return 'text-slate-500';
+                    return 'text-slate-400';
+                },
+                visibleLogs() {
+                    const server = (this.bot.logs || [])
+                        .filter(l => l && l.id > this.clearedId)
+                        .map(l => ({ key: 's' + l.id, ts: l.ts, text: l.text, cls: this.logClass(l.text) }));
+                    const local = this.localLogs.filter(l => l.ts > this.clearedTs);
+                    return server.concat(local).sort((a, b) => a.ts - b.ts);
+                },
+                addLog(message, error = false) {
+                    const ts = Date.now() / 1000;
+                    const time = new Date().toLocaleTimeString('it-IT');
+                    this.localLogs.push({ key: 'l' + ts, ts, text: `[${time}] ${message}`, cls: error ? 'text-rose-300/90' : 'text-sky-300/90' });
+                    if (this.localLogs.length > 30) this.localLogs.shift();
+                },
+                clearLogs() {
+                    this.clearedId = (this.bot.logs || []).reduce((m, l) => Math.max(m, l.id || 0), this.clearedId);
+                    this.clearedTs = Date.now() / 1000;
+                    this.localLogs = [];
+                },
 
-        // Sessione scaduta: torna alla pagina di login
-        function redirectToLogin() {
-            window.location.href = '/login';
-        }
-
-        // ---------------- Impostazioni ----------------
-        function renderWatchlist() {
-            const box = document.getElementById('watchlistChips');
-            box.replaceChildren();
-            for (const ticker of watchlist) {
-                const chip = el('span', 'inline-flex items-center gap-1.5 pl-2 pr-1 py-0.5 rounded bg-zinc-800 border border-zinc-700 font-mono text-zinc-200');
-                chip.appendChild(document.createTextNode(ticker));
-                const remove = el('button', 'text-zinc-400 hover:text-rose-400 px-1 rounded', '×');
-                remove.type = 'button';
-                remove.title = `Rimuovi ${ticker}`;
-                remove.onclick = () => {
-                    if (envLocked.watchlist) return showSettingsNotice(`Watchlist fissata da ${envLocked.watchlist}`, 'error');
-                    watchlist = watchlist.filter(t => t !== ticker); renderWatchlist();
-                };
-                chip.appendChild(remove);
-                box.appendChild(chip);
-            }
-            if (watchlist.length === 0) box.appendChild(el('span', 'text-zinc-500', 'Watchlist vuota'));
-        }
-
-        function addTicker(event) {
-            event.preventDefault();
-            const input = document.getElementById('tickerInput');
-            const ticker = input.value.trim().toUpperCase();
-            if (!/^[A-Z0-9.\-]{1,15}$/.test(ticker)) {
-                showSettingsNotice('Ticker non valido', 'error');
-                return;
-            }
-            if (!watchlist.includes(ticker)) watchlist.push(ticker);
-            input.value = '';
-            renderWatchlist();
-        }
-
-        function updateToggleHints() {
-            const auto = document.getElementById('setAutoTrade').checked;
-            document.getElementById('autoTradeHint').textContent = auto
-                ? 'Auto: esegue gli ordini automaticamente'
-                : 'Advisor: registra solo i suggerimenti';
-        }
-
-        // Campi delle impostazioni e relative chiavi di config (per i valori fissati da Render)
-        const SETTING_FIELDS = {
-            stop_loss_pct: 'setStopLoss', base_allocation_pct: 'setBaseAllocation', max_allocation_pct: 'setAllocation',
-            max_exposure_pct: 'setExposure', scan_interval_min: 'setInterval', auto_execute_trades: 'setAutoTrade',
-            keep_alive_enabled: 'setKeepAlive', ai_provider: 'setAiProvider', watchlist: 'tickerInput'
-        };
-        let envLocked = {};
-
-        function applyEnvLocks(locked) {
-            envLocked = locked || {};
-            for (const [key, id] of Object.entries(SETTING_FIELDS)) {
-                const field = document.getElementById(id);
-                if (!field) continue;
-                const env = envLocked[key];
-                field.disabled = Boolean(env);
-                field.title = env ? `Fissato dalla variabile d'ambiente ${env} su Render` : '';
-                const container = field.closest('label') || field.closest('form');
-                if (container) container.classList.toggle('opacity-50', Boolean(env));
-            }
-        }
-
-        function applySettings(cfg) {
-            watchlist = Array.isArray(cfg.watchlist) ? [...cfg.watchlist] : [];
-            renderWatchlist();
-            document.getElementById('setStopLoss').value = cfg.stop_loss_pct;
-            document.getElementById('setAllocation').value = cfg.max_allocation_pct;
-            document.getElementById('setBaseAllocation').value = cfg.base_allocation_pct;
-            document.getElementById('setExposure').value = cfg.max_exposure_pct;
-            document.getElementById('setInterval').value = cfg.scan_interval_min;
-            document.getElementById('setAutoTrade').checked = Boolean(cfg.auto_execute_trades);
-            document.getElementById('setKeepAlive').checked = Boolean(cfg.keep_alive_enabled);
-            document.getElementById('setAiProvider').value = cfg.ai_provider || 'gemini';
-            updateToggleHints();
-            applyEnvLocks(cfg.env_locked);
-        }
-
-        let noticeTimer = null;
-        function showSettingsNotice(message, type) {
-            const notice = document.getElementById('settingsNotice');
-            notice.textContent = message;
-            notice.className = `text-xs font-mono ${type === 'error' ? 'text-rose-400' : 'text-emerald-400'}`;
-            clearTimeout(noticeTimer);
-            noticeTimer = setTimeout(() => notice.classList.add('hidden'), 4000);
-        }
-
-        async function loadSettings() {
-            try {
-                const res = await fetch('/api/settings');
-                if (res.status === 401) return redirectToLogin();
-                if (!res.ok) throw new Error(`HTTP status ${res.status}`);
-                applySettings(await res.json());
-            } catch (err) {
-                showSettingsNotice('Errore caricamento impostazioni', 'error');
-            }
-        }
-
-        async function saveSettings() {
-            const btn = document.getElementById('btnSaveSettings');
-            const payload = {
-                watchlist,
-                stop_loss_pct: Number(document.getElementById('setStopLoss').value),
-                max_allocation_pct: Number(document.getElementById('setAllocation').value),
-                base_allocation_pct: Number(document.getElementById('setBaseAllocation').value),
-                max_exposure_pct: Number(document.getElementById('setExposure').value),
-                scan_interval_min: Number(document.getElementById('setInterval').value),
-                auto_execute_trades: document.getElementById('setAutoTrade').checked,
-                keep_alive_enabled: document.getElementById('setKeepAlive').checked,
-                ai_provider: document.getElementById('setAiProvider').value
+                // ---------- API ----------
+                async api(url, method = 'POST', body) {
+                    const headers = { 'X-API-Key': API_TOKEN };
+                    if (body !== undefined) headers['Content-Type'] = 'application/json';
+                    const res = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
+                    if (res.status === 401) { window.location.href = '/login'; }
+                    const data = await res.json().catch(() => ({}));
+                    return { res, data };
+                },
+                async fetchStatus() {
+                    try {
+                        const res = await fetch('/api/data');
+                        if (res.status === 401) { window.location.href = '/login'; return; }
+                        if (!res.ok) throw new Error(res.status);
+                        const data = await res.json();
+                        this.account = data.account || {};
+                        this.positions = Array.isArray(data.positions) ? data.positions : [];
+                        this.bot = data.bot || { logs: [] };
+                        this.office = this.bot.office || {};
+                        this.review = Array.isArray(this.bot.review) ? this.bot.review : [];
+                        this.cio = this.bot.cio || {};
+                        this.connected = true;
+                    } catch (e) {
+                        this.connected = false;
+                    }
+                },
+                async loadSettings() {
+                    try {
+                        const res = await fetch('/api/settings');
+                        if (res.status === 401) { window.location.href = '/login'; return; }
+                        const cfg = await res.json();
+                        this.envLocked = cfg.env_locked || {};
+                        delete cfg.env_locked;
+                        this.settings = cfg;
+                    } catch (e) { /* riprova alla prossima apertura */ }
+                },
+                locked(key) { return Boolean(this.envLocked[key]); },
+                lockTitle(key) { return this.envLocked[key] ? `Fissato dalla variabile d'ambiente ${this.envLocked[key]} su Render` : ''; },
+                addTicker() {
+                    const t = this.tickerInput.trim().toUpperCase();
+                    if (!/^[A-Z0-9.\-]{1,15}$/.test(t)) { this.flash('Ticker non valido', true); return; }
+                    if (!this.settings.watchlist.includes(t)) this.settings.watchlist.push(t);
+                    this.tickerInput = '';
+                },
+                removeTicker(t) { this.settings.watchlist = this.settings.watchlist.filter(x => x !== t); },
+                flash(message, error = false) {
+                    this.notice = message; this.noticeError = error;
+                    clearTimeout(this._noticeTimer);
+                    this._noticeTimer = setTimeout(() => this.notice = '', 4000);
+                },
+                async saveSettings() {
+                    const payload = JSON.parse(JSON.stringify(this.settings));
+                    for (const key of Object.keys(this.envLocked)) delete payload[key];
+                    this.saving = true;
+                    try {
+                        const { res, data } = await this.api('/api/settings', 'POST', payload);
+                        if (res.ok && data.settings) {
+                            this.envLocked = data.settings.env_locked || {};
+                            delete data.settings.env_locked;
+                            this.settings = data.settings;
+                            this.flash('Impostazioni salvate');
+                        } else {
+                            this.flash(data.message || 'Errore nel salvataggio', true);
+                        }
+                    } catch (e) {
+                        this.flash('Errore nel salvataggio: ' + e.message, true);
+                    } finally {
+                        this.saving = false;
+                    }
+                },
+                async scan() {
+                    this.addLog('Scansione manuale richiesta');
+                    const { res, data } = await this.api('/api/scan');
+                    this.addLog(data.message || (res.ok ? 'Scansione avviata' : 'Errore'), !res.ok);
+                },
+                async toggleBot() {
+                    const { res, data } = await this.api('/api/toggle');
+                    if (res.ok) { this.bot.active = Boolean(data.active); this.addLog(data.active ? 'Bot riattivato' : 'Bot in pausa'); }
+                },
+                async liquidate() {
+                    if (!confirm('Chiudere TUTTE le posizioni aperte?')) return;
+                    const { res, data } = await this.api('/api/liquidate');
+                    this.addLog(data.message || 'Liquidazione inviata', !res.ok);
+                    this.fetchStatus();
+                },
             };
-            for (const key of Object.keys(envLocked)) delete payload[key];  // gestiti da Render
-            btn.disabled = true;
-            try {
-                const { res, data } = await apiRequest('/api/settings', 'POST', payload);
-                if (res.ok && data.settings) {
-                    applySettings(data.settings);
-                    showSettingsNotice('✓ Impostazioni salvate', 'success');
-                    addLog('Impostazioni salvate', 'success');
-                } else {
-                    showSettingsNotice(data.message || 'Errore salvataggio', 'error');
-                }
-            } catch (err) {
-                showSettingsNotice('Errore salvataggio: ' + err.message, 'error');
-            } finally {
-                btn.disabled = false;
-            }
         }
-
-        function renderLogs(force = false) {
-            const container = document.getElementById('terminalContainer');
-            if (!container) return;
-
-            const entries = lastServerLogs
-                .filter(l => l.id > clearedServerId)
-                .map(l => ({ ts: l.ts, text: l.text, type: 'info' }))
-                .concat(localLogs.filter(l => l.ts > clearedTs))
-                .sort((a, b) => a.ts - b.ts);
-
-            const renderKey = entries.length + ':' + (entries.length ? entries[entries.length - 1].ts + entries[entries.length - 1].text : '');
-            if (!force && renderKey === lastRenderKey) return;
-            lastRenderKey = renderKey;
-
-            // Autoscroll solo se l'utente è già in fondo
-            const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 40;
-            container.replaceChildren();
-            if (entries.length === 0) {
-                container.appendChild(el('div', 'text-zinc-500', '[SYSTEM] Nessun log.'));
-            }
-            for (const entry of entries) {
-                container.appendChild(el('div', `${LOG_COLORS[entry.type] || LOG_COLORS.info} leading-relaxed break-all`, entry.text));
-            }
-            if (atBottom || force) container.scrollTop = container.scrollHeight;
-        }
-
-        function addLog(message, type = 'info') {
-            const time = new Date().toLocaleTimeString('it-IT');
-            localLogs.push({ ts: Date.now() / 1000, text: `[${time}] ${message}`, type });
-            if (localLogs.length > 30) localLogs.shift();
-            renderLogs(true);
-        }
-
-        function clearLogs() {
-            clearedServerId = lastServerLogs.reduce((max, l) => Math.max(max, l.id), clearedServerId);
-            clearedTs = Date.now() / 1000;
-            localLogs = [];
-            renderLogs(true);
-        }
-
-        function formatUsd(value) {
-            return `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-        }
-
-        function renderPositions(positions) {
-            const tbody = document.getElementById('positionsTableBody');
-            document.getElementById('posCount').textContent = `${positions.length} Posizioni Attive`;
-            if (!tbody) return;
-
-            tbody.replaceChildren();
-            if (positions.length === 0) {
-                const row = el('tr');
-                const cell = el('td', 'py-4 text-center text-zinc-500', 'Nessuna posizione aperta al momento.');
-                cell.colSpan = 6;
-                row.appendChild(cell);
-                tbody.appendChild(row);
-                return;
-            }
-
-            for (const p of positions) {
-                const pl = Number(p.unrealized_pl);
-                const row = el('tr', 'hover:bg-zinc-900/50 transition');
-
-                const symCell = el('td', 'py-3 px-4 font-bold text-white flex items-center gap-2');
-                symCell.appendChild(el('span', 'w-2 h-2 rounded-full bg-emerald-500'));
-                symCell.appendChild(document.createTextNode(' ' + p.symbol));
-                row.appendChild(symCell);
-
-                const sideCell = el('td', 'py-3 px-4');
-                sideCell.appendChild(el('span', 'px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 text-[10px]', p.side || 'LONG'));
-                row.appendChild(sideCell);
-
-                row.appendChild(el('td', 'py-3 px-4', p.qty));
-                row.appendChild(el('td', 'py-3 px-4', `$${Number(p.current_price).toFixed(2)}`));
-                row.appendChild(el('td', 'py-3 px-4', formatUsd(p.market_value)));
-                row.appendChild(el('td', `py-3 px-4 font-bold ${pl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`, `${pl >= 0 ? '+' : '-'}$${Math.abs(pl).toFixed(2)}`));
-                tbody.appendChild(row);
-            }
-        }
-
-        function renderAiAnalysis(ai) {
-            if (ai.symbol) document.getElementById('aiTargetSymbol').textContent = ai.symbol;
-            if (ai.rsi) document.getElementById('aiRsi').textContent = ai.rsi;
-            if (ai.sentiment) document.getElementById('aiSentiment').textContent = ai.sentiment;
-            if (ai.ai_verdict) {
-                const verdict = document.getElementById('aiVerdict');
-                verdict.textContent = ai.ai_verdict;
-                const v = ai.ai_verdict.toUpperCase();
-                verdict.className = 'text-sm font-mono font-bold mt-1 ' +
-                    (v.startsWith('SELL') ? 'text-rose-400' : v.startsWith('BUY') ? 'text-emerald-400' : 'text-cyan-400');
-            }
-            if (ai.reasoning) {
-                const box = document.getElementById('aiReasoning');
-                box.replaceChildren(
-                    el('span', 'text-cyan-400 font-bold', '[RAGIONAMENTO IA]:'),
-                    document.createTextNode(' ' + ai.reasoning)
-                );
-            }
-        }
-
-        const BADGE_TONES = {
-            ok: 'border-emerald-800 bg-emerald-950/60 text-emerald-300',
-            warn: 'border-amber-800 bg-amber-950/60 text-amber-300',
-            bad: 'border-rose-800 bg-rose-950/60 text-rose-300',
-            neutral: 'border-zinc-700 bg-zinc-900 text-zinc-300'
-        };
-
-        function renderBoardroom(badges) {
-            const box = document.getElementById('boardroomBadges');
-            if (!box) return;
-            box.replaceChildren();
-            for (const b of badges) {
-                const chip = el('span', `inline-flex items-center gap-1.5 px-2 py-1 rounded border text-[11px] font-mono ${BADGE_TONES[b.tone] || BADGE_TONES.neutral}`);
-                chip.appendChild(el('span', 'font-bold uppercase tracking-wider text-[10px] opacity-80', b.agent));
-                chip.appendChild(el('span', '', b.value));
-                box.appendChild(chip);
-            }
-        }
-
-        function renderOffice(office) {
-            document.getElementById('officeTimestamp').textContent =
-                `${office.scout_id} · ${String(office.timestamp || '').replace('T', ' ').slice(0, 19)}`;
-            document.getElementById('officeSector').textContent = office.sector || '--';
-            document.getElementById('officeTickers').textContent =
-                `Ispezionati: ${(office.tickers_inspected || []).join(', ') || '-'}`;
-
-            const box = document.getElementById('officeDiscoveries');
-            box.replaceChildren();
-            const discoveries = office.discoveries || [];
-            if (discoveries.length === 0) {
-                box.appendChild(el('div', 'text-zinc-500', 'Nessuna anomalia eccezionale in questo settore.'));
-            }
-            for (const d of discoveries) {
-                const approved = d.verdict === 'APPROVATO';
-                const row = el('div', 'p-2 rounded border border-zinc-800 bg-black/30');
-                const head = el('div', 'flex items-center justify-between gap-2');
-                head.appendChild(el('span', 'font-bold text-white', `${d.symbol} · score ${d.score}`));
-                head.appendChild(el('span', `px-1.5 py-0.5 rounded text-[10px] ${approved ? 'bg-emerald-950 text-emerald-300' : 'bg-rose-950 text-rose-300'}`,
-                    d.verdict || 'IN REVISIONE'));
-                row.appendChild(head);
-                row.appendChild(el('div', 'text-zinc-400 mt-1', (d.anomalies || []).join(' · ')));
-                if (d.detail) row.appendChild(el('div', 'text-zinc-500 mt-1', d.detail));
-                box.appendChild(row);
-            }
-
-            const cio = office.cio || {};
-            const verdict = document.getElementById('officeCioVerdict');
-            if (discoveries.length === 0) {
-                verdict.textContent = `${cio.decision || '--'} (nessuna scoperta da valutare)`;
-                verdict.className = 'text-sm font-bold mt-1 text-zinc-300';
-            } else {
-                verdict.textContent = (cio.approved ? '✅ SCOPERTA APPROVATA' : '❌ SCOPERTA RESPINTA')
-                    + (cio.suspended ? ' · sospesa (ciclo di avvio)' : '');
-                verdict.className = `text-sm font-bold mt-1 ${cio.approved ? 'text-emerald-400' : 'text-rose-400'}`;
-            }
-            document.getElementById('officeCioReason').textContent =
-                `${cio.decision || ''}${cio.source ? ' (' + cio.source + ')' : ''} — ${cio.reason || ''}`;
-        }
-
-        async function fetchStatus() {
-            try {
-                const res = await fetch('/api/data');
-                if (res.status === 401) return redirectToLogin();
-                if (!res.ok) throw new Error(`HTTP status ${res.status}`);
-
-                const data = await res.json();
-
-                // 1. Account Metrics
-                const account = data.account || {};
-                if (account.portfolio !== undefined) document.getElementById('portfolioValue').textContent = formatUsd(account.portfolio);
-                if (account.cash !== undefined) document.getElementById('cashBalance').textContent = formatUsd(account.cash);
-                if (account.buying_power !== undefined) document.getElementById('cashRatio').textContent = `Buying Power: ${formatUsd(account.buying_power)}`;
-
-                // 2. Stato Bot & Log (ordine cronologico, il più recente in fondo)
-                const bot = data.bot || {};
-                if (bot.last_scan) document.getElementById('lastScanTime').textContent = bot.last_scan;
-                if (bot.status) document.getElementById('lastScanStatus').textContent = `Stato: ${bot.status}`;
-                if (Array.isArray(bot.logs)) {
-                    lastServerLogs = bot.logs.filter(l => l && typeof l === 'object');
-                    renderLogs();
-                }
-
-                // 3. Posizioni Aperte (Movimentazioni)
-                renderPositions(Array.isArray(data.positions) ? data.positions : []);
-
-                // 4. Analisi Live dell'IA e pareri del Boardroom
-                if (bot.latest_ai_analysis) renderAiAnalysis(bot.latest_ai_analysis);
-                if (Array.isArray(bot.boardroom)) renderBoardroom(bot.boardroom);
-                if (bot.office && bot.office.scout_id) renderOffice(bot.office);
-
-                if (bot.active !== undefined) isRunning = Boolean(bot.active);
-                updateBotStatusDisplay();
-
-            } catch (err) {
-                document.getElementById('botStatusText').textContent = 'Connessione...';
-                document.getElementById('statusIndicator').className = 'h-2.5 w-2.5 rounded-full bg-amber-500 animate-pulse';
-            }
-        }
-
-        function updateBotStatusDisplay() {
-            const indicator = document.getElementById('statusIndicator');
-            const text = document.getElementById('botStatusText');
-            const btn = document.getElementById('btnToggle');
-
-            if (!indicator || !text || !btn) return;
-
-            const wasRunning = btn.dataset.running;
-            if (isRunning) {
-                indicator.className = 'h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse';
-                text.textContent = 'ATTIVO';
-                text.className = 'text-xs px-2 py-0.5 rounded border border-emerald-900 bg-emerald-950 text-emerald-400 font-mono';
-            } else {
-                indicator.className = 'h-2.5 w-2.5 rounded-full bg-amber-500';
-                text.textContent = 'IN PAUSA';
-                text.className = 'text-xs px-2 py-0.5 rounded border border-amber-900 bg-amber-950 text-amber-400 font-mono';
-            }
-            // Ricrea il pulsante solo quando lo stato cambia
-            if (wasRunning !== String(isRunning)) {
-                btn.dataset.running = String(isRunning);
-                btn.innerHTML = isRunning
-                    ? '<i data-lucide="pause" class="w-3.5 h-3.5"></i> PAUSA BOT'
-                    : '<i data-lucide="play" class="w-3.5 h-3.5"></i> AVVIA BOT';
-                lucide.createIcons();
-            }
-        }
-
-        function logResult(res, data, fallback) {
-            const ok = res.ok && data.status !== 'error';
-            const type = !ok ? 'error' : data.status === 'warning' ? 'warn' : 'success';
-            addLog(data.message || fallback, type);
-            return ok;
-        }
-
-        async function triggerScan() {
-            addLog('Avvio scansione manuale...', 'system');
-            try {
-                const { res, data } = await apiRequest('/api/scan');
-                logResult(res, data, 'Scansione avviata');
-                fetchStatus();
-            } catch (err) {
-                addLog('Errore durante la scansione: ' + err.message, 'error');
-            }
-        }
-
-        async function toggleBot() {
-            try {
-                const { res, data } = await apiRequest('/api/toggle');
-                if (!res.ok) {
-                    logResult(res, data, 'Errore cambio stato bot');
-                    return;
-                }
-                isRunning = Boolean(data.active);
-                updateBotStatusDisplay();
-                addLog(isRunning ? 'Bot riavviato' : 'Bot in pausa', 'warn');
-            } catch (err) {
-                addLog('Errore cambio stato bot: ' + err.message, 'error');
-            }
-        }
-
-        async function liquidateAll() {
-            if (!confirm('SEI SICURO? Questa azione chiuderà TUTTE le posizioni aperte.')) return;
-            addLog('INVIO ORDINE DI LIQUIDAZIONE TOTALE...', 'error');
-            try {
-                const { res, data } = await apiRequest('/api/liquidate');
-                logResult(res, data, 'Liquidazione completata.');
-                fetchStatus();
-            } catch (err) {
-                addLog('Errore liquidazione: ' + err.message, 'error');
-            }
-        }
-
-        loadSettings();
-        fetchStatus();
-        setInterval(fetchStatus, 3000);
     </script>
 </body>
 </html>

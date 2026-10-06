@@ -36,6 +36,8 @@ bot_state = {
     "logs": deque(maxlen=150),  # ordine cronologico: il più recente è in fondo
     "boardroom": [],  # badge con il parere dei principali agenti (dashboard)
     "office": {},     # Ufficio Virtuale: ricerca dell'Esploratore #1, revisione e decisione del CIO
+    "review": [],     # Reparto Revisione: metriche dei 5 agenti per gli asset valutati
+    "cio": {},        # Decisione esecutiva del CIO
     "latest_ai_analysis": {
         "symbol": "INIZIALIZZO...",
         "rsi": "--",
@@ -428,6 +430,44 @@ def run_trading_cycle(manual=False, boot=False):
                 rotate_capital(sell_report, final["buy_symbol"], cfg, auto_trade, pending, stop_pct=stop)
         core.save_state(state)
 
+        # Reparto Revisione: tabella delle metriche per scoperte, obiettivo del CIO e migliori candidati
+        # Ordine: scoperte, obiettivo del CIO, candidati ammessi, respinti dal comitato, poi posizioni in portafoglio
+        review_keys = [k for k in dict.fromkeys(
+            sorted(scout_keys) + ([target_key] if target_key else [])
+            + [core.normalize_symbol(a["symbol"]) for a in candidates[:3]]
+            + [core.normalize_symbol(sym) for sym, _ in excluded]
+            + [core.normalize_symbol(p["yf_symbol"]) for p in positions]) if k in analysis][:5]
+        rows = []
+        for key in review_keys:
+            a = analysis[key]
+            ind, sent, v, vf, st = a["ind"], sentiment.get(key), vol.get(key), volume.get(key, {}), audit.get(key)
+            origin = "Esploratore #1" if key in scout_keys else ("Portafoglio" if key in held_keys else "Watchlist")
+            verdict = review.get(key, {}).get("verdict") or ("APPROVATO" if key in admitted else
+                                                              ("RESPINTO" if key in excluded_why else
+                                                               ("IN PORTAFOGLIO" if key in held_keys else "—")))
+            rows.append({
+                "symbol": a["symbol"], "origin": origin, "verdict": verdict,
+                "detail": review.get(key, {}).get("detail") or excluded_why.get(key, ""),
+                "technical": {"score": a["score"], "rsi": round(ind["rsi"], 1), "macd_hist": round(ind["macd_hist"], 4),
+                              "roc": ind["roc"], "trend_up": ind["sma20"] > ind["sma50"],
+                              "audit_penalty": bool(a.get("audit_penalty"))},
+                "sentiment": {"score": sent["sentiment"], "veto": sent["veto"], "news": short_text(sent["news"], 120)} if sent else None,
+                "atr": {"atr_pct": v["atr_pct"], "stop_pct": v["stop_pct"]} if v else None,
+                "volume": {"ratio": vf.get("ratio"), "status": vf.get("status")},
+                "drawdown": {"pct": drawdown["drawdown_pct"], "blocked": drawdown["blocked"]},
+                "auditor": {"win_rate": st["win_rate"], "trades": st["trades"], "pnl": st["pnl"]} if st else None,
+            })
+        bot_state["review"] = rows
+        bot_state["cio"] = {
+            "action": final["action"], "buy_symbol": final["buy_symbol"], "sell_symbol": final["sell_symbol"],
+            "allocation_pct": round(pct_eff, 1) if final["action"] in ("BUY", "ROTATE") and orders_allowed else None,
+            "stop_pct": stop if final["action"] in ("BUY", "ROTATE") and orders_allowed else None,
+            "source": source, "reason": final["reason"] or decision["reason"],
+            "proposal": describe_decision(decision), "suspended": boot and final["action"] in ("BUY", "ROTATE"),
+            "scout_approved": scout_buy, "timestamp": core.now_local().strftime("%H:%M:%S"),
+            "macro": {c: m["regime"] for c, m in macro.items()},
+        }
+
         # Badge per la dashboard
         m_s, m_c = macro["stock"], macro["crypto"]
         vetoes = [v["symbol"] for v in sentiment.values() if v["veto"]]
@@ -602,6 +642,13 @@ def index():
 def ping():
     return jsonify({"status": "alive", "timestamp": core.now_local().isoformat()}), 200
 
+def account_with_pnl():
+    acc = dict(get_account_summary())
+    acc.update(core.pnl_summary(acc.get("portfolio", 0) or 0, acc.get("last_equity", 0) or 0))
+    positions = cached("positions", get_open_positions)
+    acc["exposure"] = round(sum(abs(p["market_value"]) for p in positions), 2)
+    return acc
+
 @app.route("/api/data")
 @require_login
 def api_data():
@@ -614,9 +661,11 @@ def api_data():
             "latest_ai_analysis": dict(bot_state["latest_ai_analysis"]),
             "boardroom": list(bot_state["boardroom"]),
             "office": dict(bot_state["office"]),
+            "review": list(bot_state["review"]),
+            "cio": dict(bot_state["cio"]),
         }
     return jsonify({
-        "account": cached("account", get_account_summary),
+        "account": cached("account_pnl", account_with_pnl),
         "positions": cached("positions", get_open_positions),
         "bot": bot,
         "sources": {

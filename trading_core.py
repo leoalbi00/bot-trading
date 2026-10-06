@@ -1643,7 +1643,7 @@ def post_trade_auditor(analysis, log=print, ledger=None):
 CIO_SYSTEM_PROMPT = (
     "Sei il Chief Investment Officer dell'Ufficio Virtuale e del Virtual Boardroom Finanziario di un bot di trading algoritmico "
     "che opera su un conto paper (simulato) Alpaca. Le tue risposte vengono lette da un programma: "
-    "rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo."
+    "rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo. Scrivi il campo reason in italiano."
 )
 
 
@@ -1929,3 +1929,45 @@ def update_scout_registry(scout_id, review, cio):
             registry["history"][i] = entry
             break
     write_json_file(SCOUT_REGISTRY_PATH, registry)
+
+
+# ===========================================================================
+# P&L del conto
+# ===========================================================================
+_initial_capital_cache = {"ts": 0.0, "value": None}
+
+
+def initial_capital():
+    """Capitale iniziale del conto: BOT_INITIAL_CAPITAL, altrimenti base_value dello storico Alpaca (cache 1h)."""
+    env = os.getenv("BOT_INITIAL_CAPITAL")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    if time.time() - _initial_capital_cache["ts"] < 3600 and _initial_capital_cache["value"]:
+        return _initial_capital_cache["value"]
+    if not alpaca_client:
+        return None
+    try:
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        hist = alpaca_client.get_portfolio_history(GetPortfolioHistoryRequest(period="all", timeframe="1D"))
+        value = float(hist.base_value) if hist.base_value else None
+    except Exception:
+        value = None
+    _initial_capital_cache.update(ts=time.time(), value=value)
+    return value
+
+
+def pnl_summary(equity, last_equity):
+    """P&L netto dall'inizio e P&L del giorno, in $ e %."""
+    base = initial_capital()
+    out = {"initial_capital": base, "net_pnl_usd": None, "net_pnl_pct": None,
+           "daily_pnl_usd": None, "daily_pnl_pct": None}
+    if base:
+        out["net_pnl_usd"] = round(equity - base, 2)
+        out["net_pnl_pct"] = round((equity / base - 1) * 100, 3)
+    if last_equity:
+        out["daily_pnl_usd"] = round(equity - last_equity, 2)
+        out["daily_pnl_pct"] = round((equity / last_equity - 1) * 100, 3)
+    return out
