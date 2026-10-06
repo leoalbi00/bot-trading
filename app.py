@@ -73,17 +73,18 @@ def cached(key, fn):
 
 def get_account_summary():
     if not alpaca_client:
-        return {"cash": 0, "portfolio": 0, "buying_power": 0}
+        return {"cash": 0, "portfolio": 0, "buying_power": 0, "non_marginable_buying_power": 0}
     try:
         acc = alpaca_client.get_account()
         return {
             "cash": float(acc.cash),
             "portfolio": float(acc.portfolio_value),
-            "buying_power": float(acc.buying_power)
+            "buying_power": float(acc.buying_power),
+            "non_marginable_buying_power": float(acc.non_marginable_buying_power or 0)
         }
     except Exception as e:
         log_message(f"Errore lettura account: {e}")
-        return {"cash": 0, "portfolio": 0, "buying_power": 0}
+        return {"cash": 0, "portfolio": 0, "buying_power": 0, "non_marginable_buying_power": 0}
 
 def get_open_positions():
     if not alpaca_client:
@@ -287,9 +288,9 @@ def run_trading_cycle(manual=False):
         log_message(f"Asset selezionati per analisi BUY: {[c['symbol'] for c in top_3]}")
 
         acc = get_account_summary()
-        allocation = acc["cash"] * cfg["max_allocation_pct"] / 100
-        if allocation < core.MIN_ORDER_USD:
-            log_message(f"Liquidità insufficiente: allocazione ${allocation:.2f} < ${core.MIN_ORDER_USD:.0f}.")
+        funds = max(core.available_funds(acc), core.available_funds(acc, crypto=True))
+        if funds <= core.MIN_ORDER_USD:
+            log_message(f"[Trading] Liquidità disponibile insufficiente per nuovi acquisti (${funds:,.2f})")
         else:
             for asset in top_3:
                 if not manual and should_abort():
@@ -304,6 +305,10 @@ def run_trading_cycle(manual=False):
                     continue
                 if not core.is_crypto(sym) and not market_open:
                     log_message(f"{sym}: mercato azionario chiuso, nessun ordine accodato.")
+                    continue
+                allocation = core.available_funds(acc, crypto=core.is_crypto(sym)) * cfg["max_allocation_pct"] / 100
+                if allocation < core.MIN_ORDER_USD:
+                    log_message(f"[Trading] {sym}: budget ${allocation:,.2f} sotto il minimo di ${core.MIN_ORDER_USD:.0f}, salto.")
                     continue
 
                 set_ai_analysis(

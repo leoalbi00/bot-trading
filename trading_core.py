@@ -9,6 +9,7 @@ import re
 import json
 import secrets
 import threading
+import time
 
 import dotenv
 import ta
@@ -26,7 +27,12 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 # Modelli Gemini supportati, in ordine di preferenza (sovrascrivibili da .env)
-GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.0-flash").split(",") if m.strip()]
+# I modelli in 404 vengono esclusi automaticamente alla prima risposta negativa
+GEMINI_MODELS = [m.strip() for m in os.getenv(
+    "GEMINI_MODELS",
+    "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash",
+).split(",") if m.strip()]
+GEMINI_TIMEOUT_MS = 45000
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 
 MIN_ORDER_USD = 10.0
@@ -251,17 +257,53 @@ def parse_decision(text, allowed=("BUY", "SELL", "HOLD")):
     return "HOLD"
 
 
+_warned_at = {}
+
+
+def _warn_throttled(key, message, log, every=3600):
+    """Scrive un'avvertenza al massimo una volta ogni `every` secondi."""
+    now = time.time()
+    if now - _warned_at.get(key, 0) >= every:
+        _warned_at[key] = now
+        log(message)
+
+
+def _resolve_provider(provider, log):
+    """Sceglie il provider effettivo in base alle chiavi configurate."""
+    has_gemini, has_claude = bool(GEMINI_KEY), bool(ANTHROPIC_KEY)
+    if provider == "hybrid" and not (has_gemini and has_claude):
+        if has_gemini or has_claude:
+            fallback = "gemini" if has_gemini else "claude"
+            missing = "ANTHROPIC_API_KEY" if has_gemini else "GEMINI_API_KEY"
+            _warn_throttled("hybrid", f"⚠️ Modalità Ibrida: {missing} non configurata, uso solo {fallback.capitalize()}.", log)
+            return fallback
+    if provider == "claude" and not has_claude and has_gemini:
+        _warn_throttled("claude", "⚠️ ANTHROPIC_API_KEY non configurata: uso Gemini al posto di Claude.", log)
+        return "gemini"
+    if provider == "gemini" and not has_gemini and has_claude:
+        _warn_throttled("gemini", "⚠️ GEMINI_API_KEY non configurata: uso Claude al posto di Gemini.", log)
+        return "claude"
+    return provider
+
+
 def query_ai(prompt, log=print):
     """Interroga il motore IA scelto in config.json (gemini / claude / hybrid).
 
     In modalità ibrida si opera solo se i due modelli sono d'accordo, altrimenti HOLD.
+    Se un provider non è configurato o non risponde, si usa automaticamente l'altro.
     """
-    provider = get_config()["ai_provider"]
+    provider = _resolve_provider(get_config()["ai_provider"], log)
     if provider == "claude":
         return query_claude_ai(prompt, log=log)
     if provider == "hybrid":
-        gemini_res = query_gemini_ai(prompt, log=log)
-        claude_res = query_claude_ai(prompt, log=log)
+        gemini_res = _ask_gemini(prompt, log)
+        claude_res = _ask_claude(prompt, log)
+        if gemini_res is None and claude_res is None:
+            return "DECISIONE: HOLD | MOTIVO: Nessun motore IA ha risposto"
+        if gemini_res is None or claude_res is None:
+            working, failed = ("Claude", "Gemini") if gemini_res is None else ("Gemini", "Claude")
+            log(f"⚠️ Modalità Ibrida: {failed} non ha risposto, decisione basata solo su {working}.")
+            return gemini_res or claude_res
         d_gemini, d_claude = parse_decision(gemini_res), parse_decision(claude_res)
         decision = d_gemini if d_gemini == d_claude else "HOLD"
         return (f"DECISIONE: {decision} | IBRIDO (Gemini={d_gemini}, Claude={d_claude})\n"
@@ -273,11 +315,16 @@ _claude_client = None
 
 
 def query_claude_ai(prompt, log=print):
-    """Interroga Claude (Anthropic). Ogni errore viene loggato e la decisione diventa HOLD."""
+    """Interroga Claude (Anthropic). In caso di errore la decisione diventa HOLD."""
+    return _ask_claude(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Claude"
+
+
+def _ask_claude(prompt, log):
+    """Testo della risposta di Claude, oppure None se non disponibile. Gli errori vengono loggati."""
     global _claude_client
     if not ANTHROPIC_KEY:
-        log("⚠️ ANTHROPIC_API_KEY non configurata: decisione forzata a HOLD.")
-        return "DECISIONE: HOLD | MOTIVO: API Key Anthropic non configurata"
+        log("⚠️ ANTHROPIC_API_KEY non configurata.")
+        return None
     try:
         if _claude_client is None:
             import anthropic
@@ -293,35 +340,64 @@ def query_claude_ai(prompt, log=print):
         log(f"⚠️ Claude {CLAUDE_MODEL}: risposta vuota.")
     except Exception as e:
         log(f"❌ Errore Claude ({CLAUDE_MODEL}): {e}")
-    return "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Claude"
+    return None
+
+
+# Modelli che hanno restituito 404 / deprecato: non vengono più riprovati
+_unavailable_gemini_models = set()
 
 
 def query_gemini_ai(prompt, log=print):
-    """Interroga Gemini provando i modelli configurati. Ogni errore viene loggato."""
+    """Interroga Gemini provando i modelli configurati. In caso di errore la decisione diventa HOLD."""
+    return _ask_gemini(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Gemini"
+
+
+def _ask_gemini(prompt, log):
+    """Prova i modelli Gemini in sequenza; restituisce il testo o None. Gli errori vengono loggati."""
     global _gemini_client
     if not GEMINI_KEY:
-        log("⚠️ GEMINI_API_KEY non configurata: decisione forzata a HOLD.")
-        return "DECISIONE: HOLD | MOTIVO: API Key Gemini non configurata"
+        log("⚠️ GEMINI_API_KEY non configurata.")
+        return None
 
     try:
+        from google import genai
+        from google.genai import errors as genai_errors, types as genai_types
         if _gemini_client is None:
-            from google import genai
-            _gemini_client = genai.Client(api_key=GEMINI_KEY)
+            _gemini_client = genai.Client(
+                api_key=GEMINI_KEY,
+                http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+            )
     except Exception as e:
         log(f"❌ Impossibile inizializzare il client Gemini: {e}")
-        return "DECISIONE: HOLD | MOTIVO: Client Gemini non disponibile"
+        return None
 
-    for model in GEMINI_MODELS:
+    models = [m for m in GEMINI_MODELS if m not in _unavailable_gemini_models]
+    if not models:
+        log("❌ Nessun modello Gemini disponibile: aggiorna GEMINI_MODELS.")
+        return None
+
+    for model in models:
         try:
             res = _gemini_client.models.generate_content(model=model, contents=prompt)
             if res and res.text:
                 return res.text
-            log(f"⚠️ Gemini {model}: risposta vuota.")
+            log(f"⚠️ Gemini {model}: risposta vuota, provo il modello successivo.")
+        except genai_errors.ClientError as e:
+            message = str(e)
+            if e.code == 404 or "deprecat" in message.lower() or "no longer available" in message.lower():
+                _unavailable_gemini_models.add(model)
+                log(f"⚠️ Gemini {model}: modello non disponibile (404/deprecato), escluso. Provo il successivo.")
+            elif e.code == 429:
+                log(f"⚠️ Gemini {model}: quota esaurita (429), provo il modello successivo.")
+            else:
+                log(f"❌ Errore Gemini ({model}): {message[:200]}")
+        except genai_errors.ServerError as e:
+            log(f"⚠️ Gemini {model}: servizio non disponibile ({e.code}), provo il modello successivo.")
         except Exception as e:
-            log(f"❌ Errore Gemini ({model}): {e}")
+            log(f"❌ Errore Gemini ({model}): {str(e)[:200]}")
 
-    log("❌ Tutti i modelli Gemini hanno fallito: decisione forzata a HOLD.")
-    return "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Gemini"
+    log("❌ Tutti i modelli Gemini hanno fallito.")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -400,3 +476,16 @@ def submit_notional_buy(yf_symbol, amount_usd):
 def close_position(alpaca_symbol):
     """Chiude l'intera posizione (gestisce anche le quantità frazionarie)."""
     return alpaca_client.close_position(alpaca_symbol)
+
+
+def available_funds(account, crypto=False):
+    """Fondi utilizzabili per nuovi acquisti, mai negativi.
+
+    `cash` può essere negativo con margine o posizioni aperte, quindi si usa il buying power.
+    Le crypto non possono essere comprate a margine: per loro vale non_marginable_buying_power.
+    """
+    key = "non_marginable_buying_power" if crypto else "buying_power"
+    try:
+        return max(0.0, float(account.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0.0

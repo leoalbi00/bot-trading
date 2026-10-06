@@ -46,17 +46,18 @@ def get_account_summary():
     """Recupera bilancio, valore totale e patrimonio dal conto Alpaca."""
     if not alpaca_client:
         print("[!] Credenziali Alpaca non configurate.")
-        return {"cash": 0.0, "equity": 0.0, "buying_power": 0.0}
+        return {"cash": 0.0, "equity": 0.0, "buying_power": 0.0, "non_marginable_buying_power": 0.0}
     try:
         acc = alpaca_client.get_account()
         return {
             "cash": float(acc.cash),
             "equity": float(acc.equity),
-            "buying_power": float(acc.buying_power)
+            "buying_power": float(acc.buying_power),
+            "non_marginable_buying_power": float(acc.non_marginable_buying_power or 0)
         }
     except Exception as e:
         print(f"[!] Errore recupero account Alpaca: {e}")
-    return {"cash": 0.0, "equity": 0.0, "buying_power": 0.0}
+    return {"cash": 0.0, "equity": 0.0, "buying_power": 0.0, "non_marginable_buying_power": 0.0}
 
 def get_positions():
     """Recupera le posizioni aperte, indicizzate per simbolo normalizzato (es. BTCUSD)."""
@@ -182,15 +183,18 @@ def evaluate_and_trade(asset, positions, pending, market_open):
             if not core.is_crypto(asset['symbol']) and not market_open:
                 print(f"[i] Mercato azionario chiuso: acquisto di {asset['symbol']} non inviato.")
                 return
-            allocation = get_account_summary()['cash'] * core.get_config()['max_allocation_pct'] / 100
-            if allocation >= core.MIN_ORDER_USD:
+            funds = core.available_funds(get_account_summary(), crypto=core.is_crypto(asset['symbol']))
+            allocation = funds * core.get_config()['max_allocation_pct'] / 100
+            if funds <= core.MIN_ORDER_USD:
+                print(f"[Trading] Liquidità disponibile insufficiente per nuovi acquisti (${funds:,.2f})")
+            elif allocation >= core.MIN_ORDER_USD:
                 print(f"[3/4] Invio ordine di ACQUISTO Alpaca: ${allocation:.2f} di {asset['symbol']}...")
                 order = core.submit_notional_buy(asset['symbol'], allocation)
                 pending.add(key)
                 print(f"[4/4] ORDINE DI ACQUISTO INVIATO! ID: {order.id}")
                 send_trade_alert(asset['symbol'], "BUY", f"${allocation:.2f}", asset['price'])
             else:
-                print("[!] Liquidità insufficiente per un nuovo acquisto.")
+                print(f"[Trading] Budget ${allocation:,.2f} sotto il minimo di ${core.MIN_ORDER_USD:.0f}: nessun acquisto.")
 
         # LOGICA DI VENDITA
         elif decision == "SELL":
