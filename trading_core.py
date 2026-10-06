@@ -1875,13 +1875,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 SCOUT_ID = "Scout_Swarm"
 SCOUT_REGISTRY_PATH = os.path.join(DATA_DIR, "scout_registry.json")
-DYNAMIC_BASKET = "S&P500 Volume Spikes"
+DYNAMIC_BASKET = "Volume Spikes & Gainers"
+# Ordine della rotazione round-robin (un paniere per iterazione dello sciame)
 DESK_BASKETS = [
-    ("MegaCap Tech", ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META"]),
-    ("Crypto High-Vol", ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD", "DOGE-USD"]),
     ("Metalli & Commodities", ["GLD", "SLV", "USO", "COPX", "UNG"]),
-    ("Bond Treasury", ["TLT", "HYG", "IEF", "BND"]),
-    ("ETF Settoriali Momentum", ["SMH", "XLK", "XLE", "XLF", "XBI", "ARKK"]),
+    ("Obbligazioni & Treasuries", ["TLT", "BND", "HYG"]),
+    ("MegaCap Tech", ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META"]),
+    ("ETF Settoriali Momentum", ["SMH", "XLE", "XLF", "XBI", "ARKK"]),
+    ("Crypto High-Vol", ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD", "DOGE-USD"]),
     (DYNAMIC_BASKET, None),  # dinamico: titoli più scambiati e gainers del giorno (screener Yahoo)
 ]
 REFERENCE_TICKERS = ["^VIX", "SPY", "QQQ", "BTC-USD"]
@@ -2349,16 +2350,19 @@ def risk_committee(pitch, ctx, fng):
 
 
 # ---------------------------------------------------------------- ciclo dello sciame
-def swarm_baskets(market_open):
-    """Panieri attivi con i loro ticker (a mercato chiuso solo crypto)."""
+def swarm_baskets(market_open=True, include=None):
+    """Tutti i panieri con i loro ticker, sempre (anche a mercato chiuso).
+
+    `include` limita il calcolo ai panieri indicati (evita di interrogare lo screener dinamico se non serve).
+    """
     baskets = []
     for name, tickers in desk_universe():
+        if include is not None and name not in include:
+            baskets.append((name, [] if tickers is None else tickers))
+            continue
         if tickers is None:
-            tickers = dynamic_volume_spikes() if market_open else []
-        if not market_open:
-            tickers = [t for t in tickers if is_crypto(t)]  # a mercato chiuso lavorano solo gli scout crypto
-        if tickers:
-            baskets.append((name, tickers))
+            tickers = dynamic_volume_spikes()
+        baskets.append((name, tickers))
     return baskets
 
 
@@ -2370,27 +2374,28 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     """
     reg = run_orchestrator_service(log=log)
     market_open = is_market_open(log=lambda m: None) if alpaca_client else True
-    all_baskets = swarm_baskets(market_open)
-    if not all_baskets:
-        return None
-    baskets = all_baskets
+    names = [n for n, _ in DESK_BASKETS]
     if rotate:
-        names = [n for n, _ in DESK_BASKETS]
-        idx = int(reg["radar"].get("basket_index", 0)) % len(names)
-        available = {n for n, _ in all_baskets}
-        for step in range(len(names)):
-            name = names[(idx + step) % len(names)]
-            if name in available:
-                baskets = [b for b in all_baskets if b[0] == name]
-                with _registry_lock:
-                    reg = load_scout_registry()
-                    reg["radar"]["basket_index"] = (names.index(name) + 1) % len(names)
-                    _save_registry(reg)
-                break
+        # Round-robin: a ogni iterazione il paniere successivo (1 -> 2 -> ... -> 6 -> 1), sempre avanzando
+        with _registry_lock:
+            reg = load_scout_registry()
+            idx = int(reg["radar"].get("basket_index", 0)) % len(names)
+            reg["radar"]["basket_index"] = (idx + 1) % len(names)
+            _save_registry(reg)
+        all_baskets = swarm_baskets(market_open, include={names[idx]})
+        baskets = [b for b in all_baskets if b[0] == names[idx]]
+        if not baskets[0][1]:
+            agent_say("Chief of Staff", f"Paniere {names[idx]}: nessun ticker disponibile (screener vuoto), passo al successivo", "muted")
+            return None
+    else:
+        all_baskets = swarm_baskets(market_open)
+        baskets = [b for b in all_baskets if b[1]]
     universe = {t: name for name, tickers in baskets for t in tickers}
     tickers = list(universe)
-    scout_no = {t: i + 1 for i, t in enumerate(t for _, ts in all_baskets for t in ts)}
-    agent_say("Chief of Staff", f"Paniere {', '.join(n for n, _ in baskets)}: {len(tickers)} micro-scout in partenza")
+    scout_no = {t: i + 1 for i, t in enumerate(dict.fromkeys(t for _, ts in all_baskets for t in ts))}
+    closed_note = "" if market_open or all(is_crypto(t) for t in tickers) else " · mercato USA chiuso: solo monitoraggio prezzi"
+    agent_say("Chief of Staff", f"Paniere {', '.join(f'{names.index(n) + 1}/{len(names)} {n}' for n, _ in baskets)}: "
+                                f"{len(tickers)} micro-scout in partenza{closed_note}")
 
     t_dl = time.perf_counter()
     f15 = _download(tickers, "5d", "15m")
@@ -2409,8 +2414,15 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         if not r:
             agent_say(tag, f"{sym} → dati insufficienti", "muted")
         else:
-            verdict = ("ANOMALIA → pitch al Chief of Staff" if r["pitch"]
-                       else ("anomalia senza forza (score ≤ 75)" if r["anomalies"] else "nessuna anomalia"))
+            monitoring = not market_open and not is_crypto(sym)
+            if monitoring and r["pitch"]:
+                r["pitch"] = False   # mercato chiuso: l'anomalia viene solo segnalata, nessuna scheda
+                verdict = "anomalia rilevata · mercato USA chiuso, nessuna scheda (solo monitoraggio)"
+            elif monitoring:
+                verdict = f"prezzo ${r['ind']['price']:,.2f} · mercato USA chiuso, solo monitoraggio"
+            else:
+                verdict = ("ANOMALIA → pitch al Chief of Staff" if r["pitch"]
+                           else ("anomalia senza forza (score ≤ 75)" if r["anomalies"] else "nessuna anomalia"))
             agent_say(tag, f"{sym} → score {r['score']} · MTF {r['mtf_aligned']}/3 · RVOL {r['rvol']}x · "
                            f"VWAP {r['vwap_dist_pct']}% · {verdict} ({r['elapsed_ms']}ms CPU)",
                       "alert" if r["pitch"] else "info")
@@ -2423,11 +2435,12 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     max_scout_ms = max((r["elapsed_ms"] for r in results), default=0)
 
     # Canali aggregati: ultimo risultato di ogni ticker dei panieri ancora attivi
-    active_universe = {t for _, ts in all_baskets for t in ts}
+    # (un giro completo dei 6 panieri dura ~2 minuti: si tengono i risultati degli ultimi 6 minuti)
+    now_ts = time.time()
     for r in results:
-        _last_scout_results[r["symbol"]] = r
-    for sym in list(_last_scout_results):
-        if sym not in active_universe:
+        _last_scout_results[r["symbol"]] = {**r, "_ts": now_ts}
+    for sym, r in list(_last_scout_results.items()):
+        if now_ts - r["_ts"] > RADAR_INTERVAL_SEC * 3:
             _last_scout_results.pop(sym, None)
     merged = list(_last_scout_results.values())
 
@@ -2436,8 +2449,10 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         "macro": macro, "fear_greed": fng,
         "scouts": len(merged), "workers": min(SCOUT_MAX_WORKERS, len(tickers)), "download_s": download_s,
         "scouts_ms": scouts_ms, "max_scout_ms": max_scout_ms, "last_basket": ", ".join(n for n, _ in baskets),
-        "baskets": [{"name": n, "tickers": len(t), "anomalies": sum(1 for r in merged if r["sector"] == n and r["anomalies"])}
-                    for n, t in all_baskets],
+        "baskets": [{"name": n, "tickers": sum(1 for r in merged if r["sector"] == n),
+                     "anomalies": sum(1 for r in merged if r["sector"] == n and r["anomalies"]),
+                     "current": n in {b for b, _ in baskets}}
+                    for n, _ in DESK_BASKETS],
         "top": sorted(({"symbol": r["symbol"], "sector": r["sector"], "score": r["score"], "mtf": r["mtf_aligned"],
                         "rvol": r["rvol"], "vwap_dist": r["vwap_dist_pct"], "beta": r["beta"], "corr": r["corr"]}
                        for r in merged), key=lambda x: x["score"], reverse=True)[:12],
@@ -2473,7 +2488,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         reg["radar"]["last_scan_epoch"] = _now_epoch()
         _save_registry(reg)
 
-    log(f"📡 [Sciame] {', '.join(n for n, _ in baskets)}: {len(results)} micro-scout | dati {download_s}s, calcoli {scouts_ms}ms "
+    log(f"📡 [Sciame] {', '.join(n for n, _ in baskets)}{closed_note}: {len(results)} micro-scout | dati {download_s}s, calcoli {scouts_ms}ms "
         f"(CPU max {max_scout_ms}ms/scout) | VIX {macro['vix']} | "
         + (f"schede → Chief of Staff: {', '.join(p['symbol'] + ' (' + ', '.join(p['anomalies']) + ')' for p in new_pitches)}"
            if new_pitches else "nessuna nuova anomalia")
