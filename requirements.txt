@@ -11,3 +11,4 @@ finnhub-python==2.4.29
 resend==2.49.1
 requests==2.34.2
 tzdata==2026.3
+scipy==1.18.1
