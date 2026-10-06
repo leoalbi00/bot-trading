@@ -6,6 +6,7 @@ agents/ e la gestione in-memory degli slot di portafoglio.
 """
 import asyncio
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 import pandas as pd
@@ -72,6 +73,8 @@ class QuantitativeTradingCore:
         order_book = candidate_data.get("order_book", {})
         macro_inputs = candidate_data.get("macro_inputs", {})
 
+        logging.info(f"[Worker {worker_id} | {threading.current_thread().name}] Avvio analisi {symbol}")
+
         try:
             # 1. Agente #1: Quant Engine
             res_quant = self.agent_quant.analyze(df_ohlcv)
@@ -99,6 +102,8 @@ class QuantitativeTradingCore:
                 agent_03_risk_res=res_risk,
                 agent_04_macro_res=res_macro
             )
+
+            logging.info(f"[Worker {worker_id}] Completato {symbol}: {res_cio.get('final_decision')} (score {res_cio.get('cio_ensemble_score')})")
 
             return {
                 "symbol": symbol,
