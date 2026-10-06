@@ -448,6 +448,8 @@ def radar_loop():
                 pending = core.get_pending_order_symbols(log=lambda m: None) or set()
                 core.run_scout_swarm(held_keys=held, pending=pending, log=log_message, rotate=True,
                                      on_approved=lambda: request_cio("schede approvate dal Comitato Rischi"))
+                # Mercato USA chiuso: pulse silenzioso dei panieri azionari (si autolimita a 1 volta ogni 15 min)
+                core.run_closed_market_pulse(log=log_message)
                 # Controllo rapido degli stop (stop del CIO salvato nell'ordine, altrimenti quello di riserva)
                 stops = bot_state.get("ledger_open", {})
                 fallback = core.get_config()["stop_loss_pct"]

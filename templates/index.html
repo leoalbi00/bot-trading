@@ -145,6 +145,16 @@
                             <span :class="v.trend === 'RIALZISTA' ? 'text-emerald-400' : 'text-rose-400'" x-text="v.trend.toLowerCase()"></span></div>
                     </template>
                     <div class="num text-slate-400" x-text="macro.regime ? 'Azioni ' + macro.regime.stock + ' · Crypto ' + macro.regime.crypto : ''"></div>
+                    <template x-if="radar.pulse">
+                        <div class="pt-2 space-y-0.5">
+                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Pulse pre/post-market</div>
+                            <template x-for="m in (radar.pulse.top_moves || []).slice(0, 5)" :key="m.symbol">
+                                <div class="num flex justify-between"><span class="text-slate-400" x-text="m.symbol"></span>
+                                    <span :class="tone(m.move_pct)" x-text="pct(m.move_pct)"></span></div>
+                            </template>
+                            <div class="text-[10px] text-slate-600 num" x-text="'aggiornato ' + shortTime(radar.pulse.timestamp) + ' · ogni 15 min'"></div>
+                        </div>
+                    </template>
                 </div>
                 <div class="p-4 space-y-1.5 text-xs">
                     <div class="text-[11px] uppercase tracking-wider text-slate-500">4 · Sentiment crypto</div>
@@ -154,8 +164,9 @@
                     </div>
                     <div class="text-[11px] text-slate-500">Fear &amp; Greed Index. Notizie e trimestrali sono verificate dal Comitato su ogni scheda.</div>
                     <div class="text-[11px] uppercase tracking-wider text-slate-500 pt-2">Panieri</div>
+                    <div class="text-[11px] text-sky-400/90" x-text="channels.mode || ''"></div>
                     <template x-for="b in (channels.baskets || [])" :key="b.name">
-                        <div class="flex justify-between gap-2"><span class="text-slate-400" x-text="b.name"></span>
+                        <div class="flex justify-between gap-2"><span :class="b.current ? 'text-slate-100' : 'text-slate-400'" x-text="(b.current ? '▸ ' : '') + b.name"></span>
                             <span class="num" :class="b.anomalies ? 'text-amber-400' : 'text-slate-500'" x-text="b.tickers + ' · ' + b.anomalies + ' anomalie'"></span></div>
                     </template>
                 </div>
@@ -602,7 +613,7 @@
                         }
                         const newDialogue = data.agent_dialogue || [];
                         if (newDialogue.length) {
-                            this.dialogue = this.dialogue.concat(newDialogue).slice(-250);
+                            this.dialogue = this.dialogue.concat(newDialogue).slice(-100);
                             this.lastDialogueId = newDialogue[newDialogue.length - 1].id;
                             if (this.streamPinned) this.$nextTick(() => { const b = this.$refs.stream; if (b) b.scrollTop = b.scrollHeight; });
                         }

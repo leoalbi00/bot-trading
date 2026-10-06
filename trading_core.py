@@ -400,6 +400,19 @@ def to_alpaca_symbol(yf_symbol):
     return yf_symbol.upper().replace("-", "/")
 
 
+def alpaca_order_symbol(yf_symbol):
+    """Simbolo da usare negli ordini Alpaca (BTC-USD -> BTC/USD), da chiamare prima dell'invio."""
+    return to_alpaca_symbol(yf_symbol)
+
+
+# Alcuni simboli hanno un nome diverso su Yahoo Finance (solo per lo scarico dei dati)
+YF_DATA_ALIASES = {"UNI-USD": "UNI7083-USD"}
+
+
+def yf_data_symbol(yf_symbol):
+    return YF_DATA_ALIASES.get(yf_symbol.upper(), yf_symbol)
+
+
 def to_yf_symbol(alpaca_symbol, crypto=None):
     """Alpaca -> yfinance: BTCUSD o BTC/USD -> BTC-USD, NVDA -> NVDA."""
     s = alpaca_symbol.upper()
@@ -732,7 +745,7 @@ def get_indicators(yf_symbol):
     RSI(14), MACD(12,26,9) con istogramma e incroci recenti, ROC(10), SMA20, SMA50.
     """
     try:
-        df = yf.Ticker(yf_symbol).history(period="3mo", interval="1h")
+        df = yf.Ticker(yf_data_symbol(yf_symbol)).history(period="3mo", interval="1h")
         if len(df) < 60:
             return None
         return compute_indicators(df["Close"], volume=df["Volume"])
@@ -948,7 +961,7 @@ def submit_notional_buy(yf_symbol, amount_usd, stop_pct=None, allocation_pct=Non
     if conviction is not None:
         tag += f"-c{int(conviction)}"
     order_data = MarketOrderRequest(
-        symbol=to_alpaca_symbol(yf_symbol),
+        symbol=alpaca_order_symbol(yf_symbol),
         notional=round(amount_usd, 2),
         side=OrderSide.BUY,
         time_in_force=TimeInForce.GTC if crypto else TimeInForce.DAY,
@@ -1439,7 +1452,7 @@ def sentiment_agent(symbols, log=print):
 # ---------------- Agente 3: Volatility Manager ----------------
 def get_daily_bars(yf_symbol, period="6mo"):
     try:
-        df = yf.Ticker(yf_symbol).history(period=period, interval="1d")
+        df = yf.Ticker(yf_data_symbol(yf_symbol)).history(period=period, interval="1d")
         return df if len(df) >= 55 else None
     except Exception:
         return None
@@ -1461,7 +1474,7 @@ def _peak_since(yf_symbol, opened_at):
     if not opened_at:
         return None
     try:
-        df = yf.Ticker(yf_symbol).history(start=opened_at.astimezone(dt.timezone.utc), interval="1h")
+        df = yf.Ticker(yf_data_symbol(yf_symbol)).history(start=opened_at.astimezone(dt.timezone.utc), interval="1h")
         return float(df["Close"].max()) if len(df) else None
     except Exception:
         return None
@@ -1886,6 +1899,49 @@ DESK_BASKETS = [
     (DYNAMIC_BASKET, None),  # dinamico: titoli più scambiati e gainers del giorno (screener Yahoo)
 ]
 REFERENCE_TICKERS = ["^VIX", "SPY", "QQQ", "BTC-USD"]
+
+# Paniere crypto esteso (solo asset negoziabili su Alpaca) e sotto-panieri della modalità mercato chiuso
+CRYPTO_EXTENDED = ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD", "DOGE-USD",
+                   "LTC-USD", "UNI-USD", "AAVE-USD", "DOT-USD", "BCH-USD"]
+CRYPTO_SUB_BASKETS = [
+    ("Crypto Major & High-Cap", ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD"]),
+    ("Crypto Altcoin & Beta", ["LINK-USD", "DOGE-USD", "LTC-USD", "UNI-USD", "AAVE-USD", "DOT-USD", "BCH-USD"]),
+]
+CLOSED_PULSE_SEC = 900          # mercato chiuso: scansione silenziosa dei panieri azionari ogni 15 minuti
+PULSE_SUMMARY_SEC = 3600        # riepilogo nei log al massimo una volta all'ora...
+PULSE_MOVE_ALERT_PCT = 1.5      # ...oppure subito se un ticker si muove oltre 1.5% in pre/post-market
+
+# Festività NYSE (mercato chiuso tutto il giorno)
+NYSE_HOLIDAYS = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03",
+    "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05",
+    "2027-09-06", "2027-11-25", "2027-12-24",
+}
+_ET = ZoneInfo("America/New_York")
+_clock_cache = {"ts": 0.0, "open": None}
+
+
+def is_us_market_open():
+    """True solo durante la negoziazione continua USA (lun-ven 09:30-16:00 New York, 15:30-22:00 a Roma).
+
+    Usa l'orologio di Alpaca (che conosce festività e chiusure anticipate, cache 60s);
+    se non è disponibile applica orari, weekend e calendario delle festività NYSE.
+    """
+    now = time.time()
+    if alpaca_client and now - _clock_cache["ts"] < 60 and _clock_cache["open"] is not None:
+        return _clock_cache["open"]
+    if alpaca_client:
+        try:
+            is_open = bool(alpaca_client.get_clock().is_open)
+            _clock_cache.update(ts=now, open=is_open)
+            return is_open
+        except Exception:
+            pass
+    et = dt.datetime.now(_ET)
+    if et.weekday() >= 5 or et.strftime("%Y-%m-%d") in NYSE_HOLIDAYS:
+        return False
+    return dt.time(9, 30) <= et.time() < dt.time(16, 0)
 SCOUT_MAX_WORKERS = 100
 RADAR_INTERVAL_SEC = 120        # una scansione completa dello sciame ogni 2 minuti
 PROPOSAL_TTL_MIN = 15           # una scheda non lavorata da più di 15 minuti è stantia
@@ -1923,7 +1979,7 @@ _registry_lock = threading.RLock()   # registro condiviso tra thread dello sciam
 # Agent dialogue: telemetria in tempo reale degli agenti (buffer circolare in memoria)
 from collections import deque as _deque
 import itertools as _itertools
-_dialogue = _deque(maxlen=250)
+_dialogue = _deque(maxlen=100)   # rigorosamente le ultime 100 righe
 _dialogue_ids = _itertools.count(1)
 _dialogue_lock = threading.Lock()
 _last_scout_results = {}             # ultimo risultato per ticker (per i canali aggregati della dashboard)
@@ -2010,21 +2066,23 @@ def run_orchestrator_service(log=print):
 
 
 # ---------------------------------------------------------------- dati di mercato in batch
-def _download(tickers, period, interval):
-    """yf.download in batch -> {ticker: DataFrame}. Gestisce colonne MultiIndex e ticker singolo."""
+def _download(tickers, period, interval, prepost=False):
+    """yf.download in batch -> {ticker: DataFrame}. Gestisce colonne MultiIndex, ticker singolo e alias Yahoo."""
     tickers = list(dict.fromkeys(t for t in tickers if t))
     if not tickers:
         return {}
+    data_syms = {t: yf_data_symbol(t) for t in tickers}
     try:
-        df = yf.download(tickers, period=period, interval=interval, group_by="ticker",
-                         progress=False, threads=True, auto_adjust=True)
+        df = yf.download(list(data_syms.values()), period=period, interval=interval, group_by="ticker",
+                         progress=False, threads=True, auto_adjust=True, prepost=prepost)
     except Exception:
         return {}
     out = {}
     multi = hasattr(df.columns, "levels")
     for t in tickers:
+        d = data_syms[t]
         try:
-            sub = df[t] if multi and t in df.columns.get_level_values(0) else (df if not multi else None)
+            sub = df[d] if multi and d in df.columns.get_level_values(0) else (df if not multi else None)
             if sub is None:
                 continue
             sub = sub.dropna(subset=["Close"])
@@ -2373,29 +2431,39 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     rotate=False: tutti i panieri insieme.
     """
     reg = run_orchestrator_service(log=log)
-    market_open = is_market_open(log=lambda m: None) if alpaca_client else True
-    names = [n for n, _ in DESK_BASKETS]
+    market_open = is_us_market_open()
+    if market_open:
+        # A. Mercato aperto: round-robin sui 6 panieri classici
+        mode_baskets, cursor = [n for n, _ in DESK_BASKETS], "basket_index"
+    else:
+        # B. Mercato chiuso: focus 24/7 sulle crypto, alternando i 2 sotto-panieri
+        mode_baskets, cursor = [n for n, _ in CRYPTO_SUB_BASKETS], "crypto_index"
+    names = mode_baskets
     if rotate:
-        # Round-robin: a ogni iterazione il paniere successivo (1 -> 2 -> ... -> 6 -> 1), sempre avanzando
         with _registry_lock:
             reg = load_scout_registry()
-            idx = int(reg["radar"].get("basket_index", 0)) % len(names)
-            reg["radar"]["basket_index"] = (idx + 1) % len(names)
+            idx = int(reg["radar"].get(cursor, 0)) % len(names)
+            reg["radar"][cursor] = (idx + 1) % len(names)
+            reg["radar"]["mode"] = "open" if market_open else "closed"
             _save_registry(reg)
-        all_baskets = swarm_baskets(market_open, include={names[idx]})
+        if market_open:
+            all_baskets = swarm_baskets(True, include={names[idx]})
+        else:
+            all_baskets = [(n, list(t)) for n, t in CRYPTO_SUB_BASKETS]
         baskets = [b for b in all_baskets if b[0] == names[idx]]
         if not baskets[0][1]:
             agent_say("Chief of Staff", f"Paniere {names[idx]}: nessun ticker disponibile (screener vuoto), passo al successivo", "muted")
             return None
     else:
-        all_baskets = swarm_baskets(market_open)
+        all_baskets = swarm_baskets(True) if market_open else [(n, list(t)) for n, t in CRYPTO_SUB_BASKETS]
         baskets = [b for b in all_baskets if b[1]]
     universe = {t: name for name, tickers in baskets for t in tickers}
     tickers = list(universe)
     scout_no = {t: i + 1 for i, t in enumerate(dict.fromkeys(t for _, ts in all_baskets for t in ts))}
-    closed_note = "" if market_open or all(is_crypto(t) for t in tickers) else " · mercato USA chiuso: solo monitoraggio prezzi"
+    closed_note = ""
+    mode_label = "" if market_open else " · focus crypto 24/7"
     agent_say("Chief of Staff", f"Paniere {', '.join(f'{names.index(n) + 1}/{len(names)} {n}' for n, _ in baskets)}: "
-                                f"{len(tickers)} micro-scout in partenza{closed_note}")
+                                f"{len(tickers)} micro-scout in partenza{mode_label}")
 
     t_dl = time.perf_counter()
     f15 = _download(tickers, "5d", "15m")
@@ -2449,10 +2517,11 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         "macro": macro, "fear_greed": fng,
         "scouts": len(merged), "workers": min(SCOUT_MAX_WORKERS, len(tickers)), "download_s": download_s,
         "scouts_ms": scouts_ms, "max_scout_ms": max_scout_ms, "last_basket": ", ".join(n for n, _ in baskets),
+        "mode": "Mercato USA aperto · rotazione 6 panieri" if market_open else "Mercato USA chiuso · focus crypto 24/7",
         "baskets": [{"name": n, "tickers": sum(1 for r in merged if r["sector"] == n),
                      "anomalies": sum(1 for r in merged if r["sector"] == n and r["anomalies"]),
                      "current": n in {b for b, _ in baskets}}
-                    for n, _ in DESK_BASKETS],
+                    for n in names],
         "top": sorted(({"symbol": r["symbol"], "sector": r["sector"], "score": r["score"], "mtf": r["mtf_aligned"],
                         "rvol": r["rvol"], "vwap_dist": r["vwap_dist_pct"], "beta": r["beta"], "corr": r["corr"]}
                        for r in merged), key=lambda x: x["score"], reverse=True)[:12],
@@ -2791,6 +2860,7 @@ def radar_snapshot():
 
     return {
         "channels": reg.get("channels", {}),
+        "pulse": reg["radar"].get("pulse") if not is_us_market_open() else None,
         "ttl_minutes": PROPOSAL_TTL_MIN,
         "next_scan_in": max(0, int(reg["radar"].get("last_scan_epoch", now) + RADAR_INTERVAL_SEC - now)),
         "queue": [item(p) for p in reg["queue"]],
@@ -2856,3 +2926,63 @@ def performance_stats(trades):
         "avg_held_min": round(sum(held) / len(held), 1) if held else None,
         "best": {"symbol": best["symbol"], "pnl": best["pnl"]}, "worst": {"symbol": worst["symbol"], "pnl": worst["pnl"]},
     }
+
+
+
+def run_closed_market_pulse(log=print, force=False):
+    """Mercato USA chiuso: scansione silenziosa (ogni 15 min) dei 5 panieri azionari/commodities.
+
+    Confronta l'ultimo prezzo pre/post-market con l'ultima chiusura regolare. Nessuna scheda viene creata.
+    Scrive nei log solo un riepilogo all'ora, oppure subito se un ticker si muove oltre PULSE_MOVE_ALERT_PCT
+    (ogni ticker viene segnalato al massimo una volta per sessione).
+    """
+    if is_us_market_open():
+        return None
+    with _registry_lock:
+        reg = load_scout_registry()
+        radar = reg["radar"]
+        if not force and _now_epoch() - float(radar.get("last_pulse_epoch", 0)) < CLOSED_PULSE_SEC:
+            return None
+        radar["last_pulse_epoch"] = _now_epoch()
+        _save_registry(reg)
+
+    tickers = [t for name, ts in swarm_baskets(True) if name != "Crypto High-Vol" for t in ts if not is_crypto(t)]
+    tickers = list(dict.fromkeys(tickers))
+    intraday = _download(tickers, "5d", "15m", prepost=True)
+    daily = _daily_frames(tickers)
+    moves = []
+    for t in tickers:
+        bars, d = intraday.get(t), daily.get(t)
+        if bars is None or d is None or not len(bars) or not len(d):
+            continue
+        last, close = float(bars["Close"].iloc[-1]), float(d["Close"].iloc[-1])
+        if close:
+            moves.append((t, round((last / close - 1) * 100, 2), last))
+    moves.sort(key=lambda m: abs(m[1]), reverse=True)
+
+    with _registry_lock:
+        reg = load_scout_registry()
+        radar = reg["radar"]
+        session = dt.datetime.now(_ET).strftime("%Y-%m-%d")
+        if radar.get("pulse_session") != session:
+            radar.update(pulse_session=session, pulse_reported=[])
+        reported = set(radar.get("pulse_reported", []))
+        alerts = [m for m in moves if abs(m[1]) > PULSE_MOVE_ALERT_PCT and m[0] not in reported]
+        summary_due = _now_epoch() - float(radar.get("last_pulse_log_epoch", 0)) >= PULSE_SUMMARY_SEC
+        if alerts:
+            radar["pulse_reported"] = sorted(reported | {m[0] for m in alerts})
+        if alerts or summary_due:
+            radar["last_pulse_log_epoch"] = _now_epoch()
+        radar["pulse"] = {"timestamp": now_local().isoformat(timespec="seconds"), "tickers": len(moves),
+                          "top_moves": [{"symbol": t, "move_pct": mv, "price": round(px, 4)} for t, mv, px in moves[:8]]}
+        _save_registry(reg)
+
+    if alerts:
+        text = ", ".join(f"{t} {mv:+.2f}%" for t, mv, _ in alerts)
+        log(f"🌙 [Pulse mercati chiusi] Movimento pre/post-market oltre {PULSE_MOVE_ALERT_PCT}%: {text}")
+        agent_say("Pulse", f"Pre/post-market oltre {PULSE_MOVE_ALERT_PCT}%: {text} (nessuna scheda: mercato chiuso)", "alert")
+    elif summary_due and moves:
+        top = ", ".join(f"{t} {mv:+.2f}%" for t, mv, _ in moves[:5])
+        log(f"🌙 [Pulse mercati chiusi] {len(moves)} ticker azionari/commodities monitorati, maggiori variazioni: {top}")
+        agent_say("Pulse", f"Riepilogo orario: {len(moves)} ticker monitorati · {top}", "muted")
+    return moves
