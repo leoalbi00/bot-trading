@@ -57,7 +57,14 @@ STALL_ROC_PCT = 0.5            # |ROC(10)| sotto questa soglia = prezzo in stall
 STALL_MIN_CYCLES = 3           # cicli consecutivi in portafoglio prima di vendere per stallo
 REVERSAL_ROC_PCT = -2.0        # ROC(10) sotto questa soglia con prezzo < SMA20 = inversione ribassista
 ROTATION_FUNDS_THRESHOLD = 50  # sotto questi fondi si valuta la rotazione del capitale
-ROTATION_MIN_SCORE = 80        # score minimo del nuovo asset per giustificare la rotazione
+ROTATION_MIN_SCORE = 80        # il nuovo asset deve avere score > di questo valore per la rotazione
+ROTATION_MIN_EDGE = 10         # vantaggio minimo di score sul titolo venduto (evita compravendite inutili)
+
+# Desk multi-agente: soglie dello Score di Forza (0-100)
+SCORE_BUY = 75                 # > 75: candidato BUY
+SCORE_SELL = 45                # < 45: candidato SELL / debolezza
+STALL_SCORE = 55               # stallo: ROC vicino a 0 e score < 55...
+STALL_STREAK = 3               # ...per più di 2 cicli consecutivi
 
 # ---------------------------------------------------------------------------
 # Configurazione dinamica (config.json)
@@ -427,8 +434,15 @@ def query_groq_ai(prompt, log=print):
 _unavailable_groq_models = set()
 
 
-def _ask_groq(prompt, log):
-    """Prova i modelli Groq in sequenza; restituisce il testo o None. Gli errori vengono loggati."""
+def _has_decision(text):
+    return bool(_DECISION_RE.search(text))
+
+
+def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024):
+    """Prova i modelli Groq in sequenza; restituisce il testo o None. Gli errori vengono loggati.
+
+    `validate` scarta le risposte nel formato sbagliato (es. rifiuti) e passa al modello successivo.
+    """
     global _groq_client
     if not GROQ_KEY:
         log("⚠️ GROQ_API_KEY non configurata.")
@@ -450,17 +464,17 @@ def _ask_groq(prompt, log):
         try:
             res = _groq_client.chat.completions.create(
                 model=model,
-                max_tokens=1024,
+                max_tokens=max_tokens,
                 messages=[
-                    {"role": "system", "content": AI_SYSTEM_PROMPT},
+                    {"role": "system", "content": system or AI_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
             )
             text = res.choices[0].message.content if res.choices else None
-            if text and _DECISION_RE.search(text):
+            if text and validate(text):
                 _last_model["groq"] = f"Groq {model}"
                 return text
-            log(f"⚠️ Groq {model}: risposta senza decisione, provo il modello successivo.")
+            log(f"⚠️ Groq {model}: risposta nel formato errato, provo il modello successivo.")
         except groq.NotFoundError:
             _unavailable_groq_models.add(model)
             log(f"⚠️ Groq {model}: modello non disponibile (404), escluso. Provo il successivo.")
@@ -485,7 +499,7 @@ def query_gemini_ai(prompt, log=print):
     return _ask_gemini(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Gemini"
 
 
-def _ask_gemini(prompt, log):
+def _ask_gemini(prompt, log, system=None, validate=_has_decision):
     """Prova i modelli Gemini in sequenza; restituisce il testo o None. Gli errori vengono loggati."""
     global _gemini_client
     if not GEMINI_KEY:
@@ -511,10 +525,13 @@ def _ask_gemini(prompt, log):
 
     for model in models:
         try:
-            res = _gemini_client.models.generate_content(model=model, contents=f"{AI_SYSTEM_PROMPT}\n\n{prompt}")
-            if res and res.text:
+            res = _gemini_client.models.generate_content(model=model, contents=f"{system or AI_SYSTEM_PROMPT}\n\n{prompt}")
+            if res and res.text and validate(res.text):
                 _last_model["gemini"] = f"Gemini {model}"
                 return res.text
+            if res and res.text:
+                log(f"⚠️ Gemini {model}: risposta nel formato errato, provo il modello successivo.")
+                continue
             log(f"⚠️ Gemini {model}: risposta vuota, provo il modello successivo.")
         except genai_errors.ClientError as e:
             message = str(e)
@@ -786,3 +803,286 @@ def available_funds(account, crypto=False):
         return max(0.0, float(account.get(key) or 0))
     except (TypeError, ValueError):
         return 0.0
+
+
+# ===========================================================================
+# DESK FINANZIARIO MULTI-AGENTE
+#   Fase 1 - Analista di mercato: indicatori e Score di Forza per ogni asset
+#   Fase 2 - Risk Manager: stato delle posizioni, stallo, fondi ed esposizione
+#   Fase 3 - Portfolio Broker: decisione operativa (IA in JSON o regole quant)
+# ===========================================================================
+def classify_score(score):
+    if score > SCORE_BUY:
+        return "BUY"
+    if score < SCORE_SELL:
+        return "SELL"
+    return "NEUTRO"
+
+
+def market_analyst(symbols, log=print):
+    """FASE 1: calcola indicatori e Score di Forza per ogni simbolo (formato yfinance)."""
+    analysis = {}
+    for sym in dict.fromkeys(symbols):
+        ind = get_indicators(sym)
+        if not ind:
+            log(f"📊 [Analista] {sym}: dati insufficienti, escluso.")
+            continue
+        score = ta_score(ind)
+        analysis[normalize_symbol(sym)] = {"symbol": sym, "ind": ind, "score": score, "class": classify_score(score)}
+
+    groups = {"BUY": [], "NEUTRO": [], "SELL": []}
+    for a in sorted(analysis.values(), key=lambda a: a["score"], reverse=True):
+        groups[a["class"]].append(f"{a['symbol']} {a['score']}")
+    log(f"📊 [Analista] BUY (>{SCORE_BUY}): {', '.join(groups['BUY']) or '-'}")
+    log(f"📊 [Analista] Neutrali/Stallo: {', '.join(groups['NEUTRO']) or '-'}")
+    log(f"📊 [Analista] SELL (<{SCORE_SELL}): {', '.join(groups['SELL']) or '-'}")
+    return analysis
+
+
+_stall_streaks = {}
+
+
+def risk_manager(positions, analysis, account, cfg, log=print):
+    """FASE 2: classifica ogni posizione e calcola fondi ed esposizione.
+
+    Stati: STOP_LOSS, RIBASSISTA, STALLO (prolungato) -> vendita obbligatoria;
+           IN_STALLO (in osservazione), OK, NO_DATA -> mantenute.
+    """
+    held = {normalize_symbol(p["symbol"]) for p in positions}
+    for key in list(_stall_streaks):
+        if key not in held:
+            del _stall_streaks[key]
+
+    report = []
+    for pos in positions:
+        key = normalize_symbol(pos["symbol"])
+        a = analysis.get(normalize_symbol(pos["yf_symbol"]))
+        pl = pos["unrealized_plpc"]
+        score = a["score"] if a else None
+        stalled_now = bool(a) and abs(a["ind"]["roc"]) <= STALL_ROC_PCT and a["score"] < STALL_SCORE
+        streak = _stall_streaks.get(key, 0) + 1 if stalled_now else 0
+        _stall_streaks[key] = streak
+
+        if pl <= cfg["stop_loss_pct"]:
+            status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ stop loss {cfg['stop_loss_pct']:.1f}%"
+        elif not a:
+            status, reason = "NO_DATA", "indicatori non disponibili"
+        else:
+            kind, why = ta_exit_signal(a["ind"])
+            if kind == "ribassista":
+                status, reason = "RIBASSISTA", why
+            elif a["score"] < SCORE_SELL:
+                status, reason = "RIBASSISTA", f"Score di Forza {a['score']} < {SCORE_SELL}"
+            elif streak >= STALL_STREAK:
+                status, reason = "STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']} da {streak} cicli"
+            elif stalled_now:
+                status, reason = "IN_STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']} (ciclo {streak}/{STALL_STREAK})"
+            else:
+                status, reason = "OK", f"ROC {a['ind']['roc']:.2f}%"
+        report.append({"pos": pos, "analysis": a, "score": score, "status": status, "reason": reason, "streak": streak})
+        log(f"🛡️ [Risk] {pos['symbol']}: {status} | score {score if score is not None else 'N/D'} | "
+            f"PnL {pl:.2f}% | {reason}")
+
+    exposure = sum(abs(p["market_value"]) for p in positions)
+    equity = float(account.get("portfolio", account.get("equity", 0)) or 0)
+    funds = {
+        "stock": buy_budget(account, exposure, cfg, crypto=False),
+        "crypto": buy_budget(account, exposure, cfg, crypto=True),
+    }
+    pct = exposure / equity * 100 if equity else 0
+    log(f"🛡️ [Risk] Capitale ${equity:,.0f} | esposizione ${exposure:,.0f} ({pct:.0f}%, limite {cfg['max_exposure_pct']:.0f}%) | "
+        f"fondi disponibili azioni ${funds['stock'][0]:,.0f}, crypto ${funds['crypto'][0]:,.0f} | "
+        f"buying power Alpaca ${float(account.get('buying_power', 0) or 0):,.0f}")
+    return {"positions": report, "exposure": exposure, "equity": equity, "funds": funds}
+
+
+BROKER_ACTIONS = ("BUY", "SELL", "ROTATE", "HOLD")
+
+BROKER_SYSTEM_PROMPT = (
+    "Sei un Senior Portfolio Manager & Quant Broker di un bot di trading algoritmico che opera su un conto paper "
+    "(simulato) Alpaca. Le tue risposte vengono lette da un programma: rispondi SOLO con un oggetto JSON valido, "
+    "senza testo prima o dopo."
+)
+
+
+def broker_candidates(analysis, held_keys, pending, market_open):
+    """Asset della watchlist acquistabili ora con Score > SCORE_BUY, dal più forte."""
+    out = []
+    for key, a in analysis.items():
+        if key in held_keys or key in pending or a["class"] != "BUY":
+            continue
+        if not is_crypto(a["symbol"]) and not market_open:
+            continue
+        out.append(a)
+    return sorted(out, key=lambda a: a["score"], reverse=True)
+
+
+def build_broker_prompt(risk, candidates, cfg, news=None):
+    news = news or {}
+    lines = []
+    for r in risk["positions"]:
+        p, a = r["pos"], r["analysis"]
+        ind = (f"RSI {a['ind']['rsi']:.1f}, ROC {a['ind']['roc']:.2f}%, MACD hist {a['ind']['macd_hist']:.4f}, "
+               f"SMA20 {'>' if a['ind']['sma20'] > a['ind']['sma50'] else '<'} SMA50") if a else "indicatori N/D"
+        lines.append(f"  - {p['yf_symbol']}: valore ${p['market_value']:,.0f}, PnL {p['unrealized_plpc']:.2f}%, "
+                     f"score {r['score']}, stato {r['status']} ({r['reason']}); {ind}")
+    positions_txt = "\n".join(lines) or "  (nessuna posizione aperta)"
+    cand_txt = "\n".join(
+        f"  - {a['symbol']}: score {a['score']}, prezzo ${a['ind']['price']:.4f}, RSI {a['ind']['rsi']:.1f}, "
+        f"ROC {a['ind']['roc']:.2f}%, MACD hist {a['ind']['macd_hist']:.4f}, "
+        f"SMA20 {'>' if a['ind']['sma20'] > a['ind']['sma50'] else '<'} SMA50"
+        + (f"; notizie: {news[a['symbol']]}" if news.get(a['symbol']) else "")
+        for a in candidates[:5]
+    ) or "  (nessun candidato con score > %d)" % SCORE_BUY
+    f_stock, f_crypto = risk["funds"]["stock"][0], risk["funds"]["crypto"][0]
+    return (
+        "Sei un Quantitative Portfolio Broker. Ricevi l'elenco degli asset e delle posizioni correnti.\n"
+        "Analizza l'opportunità di rotazione del capitale: se trovi un asset più promettente di quelli attuali "
+        "e non c'è liquidità, indica quale vendere e quale acquistare.\n\n"
+        f"Capitale: ${risk['equity']:,.0f} | esposizione: ${risk['exposure']:,.0f} | "
+        f"liquidità disponibile: azioni ${f_stock:,.0f}, crypto ${f_crypto:,.0f}\n"
+        f"Posizioni aperte:\n{positions_txt}\n"
+        f"Candidati all'acquisto (Score di Forza > {SCORE_BUY}):\n{cand_txt}\n\n"
+        "Regole del desk:\n"
+        "- BUY solo se c'è liquidità sufficiente (almeno $10) e buy_symbol è tra i candidati.\n"
+        f"- ROTATE solo se la liquidità è insufficiente (< ${ROTATION_FUNDS_THRESHOLD}), buy_symbol ha score > "
+        f"{ROTATION_MIN_SCORE} e almeno {ROTATION_MIN_EDGE} punti più di sell_symbol (preferisci posizioni in stallo o deboli).\n"
+        "- SELL per chiudere una posizione debole o in stallo; HOLD se nessuna azione è vantaggiosa.\n"
+        "- Le vendite per stop loss, trend ribassista e stallo prolungato sono già gestite dal Risk Manager.\n\n"
+        "Restituisci la risposta in formato JSON pulito:\n"
+        '{\n  "action": "BUY" | "SELL" | "ROTATE" | "HOLD",\n  "sell_symbol": "TICKER_DA_VENDERE",\n'
+        '  "buy_symbol": "TICKER_DA_COMPRARE",\n  "reason": "Spiegazione focalizzata su rotazione capitale e stallo"\n}\n'
+        "Usa i ticker esattamente come scritti sopra e stringa vuota per i campi non usati."
+    )
+
+
+def parse_broker_json(text):
+    """Estrae e normalizza la decisione JSON del Broker, oppure None."""
+    if not text:
+        return None
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    action = str(data.get("action", "")).strip().upper()
+    if action not in BROKER_ACTIONS:
+        return None
+    return {
+        "action": action,
+        "sell_symbol": str(data.get("sell_symbol") or "").strip().upper(),
+        "buy_symbol": str(data.get("buy_symbol") or "").strip().upper(),
+        "reason": str(data.get("reason") or "").strip(),
+    }
+
+
+def ask_broker_ai(prompt, log=print):
+    """Interroga l'IA del Broker secondo ai_provider. Restituisce (decisione, motore) o (None, None)."""
+    provider = _resolve_provider(get_config()["ai_provider"], log)
+    if provider == "quant":
+        return None, None
+    ask = lambda fn: parse_broker_json(fn(prompt, log, system=BROKER_SYSTEM_PROMPT,
+                                          validate=lambda t: parse_broker_json(t) is not None,
+                                          **({"max_tokens": 2048} if fn is _ask_groq else {})))
+    if provider == "hybrid":
+        d_gemini, d_groq = ask(_ask_gemini), ask(_ask_groq)
+        if d_gemini and d_groq:
+            same = all(d_gemini[k] == d_groq[k] for k in ("action", "sell_symbol", "buy_symbol"))
+            if same:
+                return d_groq, "Ibrido Gemini+Groq"
+            return ({"action": "HOLD", "sell_symbol": "", "buy_symbol": "",
+                     "reason": f"Gemini ({d_gemini['action']}) e Groq ({d_groq['action']}) non concordano"},
+                    "Ibrido Gemini+Groq")
+        if d_gemini or d_groq:
+            return (d_gemini, _last_model["gemini"]) if d_gemini else (d_groq, _last_model["groq"])
+        return None, None
+
+    order = [_ask_gemini, _ask_groq] if provider == "gemini" else [_ask_groq, _ask_gemini]
+    keys = {_ask_gemini: GEMINI_KEY, _ask_groq: GROQ_KEY}
+    for i, fn in enumerate(order):
+        if i and not keys[fn]:
+            continue
+        if i:
+            log(f"🔁 {'Gemini' if order[0] is _ask_gemini else 'Groq'} non ha risposto: provo "
+                f"{'Groq' if fn is _ask_groq else 'Gemini'} come riserva.")
+        decision = ask(fn)
+        if decision:
+            return decision, _last_model["groq" if fn is _ask_groq else "gemini"]
+    return None, None
+
+
+def weakest_holding(risk, exclude=()):
+    """Posizione più debole vendibile: prima quelle in stallo, poi score e PnL più bassi."""
+    choices = [r for r in risk["positions"]
+               if r["status"] in ("OK", "IN_STALLO") and r["score"] is not None
+               and normalize_symbol(r["pos"]["symbol"]) not in exclude]
+    if not choices:
+        return None
+    return min(choices, key=lambda r: (r["status"] != "IN_STALLO", r["score"], r["pos"]["unrealized_plpc"]))
+
+
+def ta_broker(risk, candidates):
+    """Broker quantitativo di riserva (senza IA), con le stesse regole del desk."""
+    if not candidates:
+        return {"action": "HOLD", "sell_symbol": "", "buy_symbol": "", "reason": f"[Quant] Nessun asset con score > {SCORE_BUY}"}
+    best = candidates[0]
+    funds = risk["funds"]["crypto" if is_crypto(best["symbol"]) else "stock"]
+    if funds[1] >= MIN_ORDER_USD:
+        return {"action": "BUY", "sell_symbol": "", "buy_symbol": best["symbol"],
+                "reason": f"[Quant] {best['symbol']} ha lo Score di Forza più alto ({best['score']})"}
+    weak = weakest_holding(risk)
+    if (funds[0] < ROTATION_FUNDS_THRESHOLD and best["score"] > ROTATION_MIN_SCORE and weak
+            and best["score"] - weak["score"] >= ROTATION_MIN_EDGE):
+        return {"action": "ROTATE", "sell_symbol": weak["pos"]["yf_symbol"], "buy_symbol": best["symbol"],
+                "reason": f"[Quant] Rotazione: {weak['pos']['yf_symbol']} (score {weak['score']}, {weak['status']}) → "
+                          f"{best['symbol']} (score {best['score']})"}
+    return {"action": "HOLD", "sell_symbol": "", "buy_symbol": "",
+            "reason": f"[Quant] Liquidità insufficiente e nessuna rotazione conveniente per {best['symbol']} (score {best['score']})"}
+
+
+def validate_broker_decision(decision, risk, candidates, sold_keys=(), log=print):
+    """Applica le regole del desk alla decisione del Broker; se non le rispetta la corregge o la annulla."""
+    hold = lambda why: {"action": "HOLD", "sell_symbol": "", "buy_symbol": "", "reason": why}
+    action = decision["action"]
+    cand = {normalize_symbol(a["symbol"]): a for a in candidates}
+    holdings = {normalize_symbol(r["pos"]["yf_symbol"]): r for r in risk["positions"]
+                if normalize_symbol(r["pos"]["symbol"]) not in sold_keys}
+    buy = cand.get(normalize_symbol(decision["buy_symbol"])) if decision["buy_symbol"] else None
+    sell = holdings.get(normalize_symbol(decision["sell_symbol"])) if decision["sell_symbol"] else None
+
+    if action == "HOLD":
+        return decision
+    if action == "SELL":
+        if not sell:
+            return hold(f"SELL scartato: {decision['sell_symbol'] or '?'} non è una posizione vendibile")
+        return {**decision, "sell_symbol": sell["pos"]["yf_symbol"]}
+    if not buy:
+        return hold(f"{action} scartato: {decision['buy_symbol'] or '?'} non è tra i candidati acquistabili")
+
+    funds = risk["funds"]["crypto" if is_crypto(buy["symbol"]) else "stock"]
+    if action == "BUY":
+        if funds[1] >= MIN_ORDER_USD:
+            return {**decision, "buy_symbol": buy["symbol"]}
+        # BUY senza liquidità: diventa una rotazione se il segnale è abbastanza forte
+        sell = weakest_holding(risk, exclude=sold_keys)
+        action = "ROTATE"
+        log(f"💼 [Broker] Liquidità insufficiente per {buy['symbol']}: valuto la rotazione.")
+
+    # ROTATE
+    if funds[1] >= MIN_ORDER_USD:
+        return {**decision, "action": "BUY", "sell_symbol": "", "buy_symbol": buy["symbol"],
+                "reason": decision["reason"] + " (c'è liquidità: acquisto senza vendere)"}
+    if not sell:
+        sell = weakest_holding(risk, exclude=sold_keys)
+    if not sell:
+        return hold(f"Rotazione verso {buy['symbol']} impossibile: nessuna posizione vendibile")
+    if buy["score"] <= ROTATION_MIN_SCORE:
+        return hold(f"Rotazione scartata: {buy['symbol']} ha score {buy['score']} (serve > {ROTATION_MIN_SCORE})")
+    if sell["score"] is not None and buy["score"] - sell["score"] < ROTATION_MIN_EDGE:
+        return hold(f"Rotazione scartata: vantaggio {buy['symbol']} {buy['score']} vs {sell['pos']['yf_symbol']} "
+                    f"{sell['score']} inferiore a {ROTATION_MIN_EDGE} punti")
+    return {**decision, "action": "ROTATE", "sell_symbol": sell["pos"]["yf_symbol"], "buy_symbol": buy["symbol"]}

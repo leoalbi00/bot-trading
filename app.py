@@ -33,7 +33,7 @@ bot_state = {
     "active": True,
     "last_scan": "In attesa del primo scan...",
     "status": "Inizializzato",
-    "logs": deque(maxlen=60),  # ordine cronologico: il più recente è in fondo
+    "logs": deque(maxlen=150),  # ordine cronologico: il più recente è in fondo
     "latest_ai_analysis": {
         "symbol": "INIZIALIZZO...",
         "rsi": "--",
@@ -165,10 +165,6 @@ def should_abort():
         return True
     return False
 
-# Cicli consecutivi in cui ogni posizione risulta in portafoglio (per la vendita per stallo).
-# È in memoria: dopo un riavvio il conteggio riparte da zero.
-_position_cycles = {}
-
 def execute_sell(pos, label, reason, auto_trade, pending, market_open):
     """Chiude una posizione (o la segnala in modalità Advisor). Restituisce l'ordine o None."""
     sym, qty = pos["symbol"], pos["qty"]
@@ -178,18 +174,17 @@ def execute_sell(pos, label, reason, auto_trade, pending, market_open):
     if not alpaca_client:
         return None
     try:
-        log_message(f"🚨 VENDITA {label} {sym} ({qty} quote): {core.summarize_reason(reason)}")
         order = core.close_position(sym)
         pending.add(core.normalize_symbol(sym))
         note = "" if market_open or pos["is_crypto"] else " (mercato chiuso: eseguito all'apertura)"
-        log_message(f"ORDINE VENDITA INVIATO: {sym} (ID: {order.id}){note}")
+        log_message(f"🚨 ORDINE VENDITA ({label}) INVIATO: {sym} {qty} quote (ID: {order.id}){note}")
         return order
     except Exception as e:
         log_message(f"Errore Vendita {sym}: {e}")
         return None
 
 def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO"):
-    """Acquisto a importo (o segnalazione in modalità Advisor). Restituisce l'ordine o None."""
+    """Acquisto a importo (notional) o segnalazione in modalità Advisor. Restituisce l'ordine o None."""
     if not auto_trade:
         log_message(f"🧭 [Advisor] Suggerito {label} di ${amount:,.2f} di {sym}: ordine non inviato.")
         return None
@@ -198,56 +193,43 @@ def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO"):
     try:
         order = core.submit_notional_buy(sym, amount)
         pending.add(core.normalize_symbol(sym))
-        log_message(f"ORDINE {label} INVIATO: ${amount:,.2f} di {sym} (ID: {order.id})")
+        log_message(f"✅ ORDINE {label} INVIATO: ${amount:,.2f} di {sym} (ID: {order.id})")
         return order
     except Exception as e:
         log_message(f"Errore Ordine Acquisto {sym}: {e}")
         return None
 
-def rotate_capital(target, target_score, holdings, auto_trade, pending):
-    """Vende la posizione più debole per finanziare un acquisto con segnale forte.
-
-    Restituisce True se la rotazione è stata avviata (anche solo come suggerimento in Advisor).
-    """
-    choices = [
-        h for h in holdings
-        if h["tradable"] and core.normalize_symbol(h["pos"]["symbol"]) not in pending and h["score"] < target_score
-    ]
-    if not choices:
-        log_message(f"🔄 Rotazione per {target}: nessuna posizione più debole vendibile ora.")
-        return False
-
-    # Priorità: posizioni in stallo, poi score più basso, poi PnL peggiore
-    worst = min(choices, key=lambda h: (not h["stalled"], h["score"], h["pos"]["unrealized_plpc"]))
-    pos = worst["pos"]
-    stall_note = ", in stallo" if worst["stalled"] else ""
-    log_message(
-        f"🔄 Rotazione capitale: vendo {pos['symbol']} (score {worst['score']}, PnL {pos['unrealized_plpc']:.2f}%{stall_note}) "
-        f"per comprare {target} (score {target_score})"
-    )
-    holdings.remove(worst)
+def rotate_capital(sell_report, target, cfg, auto_trade, pending):
+    """Opportunity Cost Trade: vende sell_report e reinveste il ricavato su target entro il limite di esposizione."""
+    pos = sell_report["pos"]
     if not auto_trade:
         log_message(f"🧭 [Advisor] Rotazione suggerita {pos['symbol']} → {target}: ordini non inviati.")
-        return True
-
+        return
     order = execute_sell(pos, "PER ROTAZIONE", f"Capitale riallocato su {target}", auto_trade, pending, True)
     if not order:
-        return False
+        return
     filled = core.wait_for_fill(order.id, timeout=30, log=log_message)
     if not filled:
         log_message(f"🔄 Vendita di {pos['symbol']} non ancora eseguita: l'acquisto di {target} è rimandato al prossimo ciclo.")
-        return True
+        return
 
     proceeds = float(filled.filled_qty or 0) * float(filled.filled_avg_price or 0)
-    # Reinveste solo entro il limite di esposizione (se il conto era sovraesposto la vendita riduce la leva)
-    exposure_after = sum(abs(h["pos"]["market_value"]) for h in holdings)
-    funds, _ = core.buy_budget(get_account_summary(), exposure_after, core.get_config(), crypto=core.is_crypto(target))
+    exposure_after = sum(abs(p["market_value"]) for p in get_open_positions())
+    funds, _ = core.buy_budget(get_account_summary(), exposure_after, cfg, crypto=core.is_crypto(target))
     amount = min(proceeds, funds)
     if amount < core.MIN_ORDER_USD:
         log_message(f"🔄 Nessun reinvestimento in {target}: fondi entro il limite di esposizione ${funds:,.2f}.")
-        return True
+        return
     execute_buy(target, amount, auto_trade, pending, label="ACQUISTO DA ROTAZIONE")
-    return True
+
+def describe_decision(d):
+    if d["action"] == "ROTATE":
+        return f"ROTATE {d['sell_symbol']} → {d['buy_symbol']}"
+    if d["action"] == "BUY":
+        return f"BUY {d['buy_symbol']}"
+    if d["action"] == "SELL":
+        return f"SELL {d['sell_symbol']}"
+    return "HOLD"
 
 def run_trading_cycle(manual=False):
     # Verifica che non ci sia un'altra scansione in corso
@@ -258,192 +240,99 @@ def run_trading_cycle(manual=False):
     try:
         bot_state["status"] = "Scansione & Valutazione in corso..."
         bot_state["last_scan"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_message("=== AVVIO SCANSIONE MERCATO & PORTAFOGLIO ===")
+        log_message("=== AVVIO CICLO DESK MULTI-AGENTE ===")
 
         cfg = core.get_config()
         auto_trade = cfg["auto_execute_trades"]
         if not auto_trade:
             log_message("🧭 Modalità Advisor: le decisioni vengono solo registrate, nessun ordine inviato.")
-
         if not alpaca_client:
             log_message("⚠️ Credenziali Alpaca non configurate: nessun ordine verrà inviato.")
 
         # Ordini già aperti: evitano duplicati e accumuli a mercato chiuso
         pending = core.get_pending_order_symbols(log=log_message)
-        if pending is None:
-            log_message("⚠️ Stato ordini pendenti sconosciuto: salto l'invio di ordini in questo ciclo.")
+        orders_allowed = pending is not None
+        if not orders_allowed:
+            log_message("⚠️ Stato ordini pendenti sconosciuto: nessun ordine in questo ciclo.")
+            pending = set()
         elif pending:
             log_message(f"Ordini pendenti su: {sorted(pending)}")
         market_open = core.is_market_open(log=log_message)
-
-        # ---------------------------------------------------------
-        # 1. USCITE ATTIVE: STOP LOSS, TREND RIBASSISTA, STALLO, IA
-        # ---------------------------------------------------------
-        open_positions = get_open_positions()
-        held = {core.normalize_symbol(p["symbol"]) for p in open_positions}
-        for key in list(_position_cycles):
-            if key not in held:
-                del _position_cycles[key]
-        for key in held:
-            _position_cycles[key] = _position_cycles.get(key, 0) + 1
-
-        holdings = []  # posizioni mantenute: candidate per la rotazione del capitale
-        for pos in open_positions:
-            if not manual and should_abort():
-                return
-            sym = pos["symbol"]
-            yf_sym = pos["yf_symbol"]
-            key = core.normalize_symbol(sym)
-            pl_percent = pos["unrealized_plpc"]
-
-            if pending is None or key in pending:
-                log_message(f"{sym}: ordine già pendente o stato ordini ignoto, salto la valutazione di vendita.")
-                continue
-
-            set_ai_analysis(
-                symbol=sym,
-                rsi="Calcolo...",
-                sentiment="Recupero news...",
-                ai_verdict="VALUTAZIONE VENDITA",
-                reasoning=f"Analisi del rischio in corso per la posizione aperta su {sym}..."
-            )
-
-            ind = core.get_indicators(yf_sym)
-            cycles = _position_cycles[key]
-            news_summary = ""
-            if ind:
-                log_message(
-                    f"Verifica Posizione {sym}: PnL ${pos['unrealized_pl']:.2f} ({pl_percent:.2f}%) | RSI {ind['rsi']:.1f} "
-                    f"| ROC {ind['roc']:.2f}% | MACD hist {ind['macd_hist']:.4f} | cicli {cycles}"
-                )
-            else:
-                log_message(f"Verifica Posizione {sym}: PnL ${pos['unrealized_pl']:.2f} ({pl_percent:.2f}%) | indicatori non disponibili")
-
-            decision, label, ai_res, exit_kind = "HOLD", "", "", None
-            score = core.ta_score(ind) if ind else 50
-            if pl_percent <= cfg["stop_loss_pct"]:
-                # Lo stop loss ha la precedenza: nessuna chiamata IA
-                decision, label = "SELL", "STOP LOSS"
-                ai_res = f"Stop Loss di sicurezza ({cfg['stop_loss_pct']:.1f}%) raggiunto: PnL {pl_percent:.2f}%"
-                log_message(f"🛑 {sym} → SELL (Stop Loss): PnL {pl_percent:.2f}% ≤ {cfg['stop_loss_pct']:.1f}%")
-            elif not ind:
-                ai_res = "Indicatori non disponibili: posizione mantenuta."
-            else:
-                exit_kind, why = core.ta_exit_signal(ind)
-                if exit_kind == "ribassista":
-                    decision, label = "SELL", "TREND RIBASSISTA"
-                    ai_res = f"Segnale tecnico ribassista: {why}"
-                    log_message(f"📉 {sym} → SELL (TA ribassista): {why}")
-                elif exit_kind == "stallo" and cycles >= core.STALL_MIN_CYCLES:
-                    decision, label = "SELL", "PER STALLO"
-                    ai_res = f"Momentum in stallo da {cycles} cicli: {why}"
-                    log_message(f"⏸️ {sym} → SELL (Stallo da {cycles} cicli): {why}")
-                else:
-                    if exit_kind == "stallo":
-                        log_message(f"⏸️ {sym}: segnale di stallo ({why}), ciclo {cycles}/{core.STALL_MIN_CYCLES}.")
-                    news_summary = core.get_recent_news(yf_sym)
-                    prompt = core.build_analysis_prompt(yf_sym, ind, news_summary, position=pos)
-                    ai_res, source = core.query_ai_with_source(prompt, log=log_message, symbol=yf_sym)
-                    decision = core.parse_decision(ai_res, allowed=("SELL", "HOLD"))
-                    ai_score = core.parse_score(ai_res)
-                    score = ai_score if ai_score is not None else score
-                    log_message(f"🤖 {sym} → {decision} ({source}, score {score}): {core.summarize_reason(ai_res)}")
-                    label = "PREVISIONE RIBASSISTA (IA)"
-
-            set_ai_analysis(
-                symbol=sym,
-                rsi=str(ind["rsi"]) if ind else "N/A",
-                sentiment=short_text(news_summary) if news_summary else "--",
-                ai_verdict=f"SELL ({label.title()})" if decision == "SELL" else f"HOLD (score {score})",
-                reasoning=ai_res
-            )
-
-            if decision == "SELL":
-                execute_sell(pos, label, ai_res, auto_trade, pending, market_open)
-            else:
-                holdings.append({
-                    "pos": pos,
-                    "score": score,
-                    "stalled": exit_kind == "stallo",
-                    "tradable": pos["is_crypto"] or market_open,
-                })
-
-        # ---------------------------------------------------------
-        # 2. SCANSIONE WATCHLIST, ACQUISTI E ROTAZIONE DEL CAPITALE
-        # ---------------------------------------------------------
-        log_message(f"Avvio scansione Watchlist ({len(cfg['watchlist'])} asset) per nuove opportunità...")
-        candidates, closed_skipped = [], 0
-        for ticker in cfg["watchlist"]:
-            key = core.normalize_symbol(ticker)
-            if key in held or pending is None or key in pending:
-                continue
-            if not core.is_crypto(ticker) and not market_open:
-                closed_skipped += 1
-                continue
-            ind = core.get_indicators(ticker)
-            if ind:
-                candidates.append({"symbol": ticker, "ind": ind, "score": core.ta_score(ind)})
-        if closed_skipped:
-            log_message(f"Mercato azionario chiuso: {closed_skipped} azioni escluse dalla scansione.")
-
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        top_3 = candidates[:3]
-        log_message(f"Asset selezionati per analisi BUY: {[(c['symbol'], c['score']) for c in top_3]}")
-
+        positions = get_open_positions()
         acc = get_account_summary()
-        exposure = sum(abs(p["market_value"]) for p in open_positions)
-        log_message(
-            f"Esposizione attuale ${exposure:,.0f} su capitale ${acc.get('portfolio', 0):,.0f} "
-            f"(limite {cfg['max_exposure_pct']:.0f}%)"
-        )
-        rotated = False
-        for asset in top_3:
-            if not manual and should_abort():
-                return
-            sym, ind = asset["symbol"], asset["ind"]
-            crypto = core.is_crypto(sym)
 
-            set_ai_analysis(
-                symbol=sym,
-                rsi=str(ind["rsi"]),
-                sentiment="Download notizie in corso...",
-                ai_verdict="VALUTAZIONE ACQUISTO",
-                reasoning=f"Analisi ingresso mercato per {sym}..."
-            )
+        # ---------------- FASE 1: ANALISTA DI MERCATO ----------------
+        log_message("━━━ FASE 1 · ANALISTA DI MERCATO ━━━")
+        set_ai_analysis(symbol="DESK", rsi="--", sentiment="Fase 1: Analista di mercato",
+                        ai_verdict="ANALISI IN CORSO", reasoning="Calcolo di RSI, MACD, ROC, SMA20/50 e Score di Forza...")
+        analysis = core.market_analyst(cfg["watchlist"] + [p["yf_symbol"] for p in positions], log=log_message)
+        if not manual and should_abort():
+            return
 
-            news = core.get_recent_news(sym)
-            prompt = core.build_analysis_prompt(sym, ind, news)
-            ai_res, source = core.query_ai_with_source(prompt, log=log_message, symbol=sym)
-            is_buy = core.parse_decision(ai_res, allowed=("BUY", "HOLD")) == "BUY"
-            ai_score = core.parse_score(ai_res)
-            score = ai_score if ai_score is not None else asset["score"]
-            log_message(f"🤖 {sym} → {'BUY' if is_buy else 'HOLD'} ({source}, score {score}): {core.summarize_reason(ai_res)}")
+        # ---------------- FASE 2: RISK MANAGER ----------------
+        log_message("━━━ FASE 2 · RISK MANAGER ━━━")
+        risk = core.risk_manager(positions, analysis, acc, cfg, log=log_message)
 
-            set_ai_analysis(
-                symbol=sym,
-                rsi=str(ind["rsi"]),
-                sentiment=short_text(news),
-                ai_verdict=f"BUY (score {score})" if is_buy else f"HOLD (score {score})",
-                reasoning=ai_res
-            )
-            if not is_buy:
+        # ---------------- FASE 3: PORTFOLIO BROKER ----------------
+        log_message("━━━ FASE 3 · PORTFOLIO BROKER ━━━")
+        sold = set()
+        for r in risk["positions"]:
+            if r["status"] not in ("STOP_LOSS", "RIBASSISTA", "STALLO"):
                 continue
+            pos = r["pos"]
+            key = core.normalize_symbol(pos["symbol"])
+            if not orders_allowed or key in pending:
+                log_message(f"💼 [Broker] {pos['symbol']}: vendita ({r['status']}) rimandata, ordine già pendente.")
+                continue
+            log_message(f"💼 [Broker] SELL obbligatorio {pos['symbol']} ({r['status']}): {r['reason']}")
+            if execute_sell(pos, r["status"].replace("_", " "), r["reason"], auto_trade, pending, market_open) or not auto_trade:
+                sold.add(key)
 
-            funds, allocation = core.buy_budget(acc, exposure, cfg, crypto=crypto)
-            if allocation >= core.MIN_ORDER_USD:
-                if execute_buy(sym, allocation, auto_trade, pending):
-                    exposure += allocation
-                    acc["buying_power"] = acc.get("buying_power", 0) - allocation
-                    acc["non_marginable_buying_power"] = acc.get("non_marginable_buying_power", 0) - allocation
-            elif funds <= core.ROTATION_FUNDS_THRESHOLD and score >= core.ROTATION_MIN_SCORE and not rotated:
-                rotated = rotate_capital(sym, score, holdings, auto_trade, pending)
+        held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
+        candidates = core.broker_candidates(analysis, held_keys, pending, market_open)
+        if not market_open:
+            log_message("Mercato azionario chiuso: solo crypto tra i candidati all'acquisto.")
+        news = {a["symbol"]: core.get_recent_news(a["symbol"]) for a in candidates[:3]}
+
+        prompt = core.build_broker_prompt(risk, candidates, cfg, news)
+        decision, source = core.ask_broker_ai(prompt, log=log_message)
+        if not decision:
+            log_message("🧮 Nessuna IA disponibile: decide il Broker quantitativo di riserva.")
+            decision, source = core.ta_broker(risk, candidates), "Quant"
+        log_message(f"💼 [Broker] Proposta ({source}): {describe_decision(decision)} — {core.summarize_reason(decision['reason'], 220)}")
+
+        final = core.validate_broker_decision(decision, risk, candidates, sold_keys=sold | pending, log=log_message)
+        if describe_decision(final) != describe_decision(decision):
+            log_message(f"💼 [Broker] Decisione finale: {describe_decision(final)} — {final['reason']}")
+
+        target = final["buy_symbol"] or final["sell_symbol"]
+        target_info = analysis.get(core.normalize_symbol(target)) if target else None
+        set_ai_analysis(
+            symbol=target or "PORTAFOGLIO",
+            rsi=str(target_info["ind"]["rsi"]) if target_info else "--",
+            sentiment=short_text(f"Esposizione ${risk['exposure']:,.0f} / capitale ${risk['equity']:,.0f}"),
+            ai_verdict=f"{describe_decision(final)} ({source})",
+            reasoning=final["reason"] or decision["reason"],
+        )
+
+        if not orders_allowed or final["action"] == "HOLD":
+            pass
+        elif final["action"] == "BUY":
+            crypto = core.is_crypto(final["buy_symbol"])
+            _, allocation = risk["funds"]["crypto" if crypto else "stock"]
+            execute_buy(final["buy_symbol"], allocation, auto_trade, pending)
+        else:
+            sell_report = next(r for r in risk["positions"]
+                               if core.normalize_symbol(r["pos"]["yf_symbol"]) == core.normalize_symbol(final["sell_symbol"]))
+            if final["action"] == "SELL":
+                execute_sell(sell_report["pos"], "DECISIONE BROKER", final["reason"], auto_trade, pending, market_open)
             else:
-                extra = (f"; score {score} sotto la soglia di rotazione ({core.ROTATION_MIN_SCORE})"
-                         if funds <= core.ROTATION_FUNDS_THRESHOLD and score < core.ROTATION_MIN_SCORE else "")
-                log_message(f"[Trading] Liquidità disponibile insufficiente per nuovi acquisti (${funds:,.2f}){extra}")
+                log_message(f"🔄 Rotazione capitale: {sell_report['pos']['symbol']} (score {sell_report['score']}) → "
+                            f"{final['buy_symbol']}")
+                rotate_capital(sell_report, final["buy_symbol"], cfg, auto_trade, pending)
 
         bot_state["status"] = "Attivo (In attesa ciclo)" if bot_state["active"] else "In pausa"
-        log_message("=== SCANSIONE COMPLETATA ===")
+        log_message("=== CICLO COMPLETATO ===")
 
     finally:
         if bot_state["status"].startswith("Scansione"):
