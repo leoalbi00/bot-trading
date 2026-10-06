@@ -69,9 +69,22 @@ def get_open_positions():
         log_message(f"Errore recupero posizioni: {e}")
         return []
 
+def get_recent_news(ticker):
+    """Recupera le ultime notizie per un asset tramite yfinance."""
+    try:
+        t = yf.Ticker(ticker)
+        news = t.news
+        if news:
+            titles = [item.get('title', '') for item in news[:3] if item.get('title')]
+            if titles:
+                return " | ".join(titles)
+    except Exception:
+        pass
+    return "Nessuna notizia rilevante recente."
+
 def query_gemini_ai(prompt):
     if not GEMINI_KEY:
-        return "DECISIONE: BUY | MOTIVO: Test modalità fallback"
+        return "DECISIONE: HOLD | MOTIVO: API Key non configurata"
 
     try:
         from google import genai
@@ -83,10 +96,10 @@ def query_gemini_ai(prompt):
                     return res.text
             except Exception:
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        log_message(f"Errore chiamata Gemini: {e}")
 
-    return "DECISIONE: HOLD | MOTIVO: Analisi tecnica in fase neutrale."
+    return "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API"
 
 def run_trading_cycle():
     bot_state["status"] = "Scansione & Valutazione..."
@@ -94,7 +107,7 @@ def run_trading_cycle():
     log_message("=== AVVIO SCANSIONE MERCATO & PORTAFOGLIO ===")
 
     # ---------------------------------------------------------
-    # 1. GESTIONE E VENDITA DELLE POSIZIONI APERTE (TAKE PROFIT / STOP LOSS / SELL AI)
+    # 1. VALUTAZIONE PREDITTIVA DI VENDITA SULLE POSIZIONI APERTE
     # ---------------------------------------------------------
     open_positions = get_open_positions()
     for pos in open_positions:
@@ -104,28 +117,45 @@ def run_trading_cycle():
         mkt_val = pos["market_value"]
         pl_percent = (unrealized_pl / (mkt_val - unrealized_pl)) * 100 if mkt_val != unrealized_pl else 0
 
-        log_message(f"Verifica Posizione {sym}: Qty {qty} | PnL: ${unrealized_pl:.2f} ({pl_percent:.2f}%)")
+        # Recupero dati di mercato e news in tempo reale
+        news_summary = get_recent_news(sym)
+        rsi_val = "N/A"
+        try:
+            df = yf.Ticker(sym).history(period="1mo", interval="1h")
+            if len(df) >= 20:
+                rsi_val = round(float(ta.momentum.RSIIndicator(df['Close'], window=14).rsi().iloc[-1]), 2)
+        except Exception:
+            pass
 
-        # Regola di Take Profit (+3%) o Stop Loss (-2%)
-        should_sell = False
-        reason = ""
+        log_message(f"Verifica Posizione {sym}: PnL ${unrealized_pl:.2f} ({pl_percent:.2f}%) | RSI: {rsi_val}")
 
-        if pl_percent >= 3.0:
+        # Prompt d'informazione e prevenzione per Gemini
+        prompt = f"""
+        Sei un agente di risk management per un bot quantitativo.
+        Analizza la posizione aperta per l'asset {sym}:
+        - Quantità detenuta: {qty}
+        - Valore di mercato attuale: ${mkt_val:.2f}
+        - Profit/Loss attuale: ${unrealized_pl:.2f} ({pl_percent:.2f}%)
+        - RSI (1h): {rsi_val}
+        - Ultime notizie/headlines sul titolo: "{news_summary}"
+
+        Valuta se esistono rischi imminenti di ribasso, perdita di momentum o se le notizie indicano un sentiment negativo.
+        Devi decidere se VENDERE SUBITO per proteggere il capitale o incassare il profitto, oppure MANTENERE.
+        
+        Rispondi includendo 'DECISIONE: SELL' oppure 'DECISIONE: HOLD' seguiti da una breve motivazione basata su notizie e indicatori.
+        """
+
+        ai_res = query_gemini_ai(prompt)
+        should_sell = "SELL" in ai_res.upper()
+        
+        # Paracadute di emergenza estremo (-5% Hard Stop Loss)
+        if pl_percent <= -5.0:
             should_sell = True
-            reason = f"Take Profit raggiunto (+{pl_percent:.2f}%)"
-        elif pl_percent <= -2.0:
-            should_sell = True
-            reason = f"Stop Loss attivato ({pl_percent:.2f}%)"
-        else:
-            prompt = f"Posizione aperta: {sym}, Qty: {qty}, PnL %: {pl_percent:.2f}%. Rispondi SELL se consigli di chiudere la posizione, altrimenti HOLD."
-            ai_res = query_gemini_ai(prompt)
-            if "SELL" in ai_res.upper():
-                should_sell = True
-                reason = "Segnale di vendita espresso dall'AI Gemini"
+            ai_res = "Stop Loss di sicurezza estrema (-5%)"
 
         if should_sell:
             try:
-                log_message(f"EXEC VENDITA {sym} ({qty} quote): {reason}")
+                log_message(f"🚨 VENDITA PREDITTIVA {sym} ({qty} quote): {ai_res}")
                 order_data = MarketOrderRequest(
                     symbol=sym,
                     qty=qty,
@@ -133,7 +163,7 @@ def run_trading_cycle():
                     time_in_force=TimeInForce.GTC
                 )
                 order = alpaca_client.submit_order(order_data)
-                log_message(f"ORDINE DI VENDITA ESEGUITO: {sym} (ID: {order.id})")
+                log_message(f"ORDINE VENDITA ESEGUITO: {sym} (ID: {order.id})")
             except Exception as e:
                 log_message(f"Errore Vendita {sym}: {e}")
 
@@ -161,11 +191,12 @@ def run_trading_cycle():
         log_message("Liquidità Cash insufficiente (< $10) per nuovi acquisti.")
     else:
         for asset in top_3:
+            news = get_recent_news(asset['symbol'])
             log_message(f"Analisi AI per {asset['symbol']} (${asset['price']:.2f})...")
-            prompt = f"Analizza {asset['symbol']}: Prezzo ${asset['price']:.2f}, RSI {asset['rsi']}. Rispondi BUY se reputi opportuno acquistare."
+            prompt = f"Analizza {asset['symbol']}: Prezzo ${asset['price']:.2f}, RSI {asset['rsi']}. Notizie: '{news}'. Rispondi 'DECISIONE: BUY' se reputi opportuno acquistare."
             ai_res = query_gemini_ai(prompt)
 
-            if "BUY" in ai_res.upper() or asset['score'] >= 65:
+            if "BUY" in ai_res.upper():
                 allocation = acc["cash"] * 0.15
                 if allocation >= 10:
                     qty = max(1, int(allocation / asset['price']))
@@ -196,9 +227,19 @@ def background_loop():
 
 app = Flask(__name__)
 
+# Avvio thread automatico compatibile con Gunicorn / Render
+if not hasattr(app, 'bot_started'):
+    app.bot_started = True
+    bg_thread = threading.Thread(target=background_loop, daemon=True)
+    bg_thread.start()
+
 @app.route("/")
 def index():
     return render_template("index.html")
+
+@app.route("/ping")
+def ping():
+    return jsonify({"status": "alive", "timestamp": datetime.datetime.now().isoformat()}), 200
 
 @app.route("/api/data")
 def api_data():
@@ -219,7 +260,30 @@ def api_toggle():
     log_message(f"Stato Bot impostato a: Active={bot_state['active']}")
     return jsonify({"active": bot_state["active"]})
 
+@app.route("/api/liquidate", methods=["POST"])
+def api_liquidate():
+    positions = get_open_positions()
+    if not positions:
+        return jsonify({"status": "warning", "message": "Nessuna posizione da liquidare."})
+
+    count = 0
+    for pos in positions:
+        sym = pos["symbol"]
+        qty = pos["qty"]
+        try:
+            order_data = MarketOrderRequest(
+                symbol=sym,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC
+            )
+            alpaca_client.submit_order(order_data)
+            log_message(f"🚨 LIQUIDAZIONE MANUALE: Vendita {qty} x {sym}")
+            count += 1
+        except Exception as e:
+            log_message(f"Errore vendita manuale {sym}: {e}")
+
+    return jsonify({"status": "success", "closed": count})
+
 if __name__ == "__main__":
-    t = threading.Thread(target=background_loop, daemon=True)
-    t.start()
     app.run(host="0.0.0.0", port=5000)
