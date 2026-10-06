@@ -45,11 +45,11 @@
             font-family: 'JetBrains Mono', monospace;
         }
         .custom-scrollbar::-webkit-scrollbar {
-            width: 4px;
+            width: 6px;
         }
         .custom-scrollbar::-webkit-scrollbar-thumb {
             background: rgba(255, 255, 255, 0.1);
-            border-radius: 2px;
+            border-radius: 3px;
         }
     </style>
 </head>
@@ -77,4 +77,139 @@
     </header>
 
     <!-- Main Container -->
-    <main class="flex-1 p-6 grid grid-cols-12 gap-6 max-w-[1800px] mx
+    <main class="flex-1 p-6 flex flex-col gap-6 max-w-[1800px] w-full mx-auto">
+        <!-- Metric Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <!-- Valore Portafoglio -->
+            <div class="bg-surface border border-borderSubtle rounded-lg p-5 flex flex-col justify-between">
+                <div class="flex items-center justify-between text-zinc-400">
+                    <span class="text-xs font-semibold uppercase tracking-wider">Valore Portafoglio</span>
+                    <i data-lucide="wallet" class="w-4 h-4 text-zinc-500"></i>
+                </div>
+                <div class="mt-4">
+                    <div class="text-2xl font-bold tabular-nums text-white" id="portfolioValue">--</div>
+                    <div class="text-xs text-zinc-500 mt-1 font-mono" id="portfolioPnL">PnL: --</div>
+                </div>
+            </div>
+
+            <!-- Cash Disponibile -->
+            <div class="bg-surface border border-borderSubtle rounded-lg p-5 flex flex-col justify-between">
+                <div class="flex items-center justify-between text-zinc-400">
+                    <span class="text-xs font-semibold uppercase tracking-wider">Cash Disponibile</span>
+                    <i data-lucide="dollar-sign" class="w-4 h-4 text-zinc-500"></i>
+                </div>
+                <div class="mt-4">
+                    <div class="text-2xl font-bold tabular-nums text-white" id="cashBalance">--</div>
+                    <div class="text-xs text-zinc-500 mt-1 font-mono" id="cashRatio">Quota Cash: --</div>
+                </div>
+            </div>
+
+            <!-- Ultima Scansione -->
+            <div class="bg-surface border border-borderSubtle rounded-lg p-5 flex flex-col justify-between">
+                <div class="flex items-center justify-between text-zinc-400">
+                    <span class="text-xs font-semibold uppercase tracking-wider">Ultima Scansione</span>
+                    <i data-lucide="clock" class="w-4 h-4 text-zinc-500"></i>
+                </div>
+                <div class="mt-4">
+                    <div class="text-2xl font-bold tabular-nums text-white font-mono" id="lastScanTime">--:--:--</div>
+                    <div class="text-xs text-zinc-500 mt-1 font-mono" id="lastScanStatus">Stato: In attesa</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Terminal Log Live -->
+        <div class="flex-1 bg-surface border border-borderSubtle rounded-lg flex flex-col min-h-[460px] overflow-hidden">
+            <div class="px-5 py-3 border-b border-borderSubtle flex items-center justify-between bg-zinc-950/40">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="terminal" class="w-4 h-4 text-zinc-400"></i>
+                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">Terminal Log Live</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <button onclick="clearLogs()" class="text-xs text-zinc-400 hover:text-zinc-200 px-2 py-1 rounded hover:bg-zinc-800 transition">
+                        Pulisci
+                    </button>
+                </div>
+            </div>
+            <div id="terminalContainer" class="flex-1 p-4 font-mono text-xs overflow-y-auto custom-scrollbar bg-black/60 text-zinc-300 space-y-1.5 selection:bg-zinc-700">
+                <div class="text-zinc-500">[SYSTEM] Connessione al terminale stabilita...</div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        lucide.createIcons();
+
+        let isRunning = true;
+
+        function addLog(message, type = 'info') {
+            const container = document.getElementById('terminalContainer');
+            const row = document.createElement('div');
+            
+            let color = 'text-zinc-300';
+            if (type === 'error') color = 'text-rose-400';
+            if (type === 'success') color = 'text-emerald-400';
+            if (type === 'warn') color = 'text-amber-400';
+            if (type === 'system') color = 'text-cyan-400';
+
+            const time = new Date().toLocaleTimeString('it-IT');
+            row.className = `${color} leading-relaxed break-all`;
+            row.textContent = `[${time}] ${message}`;
+
+            container.appendChild(row);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function clearLogs() {
+            const container = document.getElementById('terminalContainer');
+            container.innerHTML = '<div class="text-zinc-500">[SYSTEM] Log puliti.</div>';
+        }
+
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/api/status');
+                if (!res.ok) return;
+                const data = await res.json();
+
+                if (data.portfolio_value !== undefined) {
+                    document.getElementById('portfolioValue').textContent = typeof data.portfolio_value === 'number' 
+                        ? `$${data.portfolio_value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : data.portfolio_value;
+                }
+
+                if (data.pnl !== undefined) {
+                    document.getElementById('portfolioPnL').textContent = `PnL: ${data.pnl}`;
+                }
+
+                if (data.cash !== undefined) {
+                    document.getElementById('cashBalance').textContent = typeof data.cash === 'number'
+                        ? `$${data.cash.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : data.cash;
+                }
+
+                if (data.cash_ratio !== undefined) {
+                    document.getElementById('cashRatio').textContent = `Quota Cash: ${data.cash_ratio}`;
+                }
+
+                if (data.last_scan) {
+                    document.getElementById('lastScanTime').textContent = data.last_scan;
+                }
+
+                if (data.scan_status) {
+                    document.getElementById('lastScanStatus').textContent = `Stato: ${data.scan_status}`;
+                }
+
+                if (data.is_running !== undefined) {
+                    isRunning = Boolean(data.is_running);
+                    updateBotStatusDisplay();
+                }
+            } catch (err) {
+                // Silently handle polling errors
+            }
+        }
+
+        function updateBotStatusDisplay() {
+            const indicator = document.getElementById('statusIndicator');
+            const text = document.getElementById('botStatusText');
+            const btn = document.getElementById('btnToggle');
+
+            if (isRunning) {
