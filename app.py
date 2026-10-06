@@ -231,6 +231,7 @@ def run_trading_cycle(manual=False):
                 decision = "SELL"
                 ai_res = f"Stop Loss di sicurezza ({cfg['stop_loss_pct']:.1f}%) raggiunto: PnL {pl_percent:.2f}%"
                 verdict = "SELL (Stop Loss)"
+                log_message(f"🛑 {sym} → SELL (Stop Loss): PnL {pl_percent:.2f}% ≤ {cfg['stop_loss_pct']:.1f}%")
             else:
                 prompt = f"""
                 Sei un agente di risk management per un bot quantitativo.
@@ -247,8 +248,9 @@ def run_trading_cycle(manual=False):
                 Inizia la risposta con esattamente 'DECISIONE: SELL' oppure 'DECISIONE: HOLD', seguito da una breve motivazione.
                 """
                 log_message(f"Interrogazione Gemini per vendita {sym}...")
-                ai_res = core.query_ai(prompt, log=log_message, symbol=yf_sym)
+                ai_res, source = core.query_ai_with_source(prompt, log=log_message, symbol=yf_sym)
                 decision = core.parse_decision(ai_res, allowed=("SELL", "HOLD"))
+                log_message(f"🤖 {sym} → {decision} ({source}): {core.summarize_reason(ai_res)}")
                 verdict = "SELL (Vendita)" if decision == "SELL" else "HOLD (Mantiene)"
 
             set_ai_analysis(
@@ -327,8 +329,9 @@ def run_trading_cycle(manual=False):
                     f"Inizia la risposta con esattamente 'DECISIONE: BUY' se reputi opportuno acquistare "
                     f"oppure 'DECISIONE: HOLD', seguito da una breve motivazione."
                 )
-                ai_res = core.query_ai(prompt, log=log_message, symbol=sym)
+                ai_res, source = core.query_ai_with_source(prompt, log=log_message, symbol=sym)
                 is_buy = core.parse_decision(ai_res, allowed=("BUY", "HOLD")) == "BUY"
+                log_message(f"🤖 {sym} → {'BUY' if is_buy else 'HOLD'} ({source}): {core.summarize_reason(ai_res)}")
 
                 set_ai_analysis(
                     symbol=sym,

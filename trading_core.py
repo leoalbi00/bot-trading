@@ -313,7 +313,14 @@ def _no_ai_keys(log):
 
 
 def query_ai(prompt, log=print, symbol=None):
-    """Interroga il motore scelto in config.json (gemini / groq / hybrid / quant).
+    """Come query_ai_with_source, ma restituisce solo il testo della decisione."""
+    return query_ai_with_source(prompt, log=log, symbol=symbol)[0]
+
+
+def query_ai_with_source(prompt, log=print, symbol=None):
+    """Restituisce (testo, motore) dove motore indica chi ha deciso (es. "Groq openai/gpt-oss-120b").
+
+    Interroga il motore scelto in config.json (gemini / groq / hybrid / quant).
 
     - gemini / groq: se il motore scelto non risponde si prova l'altra IA.
     - hybrid: si opera solo se Gemini e Groq sono d'accordo, altrimenti HOLD;
@@ -324,7 +331,9 @@ def query_ai(prompt, log=print, symbol=None):
     provider = _resolve_provider(get_config()["ai_provider"], log)
 
     if provider == "quant":
-        return quant_decision(symbol, log) if symbol else "DECISIONE: HOLD | MOTIVO: Nessun simbolo per l'analisi quantitativa"
+        if not symbol:
+            return "DECISIONE: HOLD | MOTIVO: Nessun simbolo per l'analisi quantitativa", "Nessuno"
+        return quant_decision(symbol, log), "Quant"
 
     if provider == "hybrid":
         gemini_res = _ask_gemini(prompt, log)
@@ -333,28 +342,42 @@ def query_ai(prompt, log=print, symbol=None):
             d_gemini, d_groq = parse_decision(gemini_res), parse_decision(groq_res)
             decision = d_gemini if d_gemini == d_groq else "HOLD"
             return (f"DECISIONE: {decision} | IBRIDO (Gemini={d_gemini}, Groq={d_groq})\n"
-                    f"[Gemini] {gemini_res}\n[Groq] {groq_res}")
+                    f"[Gemini] {gemini_res}\n[Groq] {groq_res}"), "Ibrido Gemini+Groq"
         if gemini_res or groq_res:
             working, failed = ("Gemini", "Groq") if gemini_res else ("Groq", "Gemini")
             log(f"⚠️ Modalità Ibrida: {failed} non ha risposto, decisione basata solo su {working}.")
-            return gemini_res or groq_res
+            return gemini_res or groq_res, _last_model[working.lower()]
         result = None
     else:
         # Motore scelto, poi l'altra IA (se ha la chiave) prima del motore quantitativo
         ask = {"gemini": (_ask_gemini, "Gemini", GEMINI_KEY), "groq": (_ask_groq, "Groq", GROQ_KEY)}
         primary_fn, primary_name, _ = ask[provider]
         backup_fn, backup_name, backup_key = ask["groq" if provider == "gemini" else "gemini"]
-        result = primary_fn(prompt, log)
+        result, source = primary_fn(prompt, log), primary_name
         if not result and backup_key:
             log(f"🔁 {primary_name} non ha risposto: provo {backup_name} come riserva.")
-            result = backup_fn(prompt, log)
+            result, source = backup_fn(prompt, log), backup_name
+        if result:
+            return result, _last_model[source.lower()]
 
-    if result:
-        return result
     if symbol:
         log("🧮 Nessuna IA disponibile: uso l'analisi quantitativa di riserva (RSI + SMA20).")
-        return quant_decision(symbol, log)
-    return "DECISIONE: HOLD | MOTIVO: Nessun motore IA ha risposto"
+        return quant_decision(symbol, log), "Quant"
+    return "DECISIONE: HOLD | MOTIVO: Nessun motore IA ha risposto", "Nessuno"
+
+
+# Ultimo modello che ha risposto per ciascun provider (per i log delle decisioni)
+_last_model = {"gemini": "Gemini", "groq": "Groq"}
+
+
+def summarize_reason(text, limit=160):
+    """Motivazione compatta su una riga, senza il prefisso 'DECISIONE: X'."""
+    if not text:
+        return ""
+    reason = _DECISION_RE.sub("", text, count=1)
+    reason = re.sub(r"\s+", " ", reason).strip(" -–—|:*.\n")
+    reason = re.sub(r"^(MOTIVO|MOTIVAZIONE)\s*:\s*", "", reason, flags=re.IGNORECASE)
+    return reason[:limit] + "…" if len(reason) > limit else reason
 
 
 _groq_client = None
@@ -399,6 +422,7 @@ def _ask_groq(prompt, log):
             )
             text = res.choices[0].message.content if res.choices else None
             if text and _DECISION_RE.search(text):
+                _last_model["groq"] = f"Groq {model}"
                 return text
             log(f"⚠️ Groq {model}: risposta senza decisione, provo il modello successivo.")
         except groq.NotFoundError:
@@ -453,6 +477,7 @@ def _ask_gemini(prompt, log):
         try:
             res = _gemini_client.models.generate_content(model=model, contents=prompt)
             if res and res.text:
+                _last_model["gemini"] = f"Gemini {model}"
                 return res.text
             log(f"⚠️ Gemini {model}: risposta vuota, provo il modello successivo.")
         except genai_errors.ClientError as e:

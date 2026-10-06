@@ -162,9 +162,9 @@ def evaluate_and_trade(asset, positions, pending, market_open):
         f"e motiva in una frase."
     )
 
-    text = core.query_ai(prompt, symbol=asset['symbol'])
-    print(f"Decisione AI:\n{text}")
+    text, source = core.query_ai_with_source(prompt, symbol=asset['symbol'])
     decision = core.parse_decision(text)
+    print(f"🤖 {asset['symbol']} → {decision} ({source}): {core.summarize_reason(text)}")
 
     if not alpaca_client:
         print("[!] Credenziali Alpaca non configurate: nessun ordine inviato.")
