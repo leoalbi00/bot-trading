@@ -143,6 +143,7 @@
 
         function addLog(message, type = 'info') {
             const container = document.getElementById('terminalContainer');
+            if (!container) return;
             const row = document.createElement('div');
             
             let color = 'text-zinc-300';
@@ -161,49 +162,79 @@
 
         function clearLogs() {
             const container = document.getElementById('terminalContainer');
-            container.innerHTML = '<div class="text-zinc-500">[SYSTEM] Log puliti.</div>';
+            if (container) {
+                container.innerHTML = '<div class="text-zinc-500">[SYSTEM] Log puliti.</div>';
+            }
         }
 
         async function fetchStatus() {
             try {
-                const res = await fetch('/api/status');
-                if (!res.ok) return;
+                let res = await fetch('/api/data');
+                if (!res.ok) {
+                    res = await fetch('/api/status');
+                }
+                if (!res.ok) throw new Error(`HTTP status ${res.status}`);
+
                 const data = await res.json();
 
-                if (data.portfolio_value !== undefined) {
-                    document.getElementById('portfolioValue').textContent = typeof data.portfolio_value === 'number' 
-                        ? `$${data.portfolio_value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                        : data.portfolio_value;
+                // Portfolio Value
+                const val = data.portfolio_value ?? data.equity;
+                if (val !== undefined) {
+                    document.getElementById('portfolioValue').textContent = typeof val === 'number' 
+                        ? `$${val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : val;
                 }
 
+                // PnL
                 if (data.pnl !== undefined) {
                     document.getElementById('portfolioPnL').textContent = `PnL: ${data.pnl}`;
                 }
 
-                if (data.cash !== undefined) {
-                    document.getElementById('cashBalance').textContent = typeof data.cash === 'number'
-                        ? `$${data.cash.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                        : data.cash;
+                // Cash
+                const cash = data.cash;
+                if (cash !== undefined) {
+                    document.getElementById('cashBalance').textContent = typeof cash === 'number'
+                        ? `$${cash.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : cash;
                 }
 
+                // Cash Ratio / Buying Power
                 if (data.cash_ratio !== undefined) {
                     document.getElementById('cashRatio').textContent = `Quota Cash: ${data.cash_ratio}`;
+                } else if (data.buying_power !== undefined) {
+                    document.getElementById('cashRatio').textContent = `Buying Power: $${Number(data.buying_power).toFixed(2)}`;
                 }
 
+                // Last Scan
                 if (data.last_scan) {
                     document.getElementById('lastScanTime').textContent = data.last_scan;
+                } else {
+                    document.getElementById('lastScanTime').textContent = new Date().toLocaleTimeString('it-IT');
                 }
 
                 if (data.scan_status) {
                     document.getElementById('lastScanStatus').textContent = `Stato: ${data.scan_status}`;
+                } else {
+                    document.getElementById('lastScanStatus').textContent = `Stato: Attivo`;
+                }
+
+                // Live Terminal Logs
+                if (Array.isArray(data.logs) && data.logs.length > 0) {
+                    const container = document.getElementById('terminalContainer');
+                    container.innerHTML = data.logs.map(l => `<div class="text-zinc-300 leading-relaxed break-all">${l}</div>`).join('');
+                    container.scrollTop = container.scrollHeight;
                 }
 
                 if (data.is_running !== undefined) {
                     isRunning = Boolean(data.is_running);
-                    updateBotStatusDisplay();
+                } else {
+                    isRunning = true;
                 }
+                updateBotStatusDisplay();
+
             } catch (err) {
-                // Silently handle polling errors
+                document.getElementById('botStatusText').textContent = 'In attesa risposta backend...';
+                document.getElementById('statusIndicator').className = 'h-2.5 w-2.5 rounded-full bg-amber-500 animate-pulse';
             }
         }
 
@@ -212,4 +243,62 @@
             const text = document.getElementById('botStatusText');
             const btn = document.getElementById('btnToggle');
 
+            if (!indicator || !text || !btn) return;
+
             if (isRunning) {
+                indicator.className = 'h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse';
+                text.textContent = 'ATTIVO';
+                text.className = 'text-xs px-2 py-0.5 rounded border border-emerald-900 bg-emerald-950 text-emerald-400 font-mono';
+                btn.innerHTML = '<i data-lucide="pause" class="w-3.5 h-3.5"></i> PAUSA BOT';
+            } else {
+                indicator.className = 'h-2.5 w-2.5 rounded-full bg-amber-500';
+                text.textContent = 'IN PAUSA';
+                text.className = 'text-xs px-2 py-0.5 rounded border border-amber-900 bg-amber-950 text-amber-400 font-mono';
+                btn.innerHTML = '<i data-lucide="play" class="w-3.5 h-3.5"></i> AVVIA BOT';
+            }
+            lucide.createIcons();
+        }
+
+        async function triggerScan() {
+            addLog('Avvio scansione manuale...', 'system');
+            try {
+                const res = await fetch('/api/scan', { method: 'POST' });
+                const data = await res.json();
+                addLog(data.message || 'Scansione completata con successo', 'success');
+                fetchStatus();
+            } catch (err) {
+                addLog('Errore durante la scansione: ' + err.message, 'error');
+            }
+        }
+
+        async function toggleBot() {
+            try {
+                const res = await fetch('/api/toggle', { method: 'POST' });
+                const data = await res.json();
+                isRunning = data.is_running !== undefined ? data.is_running : !isRunning;
+                updateBotStatusDisplay();
+                addLog(isRunning ? 'Bot riavviato' : 'Bot messo in pausa', 'warn');
+            } catch (err) {
+                addLog('Errore cambio stato bot: ' + err.message, 'error');
+            }
+        }
+
+        async function liquidateAll() {
+            if (!confirm('SEI SICURO? Questa azione chiuderà TUTTE le posizioni aperte su Alpaca.')) return;
+            addLog('INVIO ORDINE DI LIQUIDAZIONE TOTALE...', 'error');
+            try {
+                const res = await fetch('/api/liquidate', { method: 'POST' });
+                const data = await res.json();
+                addLog(data.message || 'Liquidazione completata.', 'success');
+                fetchStatus();
+            } catch (err) {
+                addLog('Errore liquidazione: ' + err.message, 'error');
+            }
+        }
+
+        // Auto-polling ogni 3 secondi
+        fetchStatus();
+        setInterval(fetchStatus, 3000);
+    </script>
+</body>
+</html>
