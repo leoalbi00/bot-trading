@@ -44,12 +44,20 @@ GROQ_MODELS = list(dict.fromkeys(GROQ_MODELS))  # rimuove duplicati mantenendo l
 # Contesto per i modelli di chat: senza, alcuni rifiutano le richieste di tipo finanziario
 AI_SYSTEM_PROMPT = (
     "Sei il modulo decisionale di un bot di trading algoritmico che opera su un conto paper (simulato) Alpaca. "
-    "Le tue risposte vengono lette da un programma: rispondi sempre iniziando con 'DECISIONE: BUY', 'DECISIONE: SELL' "
-    "o 'DECISIONE: HOLD' (solo le opzioni ammesse dal prompt), seguita da una breve motivazione tecnica."
+    "Le tue risposte vengono lette da un programma: rispondi sempre nel formato richiesto, iniziando con "
+    "'DECISIONE: BUY', 'DECISIONE: SELL' o 'DECISIONE: HOLD' (solo le opzioni ammesse dal prompt), "
+    "poi 'SCORE: <0-100>' e 'MOTIVO: <breve spiegazione tecnica>'."
 )
 
 MIN_ORDER_USD = 10.0
 HTTP_TIMEOUT = 10
+
+# Regole di uscita attiva e rotazione del capitale
+STALL_ROC_PCT = 0.5            # |ROC(10)| sotto questa soglia = prezzo in stallo
+STALL_MIN_CYCLES = 3           # cicli consecutivi in portafoglio prima di vendere per stallo
+REVERSAL_ROC_PCT = -2.0        # ROC(10) sotto questa soglia con prezzo < SMA20 = inversione ribassista
+ROTATION_FUNDS_THRESHOLD = 50  # sotto questi fondi si valuta la rotazione del capitale
+ROTATION_MIN_SCORE = 80        # score minimo del nuovo asset per giustificare la rotazione
 
 # ---------------------------------------------------------------------------
 # Configurazione dinamica (config.json)
@@ -71,7 +79,10 @@ LEGACY_PROVIDERS = {"claude": "gemini"}
 _TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,15}$")
 
 DEFAULT_CONFIG = {
-    "watchlist": ["BTC-USD", "ETH-USD", "SOL-USD", "NVDA", "AAPL", "TSLA", "MSFT", "AMD"],
+    "watchlist": [
+        "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD",
+        "NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META", "PLTR", "COIN", "SMCI",
+    ],
     "max_allocation_pct": 15.0,
     "stop_loss_pct": -5.0,
     "scan_interval_min": 15,
@@ -261,6 +272,15 @@ def to_yf_symbol(alpaca_symbol, crypto=None):
 # ---------------------------------------------------------------------------
 # IA
 # ---------------------------------------------------------------------------
+_SCORE_RE = re.compile(r"SCORE[\s*_`]*[:=]?[\s*_`\[]*(\d{1,3})", re.IGNORECASE)
+
+
+def parse_score(text):
+    """Estrae SCORE: 0-100 dalla risposta, oppure None."""
+    match = _SCORE_RE.search(text or "")
+    return max(0, min(100, int(match.group(1)))) if match else None
+
+
 def parse_decision(text, allowed=("BUY", "SELL", "HOLD")):
     """Estrae la decisione dal testo dell'IA. In caso di dubbio restituisce HOLD."""
     if not text:
@@ -374,8 +394,10 @@ def summarize_reason(text, limit=160):
     """Motivazione compatta su una riga, senza il prefisso 'DECISIONE: X'."""
     if not text:
         return ""
-    reason = _DECISION_RE.sub("", text, count=1)
+    reason = _DECISION_RE.sub("", text.replace("**", ""), count=1)
     reason = re.sub(r"\s+", " ", reason).strip(" -–—|:*.\n")
+    reason = _SCORE_RE.sub("", reason, count=1)
+    reason = re.sub(r"^[\s|:\-–—*\]]*", "", reason)
     reason = re.sub(r"^(MOTIVO|MOTIVAZIONE)\s*:\s*", "", reason, flags=re.IGNORECASE)
     return reason[:limit] + "…" if len(reason) > limit else reason
 
@@ -475,7 +497,7 @@ def _ask_gemini(prompt, log):
 
     for model in models:
         try:
-            res = _gemini_client.models.generate_content(model=model, contents=prompt)
+            res = _gemini_client.models.generate_content(model=model, contents=f"{AI_SYSTEM_PROMPT}\n\n{prompt}")
             if res and res.text:
                 _last_model["gemini"] = f"Gemini {model}"
                 return res.text
@@ -520,18 +542,132 @@ def get_recent_news(yf_symbol, limit=3):
 
 
 def get_indicators(yf_symbol):
-    """RSI(14), SMA(20) e prezzo su candele 1h dell'ultimo mese, oppure None."""
+    """Indicatori su candele 1h degli ultimi 3 mesi, oppure None se i dati sono insufficienti.
+
+    RSI(14), MACD(12,26,9) con istogramma e incroci recenti, ROC(10), SMA20, SMA50.
+    """
     try:
-        df = yf.Ticker(yf_symbol).history(period="1mo", interval="1h")
-        if len(df) >= 20:
-            close = df["Close"]
-            return {
-                "rsi": round(float(ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]), 2),
-                "sma20": float(ta.trend.SMAIndicator(close, window=20).sma_indicator().iloc[-1]),
-                "price": float(close.iloc[-1]),
-            }
+        df = yf.Ticker(yf_symbol).history(period="3mo", interval="1h")
+        if len(df) < 60:
+            return None
+        return compute_indicators(df["Close"])
     except Exception:
-        pass
+        return None
+
+
+def compute_indicators(close):
+    """Calcola gli indicatori da una serie di prezzi di chiusura (almeno 60 valori)."""
+    macd = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
+    hist = macd.macd_diff()
+    # Incrocio MACD/segnale nelle ultime 3 candele
+    recent = hist.iloc[-4:]
+    cross = None
+    for prev, cur in zip(recent.iloc[:-1], recent.iloc[1:]):
+        if prev <= 0 < cur:
+            cross = "rialzista"
+        elif prev >= 0 > cur:
+            cross = "ribassista"
+    return {
+        "price": float(close.iloc[-1]),
+        "rsi": round(float(ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]), 2),
+        "macd": float(macd.macd().iloc[-1]),
+        "macd_signal": float(macd.macd_signal().iloc[-1]),
+        "macd_hist": float(hist.iloc[-1]),
+        "macd_cross": cross,
+        "roc": round(float(ta.momentum.ROCIndicator(close, window=10).roc().iloc[-1]), 2),
+        "sma20": float(ta.trend.SMAIndicator(close, window=20).sma_indicator().iloc[-1]),
+        "sma50": float(ta.trend.SMAIndicator(close, window=50).sma_indicator().iloc[-1]),
+    }
+
+
+def ta_score(ind):
+    """Punteggio tecnico 0-100: >50 rialzista, <50 ribassista."""
+    score = 50.0
+    rsi = ind["rsi"]
+    if rsi < 30:
+        score += 15
+    elif rsi > 70:
+        score -= 15
+    score += 10 if ind["macd_hist"] > 0 else -10
+    score += 5 if ind["macd"] > 0 else -5
+    if ind["macd_cross"] == "rialzista":
+        score += 10
+    elif ind["macd_cross"] == "ribassista":
+        score -= 10
+    score += max(-15.0, min(15.0, ind["roc"] * 3))
+    score += 10 if ind["sma20"] > ind["sma50"] else -10
+    score += 5 if ind["price"] > ind["sma20"] else -5
+    return int(max(0, min(100, round(score))))
+
+
+def ta_exit_signal(ind):
+    """Segnali tecnici di uscita: ('ribassista' | 'stallo' | None, motivo)."""
+    bearish_cross = ind["macd_cross"] == "ribassista"
+    if bearish_cross and ind["price"] < ind["sma20"]:
+        return "ribassista", "incrocio MACD ribassista con prezzo sotto SMA20"
+    if ind["sma20"] < ind["sma50"] and ind["macd"] < 0 and ind["roc"] < -STALL_ROC_PCT:
+        return "ribassista", f"SMA20 sotto SMA50, MACD negativo e ROC {ind['roc']:.2f}%"
+    if ind["price"] < ind["sma20"] and ind["macd_hist"] < 0 and ind["roc"] <= REVERSAL_ROC_PCT:
+        return "ribassista", f"inversione: prezzo sotto SMA20, MACD in calo e ROC {ind['roc']:.2f}%"
+    if abs(ind["roc"]) <= STALL_ROC_PCT and (ind["macd_hist"] < 0 or bearish_cross):
+        return "stallo", f"ROC {ind['roc']:.2f}% piatto e MACD {'in incrocio ribassista' if bearish_cross else 'negativo'}"
+    return None, ""
+
+
+def format_indicators(ind):
+    trend = "rialzista (SMA20 > SMA50)" if ind["sma20"] > ind["sma50"] else "ribassista (SMA20 < SMA50)"
+    cross = f", incrocio {ind['macd_cross']} recente" if ind["macd_cross"] else ""
+    return (
+        f"- Prezzo: ${ind['price']:.4f}\n"
+        f"- RSI(14, 1h): {ind['rsi']:.1f}\n"
+        f"- MACD(12,26,9): {ind['macd']:.4f}, segnale {ind['macd_signal']:.4f}, istogramma {ind['macd_hist']:.4f}{cross}\n"
+        f"- ROC(10): {ind['roc']:.2f}%\n"
+        f"- SMA20: ${ind['sma20']:.4f} | SMA50: ${ind['sma50']:.4f} → trend {trend}\n"
+        f"- Score tecnico: {ta_score(ind)}/100"
+    )
+
+
+def build_analysis_prompt(symbol, ind, news, position=None):
+    """Prompt per l'IA. Con `position` valuta SELL/HOLD, altrimenti BUY/HOLD."""
+    if position:
+        context = (
+            f"- Posizione aperta: {position['qty']} quote, valore ${position['market_value']:.2f}, "
+            f"PnL ${position['unrealized_pl']:.2f} ({position['unrealized_plpc']:.2f}%)\n"
+        )
+        options, task = "SELL|HOLD", (
+            "Decidi se VENDERE ora (trend ribassista, inversione, perdita di momentum o stallo che immobilizza capitale) "
+            "oppure MANTENERE la posizione."
+        )
+    else:
+        context = "- Posizione: non in portafoglio\n"
+        options, task = "BUY|HOLD", "Decidi se ACQUISTARE ora oppure attendere."
+    return (
+        f"Sei un trader quantitativo di Wall Street orientato alla rotazione del capitale. Analizza i dati per {symbol}.\n"
+        f"{context}{format_indicators(ind)}\n"
+        f"- Notizie recenti: {news}\n\n"
+        f"{task}\n"
+        f"Restituisci la decisione nel formato esatto:\n"
+        f"DECISIONE: [{options}]\n"
+        f"SCORE: [0-100] (forza del segnale rialzista: 100 = acquisto molto forte, 0 = forte ribasso)\n"
+        f"MOTIVO: [Breve spiegazione focalizzata su momentum, trend e rischio stallo]"
+    )
+
+
+def wait_for_fill(order_id, timeout=20, log=print):
+    """Attende l'esecuzione di un ordine. Restituisce l'ordine eseguito oppure None."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            order = alpaca_client.get_order_by_id(order_id)
+            status = str(getattr(order.status, "value", order.status)).lower()
+            if status == "filled":
+                return order
+            if status in ("canceled", "expired", "rejected"):
+                log(f"Ordine {order_id} non eseguito: {status}")
+                return None
+        except Exception as e:
+            log(f"Errore controllo ordine {order_id}: {e}")
+        time.sleep(2)
     return None
 
 
@@ -558,8 +694,9 @@ def quant_decision(yf_symbol, log=print):
         return "DECISIONE: HOLD | MOTIVO: [Quant] dati di mercato insufficienti"
     decision, reason = quant_rule(ind["rsi"], ind["price"], ind["sma20"])
     detail = f"prezzo ${ind['price']:.2f}, SMA20 ${ind['sma20']:.2f}"
-    log(f"🧮 [Quant] {yf_symbol}: {decision} ({reason}; {detail})")
-    return f"DECISIONE: {decision} | MOTIVO: [Quant] {reason}; {detail}"
+    score = ta_score(ind)
+    log(f"🧮 [Quant] {yf_symbol}: {decision} ({reason}; {detail}; score {score})")
+    return f"DECISIONE: {decision} | SCORE: {score} | MOTIVO: [Quant] {reason}; {detail}"
 
 
 # ---------------------------------------------------------------------------
