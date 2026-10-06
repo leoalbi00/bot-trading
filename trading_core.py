@@ -302,6 +302,7 @@ def _no_ai_keys(log):
 def query_ai(prompt, log=print, symbol=None):
     """Interroga il motore scelto in config.json (gemini / groq / hybrid / quant).
 
+    - gemini / groq: se il motore scelto non risponde si prova l'altra IA.
     - hybrid: si opera solo se Gemini e Groq sono d'accordo, altrimenti HOLD;
       se uno dei due non risponde si usa l'altro.
     - Se nessuna IA risponde (o non ci sono chiavi) e `symbol` è indicato,
@@ -325,10 +326,15 @@ def query_ai(prompt, log=print, symbol=None):
             log(f"⚠️ Modalità Ibrida: {failed} non ha risposto, decisione basata solo su {working}.")
             return gemini_res or groq_res
         result = None
-    elif provider == "groq":
-        result = _ask_groq(prompt, log)
     else:
-        result = _ask_gemini(prompt, log)
+        # Motore scelto, poi l'altra IA (se ha la chiave) prima del motore quantitativo
+        ask = {"gemini": (_ask_gemini, "Gemini", GEMINI_KEY), "groq": (_ask_groq, "Groq", GROQ_KEY)}
+        primary_fn, primary_name, _ = ask[provider]
+        backup_fn, backup_name, backup_key = ask["groq" if provider == "gemini" else "gemini"]
+        result = primary_fn(prompt, log)
+        if not result and backup_key:
+            log(f"🔁 {primary_name} non ha risposto: provo {backup_name} come riserva.")
+            result = backup_fn(prompt, log)
 
     if result:
         return result
