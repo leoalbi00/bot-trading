@@ -33,7 +33,20 @@ GEMINI_MODELS = [m.strip() for m in os.getenv(
     "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash",
 ).split(",") if m.strip()]
 GEMINI_TIMEOUT_MS = 45000
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Modelli Groq in ordine di preferenza; quelli in 404 vengono esclusi automaticamente.
+# GROQ_MODEL (singolo) resta supportato e viene provato per primo.
+GROQ_MODELS = [m.strip() for m in (os.getenv("GROQ_MODEL", "") + "," + os.getenv(
+    "GROQ_MODELS",
+    "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b,llama-3.3-70b-versatile",
+)).split(",") if m.strip()]
+GROQ_MODELS = list(dict.fromkeys(GROQ_MODELS))  # rimuove duplicati mantenendo l'ordine
+
+# Contesto per i modelli di chat: senza, alcuni rifiutano le richieste di tipo finanziario
+AI_SYSTEM_PROMPT = (
+    "Sei il modulo decisionale di un bot di trading algoritmico che opera su un conto paper (simulato) Alpaca. "
+    "Le tue risposte vengono lette da un programma: rispondi sempre iniziando con 'DECISIONE: BUY', 'DECISIONE: SELL' "
+    "o 'DECISIONE: HOLD' (solo le opzioni ammesse dal prompt), seguita da una breve motivazione tecnica."
+)
 
 MIN_ORDER_USD = 10.0
 HTTP_TIMEOUT = 10
@@ -352,8 +365,11 @@ def query_groq_ai(prompt, log=print):
     return _ask_groq(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Groq"
 
 
+_unavailable_groq_models = set()
+
+
 def _ask_groq(prompt, log):
-    """Testo della risposta di Groq, oppure None se non disponibile. Gli errori vengono loggati."""
+    """Prova i modelli Groq in sequenza; restituisce il testo o None. Gli errori vengono loggati."""
     global _groq_client
     if not GROQ_KEY:
         log("⚠️ GROQ_API_KEY non configurata.")
@@ -362,25 +378,41 @@ def _ask_groq(prompt, log):
         import groq
         if _groq_client is None:
             _groq_client = groq.Groq(api_key=GROQ_KEY, timeout=45, max_retries=1)
-        res = _groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = res.choices[0].message.content if res.choices else None
-        if text:
-            return text
-        log(f"⚠️ Groq {GROQ_MODEL}: risposta vuota.")
     except Exception as e:
-        kind = type(e).__name__
-        if kind == "RateLimitError":
-            log(f"⚠️ Groq {GROQ_MODEL}: limite di richieste raggiunto (429).")
-        elif kind == "NotFoundError":
-            log(f"⚠️ Groq {GROQ_MODEL}: modello non disponibile (404), imposta GROQ_MODEL.")
-        elif kind == "AuthenticationError":
+        log(f"❌ Impossibile inizializzare il client Groq: {e}")
+        return None
+
+    models = [m for m in GROQ_MODELS if m not in _unavailable_groq_models]
+    if not models:
+        log("❌ Nessun modello Groq disponibile: aggiorna GROQ_MODELS.")
+        return None
+
+    for model in models:
+        try:
+            res = _groq_client.chat.completions.create(
+                model=model,
+                max_tokens=1024,
+                messages=[
+                    {"role": "system", "content": AI_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            text = res.choices[0].message.content if res.choices else None
+            if text and _DECISION_RE.search(text):
+                return text
+            log(f"⚠️ Groq {model}: risposta senza decisione, provo il modello successivo.")
+        except groq.NotFoundError:
+            _unavailable_groq_models.add(model)
+            log(f"⚠️ Groq {model}: modello non disponibile (404), escluso. Provo il successivo.")
+        except groq.RateLimitError:
+            log(f"⚠️ Groq {model}: limite di richieste raggiunto (429), provo il modello successivo.")
+        except groq.AuthenticationError:
             log("❌ Groq: GROQ_API_KEY non valida.")
-        else:
-            log(f"❌ Errore Groq ({GROQ_MODEL}): {str(e)[:200]}")
+            return None
+        except Exception as e:
+            log(f"❌ Errore Groq ({model}): {str(e)[:200]}")
+
+    log("❌ Tutti i modelli Groq hanno fallito.")
     return None
 
 
