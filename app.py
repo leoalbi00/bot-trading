@@ -237,7 +237,9 @@ def describe_decision(d):
 def badge(agent, value, tone="ok"):
     return {"agent": agent, "value": value, "tone": tone}
 
-def run_trading_cycle(manual=False):
+def run_trading_cycle(manual=False, boot=False):
+    """Ciclo del boardroom. Con boot=True (primo ciclo dopo avvio/deploy) non esegue acquisti né rotazioni:
+    solo analisi e vendite difensive, così un deploy non apre mai nuove posizioni."""
     # Verifica che non ci sia un'altra scansione in corso
     if not scan_lock.acquire(blocking=False):
         log_message("⚠️ Scansione già in corso. Attendi il completamento.")
@@ -247,6 +249,8 @@ def run_trading_cycle(manual=False):
         bot_state["status"] = "Scansione & Valutazione in corso..."
         bot_state["last_scan"] = core.now_local().strftime("%Y-%m-%d %H:%M:%S")
         log_message("=== AVVIO VIRTUAL BOARDROOM (8 AGENTI) ===")
+        if boot:
+            log_message("🌅 Ciclo di avvio: solo analisi e vendite difensive, nessun acquisto dopo il deploy.")
 
         cfg = core.get_config()
         auto_trade = cfg["auto_execute_trades"]
@@ -354,7 +358,11 @@ def run_trading_cycle(manual=False):
                          + (f", stop {stop:.1f}%" if stop is not None else ""))
             log_message(f"💼 [CIO] {final['buy_symbol']}: {exec_note}")
 
-        if not orders_allowed or final["action"] == "HOLD":
+        if boot and final["action"] in ("BUY", "ROTATE"):
+            log_message(f"🌅 [Avvio] {describe_decision(final)} non eseguito: acquisti sospesi nel ciclo di avvio "
+                        f"(riprendono tra {cfg['scan_interval_min']} minuti).")
+            exec_note = (exec_note + " · " if exec_note else "") + "sospeso (ciclo di avvio)"
+        elif not orders_allowed or final["action"] == "HOLD":
             pass
         elif final["action"] == "BUY":
             _, allocation = core.buy_budget(acc, risk["exposure"], cfg, crypto=crypto, pct=pct_eff)
@@ -410,13 +418,15 @@ def run_trading_cycle(manual=False):
 def background_loop():
     time.sleep(3)  # Pausa di 3 secondi all'avvio per caricamento server
     last_run = 0.0
+    boot = True  # il primo ciclo dopo l'avvio non apre posizioni
     while True:
         # L'intervallo viene riletto da config.json a ogni giro
         interval = core.get_config()["scan_interval_min"] * 60
         if bot_state["active"] and time.time() - last_run >= interval:
             last_run = time.time()
             try:
-                run_trading_cycle()
+                run_trading_cycle(boot=boot)
+                boot = False
             except Exception as e:
                 log_message(f"Errore loop background: {e}")
         # Controlla ogni 30s; si risveglia subito se il bot viene riattivato
