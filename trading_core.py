@@ -1918,6 +1918,31 @@ EXECUTED, EXPIRED = "EXECUTED", "EXPIRED"
 ACTIVE_STATES = (SUBMITTED_PITCH, UNDER_REVIEW, APPROVED_BY_RISK)
 
 _registry_lock = threading.RLock()   # registro condiviso tra thread dello sciame e del CIO
+
+# Agent dialogue: telemetria in tempo reale degli agenti (buffer circolare in memoria)
+from collections import deque as _deque
+import itertools as _itertools
+_dialogue = _deque(maxlen=250)
+_dialogue_ids = _itertools.count(1)
+_dialogue_lock = threading.Lock()
+_last_scout_results = {}             # ultimo risultato per ticker (per i canali aggregati della dashboard)
+
+
+def agent_say(agent, text, level="info"):
+    """Aggiunge una riga al feed live degli agenti."""
+    with _dialogue_lock:
+        _dialogue.append({"id": next(_dialogue_ids), "ts": time.time(), "time": now_local().strftime("%H:%M:%S"),
+                          "agent": agent, "text": text, "level": level})
+
+
+def dialogue_head():
+    with _dialogue_lock:
+        return _dialogue[-1]["id"] if _dialogue else 0
+
+
+def dialogue_since(since_id=0):
+    with _dialogue_lock:
+        return [d for d in _dialogue if d["id"] > since_id]
 _REGISTRY_DEFAULT = {"scouts": {}, "radar": {}, "queue": [], "recent": [], "cooldown": {}, "history": [],
                      "channels": {}}
 _tradable_cache = {}
@@ -1975,6 +2000,8 @@ def run_orchestrator_service(log=print):
         for p in expired:
             _close(reg, p, EXPIRED, f"non lavorata entro {PROPOSAL_TTL_MIN} minuti (dati stantii)")
         reg["cooldown"] = {s: until for s, until in reg["cooldown"].items() if until > now}
+        for p in expired:
+            agent_say("Chief of Staff", f"{p['symbol']} → EXPIRED (TTL {PROPOSAL_TTL_MIN} min)", "muted")
         if expired:
             log(f"🗂️ [Chief of Staff] Schede scadute (TTL {PROPOSAL_TTL_MIN} min): {', '.join(p['symbol'] for p in expired)}")
         _save_registry(reg)
@@ -2322,11 +2349,8 @@ def risk_committee(pitch, ctx, fng):
 
 
 # ---------------------------------------------------------------- ciclo dello sciame
-def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None):
-    """Tier 1 -> 2 -> 3: scansione parallela di tutti i panieri, schede all'Orchestrator, revisione immediata."""
-    t0 = time.perf_counter()
-    reg = run_orchestrator_service(log=log)
-    market_open = is_market_open(log=lambda m: None) if alpaca_client else True
+def swarm_baskets(market_open):
+    """Panieri attivi con i loro ticker (a mercato chiuso solo crypto)."""
     baskets = []
     for name, tickers in desk_universe():
         if tickers is None:
@@ -2335,8 +2359,38 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None):
             tickers = [t for t in tickers if is_crypto(t)]  # a mercato chiuso lavorano solo gli scout crypto
         if tickers:
             baskets.append((name, tickers))
+    return baskets
+
+
+def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotate=False):
+    """Tier 1 -> 2 -> 3: scansione parallela, schede all'Orchestrator, revisione immediata.
+
+    rotate=True: un solo paniere per chiamata, a rotazione (scansione continua, feed sempre attivo);
+    rotate=False: tutti i panieri insieme.
+    """
+    reg = run_orchestrator_service(log=log)
+    market_open = is_market_open(log=lambda m: None) if alpaca_client else True
+    all_baskets = swarm_baskets(market_open)
+    if not all_baskets:
+        return None
+    baskets = all_baskets
+    if rotate:
+        names = [n for n, _ in DESK_BASKETS]
+        idx = int(reg["radar"].get("basket_index", 0)) % len(names)
+        available = {n for n, _ in all_baskets}
+        for step in range(len(names)):
+            name = names[(idx + step) % len(names)]
+            if name in available:
+                baskets = [b for b in all_baskets if b[0] == name]
+                with _registry_lock:
+                    reg = load_scout_registry()
+                    reg["radar"]["basket_index"] = (names.index(name) + 1) % len(names)
+                    _save_registry(reg)
+                break
     universe = {t: name for name, tickers in baskets for t in tickers}
     tickers = list(universe)
+    scout_no = {t: i + 1 for i, t in enumerate(t for _, ts in all_baskets for t in ts)}
+    agent_say("Chief of Staff", f"Paniere {', '.join(n for n, _ in baskets)}: {len(tickers)} micro-scout in partenza")
 
     t_dl = time.perf_counter()
     f15 = _download(tickers, "5d", "15m")
@@ -2349,23 +2403,44 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None):
     def ref_for(sym):
         return f1d.get("BTC-USD") if is_crypto(sym) else f1d.get("SPY")
 
+    def run_one(sym):
+        r = micro_scout(sym, universe[sym], f15.get(sym), f1h.get(sym), f1d.get(sym), ref_for(sym))
+        tag = f"Scout #{scout_no.get(sym, 0):02d}"
+        if not r:
+            agent_say(tag, f"{sym} → dati insufficienti", "muted")
+        else:
+            verdict = ("ANOMALIA → pitch al Chief of Staff" if r["pitch"]
+                       else ("anomalia senza forza (score ≤ 75)" if r["anomalies"] else "nessuna anomalia"))
+            agent_say(tag, f"{sym} → score {r['score']} · MTF {r['mtf_aligned']}/3 · RVOL {r['rvol']}x · "
+                           f"VWAP {r['vwap_dist_pct']}% · {verdict} ({r['elapsed_ms']}ms CPU)",
+                      "alert" if r["pitch"] else "info")
+        return r
+
     t_sc = time.perf_counter()
     with ThreadPoolExecutor(max_workers=max(1, min(SCOUT_MAX_WORKERS, len(tickers)))) as pool:
-        results = [r for r in pool.map(lambda s: micro_scout(s, universe[s], f15.get(s), f1h.get(s), f1d.get(s), ref_for(s)),
-                                       tickers) if r]
+        results = [r for r in pool.map(run_one, tickers) if r]
     scouts_ms = round((time.perf_counter() - t_sc) * 1000, 1)
     max_scout_ms = max((r["elapsed_ms"] for r in results), default=0)
+
+    # Canali aggregati: ultimo risultato di ogni ticker dei panieri ancora attivi
+    active_universe = {t for _, ts in all_baskets for t in ts}
+    for r in results:
+        _last_scout_results[r["symbol"]] = r
+    for sym in list(_last_scout_results):
+        if sym not in active_universe:
+            _last_scout_results.pop(sym, None)
+    merged = list(_last_scout_results.values())
 
     channels = {
         "timestamp": now_local().isoformat(timespec="seconds"),
         "macro": macro, "fear_greed": fng,
-        "scouts": len(results), "workers": min(SCOUT_MAX_WORKERS, len(tickers)), "download_s": download_s,
-        "scouts_ms": scouts_ms, "max_scout_ms": max_scout_ms,
-        "baskets": [{"name": n, "tickers": len(t), "anomalies": sum(1 for r in results if r["sector"] == n and r["anomalies"])}
-                    for n, t in baskets],
+        "scouts": len(merged), "workers": min(SCOUT_MAX_WORKERS, len(tickers)), "download_s": download_s,
+        "scouts_ms": scouts_ms, "max_scout_ms": max_scout_ms, "last_basket": ", ".join(n for n, _ in baskets),
+        "baskets": [{"name": n, "tickers": len(t), "anomalies": sum(1 for r in merged if r["sector"] == n and r["anomalies"])}
+                    for n, t in all_baskets],
         "top": sorted(({"symbol": r["symbol"], "sector": r["sector"], "score": r["score"], "mtf": r["mtf_aligned"],
                         "rvol": r["rvol"], "vwap_dist": r["vwap_dist_pct"], "beta": r["beta"], "corr": r["corr"]}
-                       for r in results), key=lambda x: x["score"], reverse=True)[:12],
+                       for r in merged), key=lambda x: x["score"], reverse=True)[:12],
     }
 
     new_pitches, skipped = [], []
@@ -2388,6 +2463,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None):
             pitch.pop("pitch", None)
             reg["queue"].append(pitch)
             new_pitches.append(pitch)
+            agent_say("Chief of Staff", f"{r['symbol']} registrato SUBMITTED_PITCH (TTL {PROPOSAL_TTL_MIN} min) → Comitato Rischi", "alert")
         reg["queue"] = reg["queue"][-QUEUE_MAX:]
         reg["channels"] = channels
         entry = {"scout_id": SCOUT_ID, "timestamp": channels["timestamp"], "tickers": len(results),
@@ -2397,7 +2473,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None):
         reg["radar"]["last_scan_epoch"] = _now_epoch()
         _save_registry(reg)
 
-    log(f"📡 [Sciame] {len(results)} micro-scout su {len(baskets)} panieri | dati {download_s}s, calcoli {scouts_ms}ms "
+    log(f"📡 [Sciame] {', '.join(n for n, _ in baskets)}: {len(results)} micro-scout | dati {download_s}s, calcoli {scouts_ms}ms "
         f"(CPU max {max_scout_ms}ms/scout) | VIX {macro['vix']} | "
         + (f"schede → Chief of Staff: {', '.join(p['symbol'] + ' (' + ', '.join(p['anomalies']) + ')' for p in new_pitches)}"
            if new_pitches else "nessuna nuova anomalia")
@@ -2420,14 +2496,19 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None):
                 continue
             p["review"] = {k: v[k] for k in ("gates", "vetoes", "score", "audit", "elapsed_ms")}
             p["updated_at"] = now_local().isoformat(timespec="seconds")
+            for g in v["gates"]:
+                agent_say(g["agent"], f"{p['symbol']} → {'VETO: ' + g['reason'] if g['veto'] else 'ok'} ({g['detail']})",
+                          "veto" if g["veto"] else "info")
             if v["approved"]:
                 p["status"], p["package"], p["score"] = APPROVED_BY_RISK, v["package"], v["score"]
                 approved.append(p["symbol"])
+                agent_say("Chief of Staff", f"{p['symbol']} → APPROVED_BY_RISK, in attesa del CIO", "ok")
                 log(f"🛡️ [Comitato Rischi] {p['symbol']} APPROVATO in {v['elapsed_ms']}ms → CIO "
                     f"(target ${v['package']['target_price']:,.4f}, stop {v['package']['stop_pct']:.1f}%)")
             else:
                 reg["cooldown"][normalize_symbol(p["symbol"])] = _now_epoch() + REJECT_COOLDOWN_MIN * 60
                 _close(reg, p, REJECTED_BY_RISK, " | ".join(v["vetoes"]))
+                agent_say("Chief of Staff", f"{p['symbol']} → REJECTED_BY_RISK, cooldown {REJECT_COOLDOWN_MIN} min", "veto")
                 log(f"⛔ [Comitato Rischi] {p['symbol']} VETO: {' | '.join(v['vetoes'])} "
                     f"(cooldown {REJECT_COOLDOWN_MIN} min, feedback allo sciame)")
         _save_registry(reg)

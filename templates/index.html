@@ -48,9 +48,8 @@
                 <span class="hidden md:inline text-xs text-slate-600 num" x-text="bot.status || ''"></span>
             </div>
             <nav class="flex items-center gap-1.5 text-xs shrink-0">
-                <button @click="scan()" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 inline-flex items-center gap-1.5">
-                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">Scansiona</span>
-                </button>
+                <button @click="forceCio()" title="Forza il CIO a valutare subito le schede in coda"
+                        class="h-7 px-2.5 rounded border border-amber-800/70 text-amber-300 hover:bg-amber-950/50 whitespace-nowrap">⚡ Forza CIO</button>
                 <button @click="toggleBot()" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200"
                         x-text="bot.active ? 'Pausa' : 'Riprendi'"></button>
                 <button @click="showSettings = true" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 inline-flex items-center gap-1.5">
@@ -105,6 +104,28 @@
             <span>Permanenza media <span class="num text-slate-200" x-text="duration(perf.avg_held_min)"></span></span>
             <span x-show="perf.best">Migliore <span class="num text-emerald-400" x-text="perf.best ? perf.best.symbol + ' ' + usd(perf.best.pnl, true) : ''"></span></span>
             <span x-show="perf.worst">Peggiore <span class="num text-rose-400" x-text="perf.worst ? perf.worst.symbol + ' ' + usd(perf.worst.pnl, true) : ''"></span></span>
+        </section>
+
+        <!-- ============ AGENT STREAM (telemetria live) ============ -->
+        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
+            <div class="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+                    <span class="h-1.5 w-1.5 rounded-full" :class="streamAlive() ? 'bg-emerald-500' : 'bg-slate-600'"></span>
+                    Agent stream
+                </h2>
+                <span class="text-[11px] text-slate-500 num" x-text="dialogue.length + ' messaggi · aggiornamento 1s'"></span>
+            </div>
+            <div x-ref="stream" @scroll="streamPinned = $refs.stream.scrollHeight - $refs.stream.scrollTop - $refs.stream.clientHeight < 30"
+                 class="h-56 overflow-y-auto scroll-thin px-4 py-2 num text-[11px] leading-relaxed">
+                <template x-for="d in dialogue" :key="d.id">
+                    <div class="flex gap-2 whitespace-nowrap">
+                        <span class="text-slate-600 shrink-0" x-text="d.time"></span>
+                        <span class="shrink-0 w-40 truncate" :class="agentColor(d.agent)" x-text="d.agent"></span>
+                        <span class="truncate" :class="levelColor(d.level)" :title="d.text" x-text="d.text"></span>
+                    </div>
+                </template>
+                <div x-show="!dialogue.length" class="text-slate-500 font-sans">In attesa della telemetria degli agenti…</div>
+            </div>
         </section>
 
         <!-- ============ 5 CANALI DI INTELLIGENCE ============ -->
@@ -424,6 +445,7 @@
                 settings: { watchlist: [] }, envLocked: {},
                 showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
                 localLogs: [], clearedId: 0, clearedTs: 0,
+                logs: [], lastLogId: 0, dialogue: [], lastDialogueId: 0, fetching: false, streamPinned: true,
                 numberFields: [
                     { key: 'stop_loss_pct', label: 'Stop di riserva % (se manca ATR)', step: 0.5, min: -50, max: -0.5 },
                     { key: 'scan_interval_min', label: 'Intervallo di scansione (min)', step: 1, min: 1, max: 1440 },
@@ -434,7 +456,7 @@
                 init() {
                     this.fetchStatus();
                     this.loadSettings();
-                    setInterval(() => this.fetchStatus(), 3000);
+                    setInterval(() => this.fetchStatus(), 1000);
                     this.$nextTick(() => window.lucide && lucide.createIcons());
                 },
 
@@ -527,7 +549,7 @@
                     return 'text-slate-400';
                 },
                 visibleLogs() {
-                    const server = (this.bot.logs || [])
+                    const server = this.logs
                         .filter(l => l && l.id > this.clearedId)
                         .map(l => ({ key: 's' + l.id, ts: l.ts, text: l.text, cls: this.logClass(l.text) }));
                     const local = this.localLogs.filter(l => l.ts > this.clearedTs);
@@ -540,7 +562,7 @@
                     if (this.localLogs.length > 30) this.localLogs.shift();
                 },
                 clearLogs() {
-                    this.clearedId = (this.bot.logs || []).reduce((m, l) => Math.max(m, l.id || 0), this.clearedId);
+                    this.clearedId = this.lastLogId;
                     this.clearedTs = Date.now() / 1000;
                     this.localLogs = [];
                 },
@@ -555,8 +577,10 @@
                     return { res, data };
                 },
                 async fetchStatus() {
+                    if (this.fetching) return;   // niente richieste sovrapposte con il polling a 1s
+                    this.fetching = true;
                     try {
-                        const res = await fetch('/api/data');
+                        const res = await fetch(`/api/data?since_log=${this.lastLogId}&since_dialogue=${this.lastDialogueId}`);
                         if (res.status === 401) { window.location.href = '/login'; return; }
                         if (!res.ok) throw new Error(res.status);
                         const data = await res.json();
@@ -568,10 +592,39 @@
                         this.macro = this.channels.macro || {};
                         this.perf = this.bot.performance || {};
                         this.cio = this.bot.cio || {};
+                        // Log e dialoghi arrivano in modo incrementale; riallineamento dopo un riavvio del server
+                        if ((data.log_head || 0) < this.lastLogId) { this.logs = []; this.lastLogId = 0; this.clearedId = 0; }
+                        if ((data.dialogue_head || 0) < this.lastDialogueId) { this.dialogue = []; this.lastDialogueId = 0; }
+                        const newLogs = this.bot.logs || [];
+                        if (newLogs.length) {
+                            this.logs = this.logs.concat(newLogs).slice(-300);
+                            this.lastLogId = newLogs[newLogs.length - 1].id;
+                        }
+                        const newDialogue = data.agent_dialogue || [];
+                        if (newDialogue.length) {
+                            this.dialogue = this.dialogue.concat(newDialogue).slice(-250);
+                            this.lastDialogueId = newDialogue[newDialogue.length - 1].id;
+                            if (this.streamPinned) this.$nextTick(() => { const b = this.$refs.stream; if (b) b.scrollTop = b.scrollHeight; });
+                        }
                         this.connected = true;
                     } catch (e) {
                         this.connected = false;
+                    } finally {
+                        this.fetching = false;
                     }
+                },
+                streamAlive() {
+                    const last = this.dialogue[this.dialogue.length - 1];
+                    return last && (Date.now() / 1000 - last.ts) < 30;
+                },
+                agentColor(agent) {
+                    if (agent.startsWith('Scout')) return 'text-slate-400';
+                    return { 'Chief of Staff': 'text-sky-400', 'Technical & Liquidity': 'text-violet-400',
+                             'Sentiment & Compliance': 'text-violet-400', 'Risk & ATR': 'text-violet-400',
+                             'CIO': 'text-amber-300', 'Execution Desk': 'text-emerald-400' }[agent] || 'text-slate-300';
+                },
+                levelColor(level) {
+                    return { alert: 'text-amber-300', veto: 'text-rose-400', ok: 'text-emerald-400', muted: 'text-slate-600' }[level] || 'text-slate-300';
                 },
                 async loadSettings() {
                     try {
@@ -617,10 +670,10 @@
                         this.saving = false;
                     }
                 },
-                async scan() {
-                    this.addLog('Scansione manuale richiesta');
+                async forceCio() {
+                    this.addLog('⚡ Forza CIO richiesto');
                     const { res, data } = await this.api('/api/scan');
-                    this.addLog(data.message || (res.ok ? 'Scansione avviata' : 'Errore'), !res.ok);
+                    this.addLog(data.message || (res.ok ? 'CIO attivato' : 'Errore'), !res.ok || data.status === 'warning');
                 },
                 async toggleBot() {
                     const { res, data } = await this.api('/api/toggle');

@@ -18,7 +18,7 @@ KEEP_ALIVE_INTERVAL = 600  # secondi tra un self-ping e l'altro
 # Protezione login: dopo MAX_LOGIN_ATTEMPTS errori l'IP viene bloccato per LOGIN_LOCKOUT secondi
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCKOUT = 300
-DATA_CACHE_TTL = 5  # secondi: limita le chiamate ad Alpaca dal polling della dashboard
+DATA_CACHE_TTL = 2  # secondi: la dashboard interroga ogni secondo, Alpaca al massimo ogni 2 secondi
 
 # Lock per impedire scansioni multiple simultanee
 scan_lock = threading.Lock()
@@ -184,6 +184,7 @@ def execute_sell(pos, label, reason, auto_trade, pending, market_open, pct=100):
         pending.add(core.normalize_symbol(sym))
         note = "" if market_open or pos["is_crypto"] else " (mercato chiuso: eseguito all'apertura)"
         log_message(f"🚨 [Execution Desk] VENDITA{part} ({label}) INVIATA: {sym} (ID: {order.id}){note}")
+        core.agent_say("Execution Desk", f"SELL{part} {sym} ({label}) inviato ad Alpaca", "veto")
         return order
     except Exception as e:
         log_message(f"Errore Vendita {sym}: {e}")
@@ -200,6 +201,7 @@ def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=Non
         order = core.submit_notional_buy(sym, amount, stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction)
         pending.add(core.normalize_symbol(sym))
         log_message(f"✅ [Execution Desk] {label} INVIATO: ${amount:,.2f} di {sym} (stop {stop_pct}%, ID: {order.id})")
+        core.agent_say("Execution Desk", f"BUY {sym} ${amount:,.2f} inviato ad Alpaca (stop {stop_pct}%)", "ok")
         return order
     except Exception as e:
         log_message(f"Errore Ordine Acquisto {sym}: {e}")
@@ -297,6 +299,7 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         channels = core.latest_channels()
         held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
         inbox = [p for p in core.cio_inbox() if core.normalize_symbol(p["symbol"]) not in held_keys | pending]
+        core.agent_say("CIO", f"Ciclo ({'manuale' if manual else trigger}): {len(inbox)} schede APPROVED_BY_RISK da valutare")
         log_message("📥 [CIO] Schede APPROVED_BY_RISK: " + (", ".join(
             f"{p['symbol']} (score {p['score']}, scade tra {max(0, int((p['expires_epoch'] - time.time()) / 60))} min)"
             for p in inbox) if inbox else "nessuna"))
@@ -326,6 +329,12 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
             log_message(f"💼 [CIO] Mandato esecutivo: {describe_decision(final)}"
                         + (f" — {'; '.join(final.get('notes', []))}" if final.get("notes") else "")
                         + (f" — {final['reason']}" if final["action"] == "HOLD" and decision["action"] != "HOLD" else ""))
+
+        core.agent_say("CIO", f"Mandato: {describe_decision(final)}"
+                       + (f" · convinzione {final.get('conviction_score')} · allocazione {final.get('allocation_pct')}%"
+                          if final["action"] in ("BUY", "ROTATE") else "")
+                       + f" — {core.summarize_reason(final['reason'] or decision['reason'], 140)}",
+                       "ok" if final["action"] in ("BUY", "ROTATE") else "info")
 
         # Tier 5: Execution Desk
         suspended = boot and final["action"] in ("BUY", "ROTATE")
@@ -425,7 +434,7 @@ def background_loop():
             cio_wake.wait(15)
 
 def radar_loop():
-    """Tier 1-3: sciame di micro-scout + Chief of Staff + Comitato Rischi ogni RADAR_INTERVAL_SEC.
+    """Tier 1-3: sciame di micro-scout + Chief of Staff + Comitato Rischi, un paniere alla volta in rotazione.
 
     Non invia ordini. Controlla anche gli stop delle posizioni e, se toccati, sveglia subito il CIO.
     """
@@ -437,7 +446,7 @@ def radar_loop():
                 positions = get_open_positions()
                 held = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
                 pending = core.get_pending_order_symbols(log=lambda m: None) or set()
-                core.run_scout_swarm(held_keys=held, pending=pending, log=log_message,
+                core.run_scout_swarm(held_keys=held, pending=pending, log=log_message, rotate=True,
                                      on_approved=lambda: request_cio("schede approvate dal Comitato Rischi"))
                 # Controllo rapido degli stop (stop del CIO salvato nell'ordine, altrimenti quello di riserva)
                 stops = bot_state.get("ledger_open", {})
@@ -449,7 +458,9 @@ def radar_loop():
                         request_cio(f"stop toccato su {p['symbol']}", urgent=True)
             except Exception as e:
                 log_message(f"📡 Errore sciame: {e}")
-        time.sleep(max(10, core.RADAR_INTERVAL_SEC - (time.time() - started)))
+        # Scansione continua: un paniere ogni RADAR_INTERVAL_SEC / numero di panieri (~20s)
+        tick = core.RADAR_INTERVAL_SEC / len(core.DESK_BASKETS)
+        time.sleep(max(5, tick - (time.time() - started)))
 
 def keep_alive_url():
     base = os.getenv("RENDER_EXTERNAL_URL")
@@ -585,12 +596,15 @@ def positions_with_allocation():
 @app.route("/api/data")
 @require_login
 def api_data():
+    # Risposta incrementale: il client indica l'ultimo id di log e di dialogo già ricevuti
+    since_log = request.args.get("since_log", default=0, type=int)
+    since_dialogue = request.args.get("since_dialogue", default=0, type=int)
     with state_lock:
         bot = {
             "active": bot_state["active"],
             "last_scan": bot_state["last_scan"],
             "status": bot_state["status"],
-            "logs": list(bot_state["logs"]),
+            "logs": [l for l in bot_state["logs"] if l["id"] > since_log],
             "latest_ai_analysis": dict(bot_state["latest_ai_analysis"]),
             "cio": dict(bot_state["cio"]),
             "performance": dict(bot_state["performance"]),
@@ -600,6 +614,10 @@ def api_data():
         "positions": positions_with_allocation(),
         "bot": bot,
         "radar": core.radar_snapshot(),
+        "agent_dialogue": core.dialogue_since(since_dialogue),
+        # id più recenti disponibili: se sono inferiori a quelli del client il server è stato riavviato
+        "log_head": bot_state["logs"][-1]["id"] if bot_state["logs"] else 0,
+        "dialogue_head": core.dialogue_head(),
         "sources": {
             "yfinance": "Yahoo Finance API (News & Historical)",
             "alpaca": "Alpaca Paper Trading v2 API",
@@ -633,11 +651,12 @@ def api_settings_post():
 @require_token
 def api_trigger():
     if scan_lock.locked():
-        return jsonify({"status": "warning", "message": "Scansione già in corso!"})
+        return jsonify({"status": "warning", "message": "Il CIO sta già valutando: attendi la fine del ciclo."})
 
-    log_message("⚡ Avvio manuale scansione da Dashboard Web...")
-    threading.Thread(target=run_trading_cycle, kwargs={"manual": True}, daemon=True).start()
-    return jsonify({"status": "success", "message": "Scansione avviata con successo"})
+    log_message("⚡ Forza CIO dalla dashboard: valutazione immediata delle schede in coda.")
+    core.agent_say("CIO", "⚡ Override manuale: valutazione immediata della coda", "alert")
+    threading.Thread(target=run_trading_cycle, kwargs={"manual": True, "trigger": "⚡ Forza CIO"}, daemon=True).start()
+    return jsonify({"status": "success", "message": "CIO attivato: valutazione delle schede in coda"})
 
 @app.route("/api/toggle", methods=["POST"])
 @require_token
