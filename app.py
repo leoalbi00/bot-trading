@@ -34,9 +34,9 @@ bot_state = {
     "last_scan": "In attesa del primo scan...",
     "status": "Inizializzato",
     "logs": deque(maxlen=300),  # ordine cronologico: il più recente è in fondo
-    "boardroom": [],  # badge con il parere dei principali agenti (dashboard)
-    "review": [],     # Reparto Revisione: metriche dei 5 agenti per gli asset valutati
-    "cio": {},        # Decisione esecutiva del CIO
+    "cio": {},           # mandato esecutivo del CIO
+    "performance": {},   # Post-Trade Auditor: win rate, PnL, permanenza media
+    "ledger_open": {},   # per posizione: data di apertura, stop, allocazione e convinzione (da Alpaca)
     "latest_ai_analysis": {
         "symbol": "INIZIALIZZO...",
         "rsi": "--",
@@ -170,154 +170,115 @@ def should_abort():
         return True
     return False
 
-def execute_sell(pos, label, reason, auto_trade, pending, market_open):
-    """Chiude una posizione (o la segnala in modalità Advisor). Restituisce l'ordine o None."""
+def execute_sell(pos, label, reason, auto_trade, pending, market_open, pct=100):
+    """Vendita totale o parziale di una posizione (o segnalazione in modalità Advisor). Restituisce l'ordine o None."""
     sym, qty = pos["symbol"], pos["qty"]
+    part = "" if pct >= 100 else f" ({pct:.0f}%)"
     if not auto_trade:
-        log_message(f"🧭 [Advisor] Suggerita VENDITA ({label}) di {sym} ({qty} quote): ordine non inviato.")
+        log_message(f"🧭 [Advisor] Suggerita VENDITA{part} ({label}) di {sym}: ordine non inviato.")
         return None
     if not alpaca_client:
         return None
     try:
-        order = core.close_position(sym)
+        order = core.close_position_pct(sym, pct)
         pending.add(core.normalize_symbol(sym))
         note = "" if market_open or pos["is_crypto"] else " (mercato chiuso: eseguito all'apertura)"
-        log_message(f"🚨 ORDINE VENDITA ({label}) INVIATO: {sym} {qty} quote (ID: {order.id}){note}")
+        log_message(f"🚨 [Execution Desk] VENDITA{part} ({label}) INVIATA: {sym} (ID: {order.id}){note}")
         return order
     except Exception as e:
         log_message(f"Errore Vendita {sym}: {e}")
         return None
 
-def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=None):
-    """Acquisto a importo (notional) o segnalazione in modalità Advisor. Restituisce l'ordine o None."""
+def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=None, allocation_pct=None, conviction=None):
+    """Acquisto a importo (notional) con stop ATR, allocazione e convinzione salvati nell'ordine."""
     if not auto_trade:
         log_message(f"🧭 [Advisor] Suggerito {label} di ${amount:,.2f} di {sym}: ordine non inviato.")
         return None
     if not alpaca_client:
         return None
     try:
-        order = core.submit_notional_buy(sym, amount, stop_pct=stop_pct)
+        order = core.submit_notional_buy(sym, amount, stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction)
         pending.add(core.normalize_symbol(sym))
-        log_message(f"✅ ORDINE {label} INVIATO: ${amount:,.2f} di {sym} (ID: {order.id})")
+        log_message(f"✅ [Execution Desk] {label} INVIATO: ${amount:,.2f} di {sym} (stop {stop_pct}%, ID: {order.id})")
         return order
     except Exception as e:
         log_message(f"Errore Ordine Acquisto {sym}: {e}")
         return None
 
-def rotate_capital(sell_report, target, cfg, auto_trade, pending, stop_pct=None):
-    """Opportunity Cost Trade: vende sell_report e reinveste il ricavato su target entro il limite di esposizione."""
-    pos = sell_report["pos"]
+def rotate_capital(pos, sell_pct, target, amount, cfg, auto_trade, pending, stop_pct=None, allocation_pct=None, conviction=None):
+    """Rotazione asimmetrica: vende il sell_pct% di pos e reinveste su target entro il limite di esposizione."""
     if not auto_trade:
-        log_message(f"🧭 [Advisor] Rotazione suggerita {pos['symbol']} → {target}: ordini non inviati.")
+        log_message(f"🧭 [Advisor] Rotazione suggerita: vendi {sell_pct:.0f}% di {pos['symbol']} → ${amount:,.2f} di {target}.")
         return
-    order = execute_sell(pos, "PER ROTAZIONE", f"Capitale riallocato su {target}", auto_trade, pending, True)
+    order = execute_sell(pos, "ROTAZIONE", f"Capitale riallocato su {target}", auto_trade, pending, True, pct=sell_pct)
     if not order:
         return
     filled = core.wait_for_fill(order.id, timeout=30, log=log_message)
     if not filled:
-        log_message(f"🔄 Vendita di {pos['symbol']} non ancora eseguita: l'acquisto di {target} è rimandato al prossimo ciclo.")
+        log_message(f"🔄 Vendita di {pos['symbol']} non ancora eseguita: l'acquisto di {target} è rimandato.")
         return
-
-    proceeds = float(filled.filled_qty or 0) * float(filled.filled_avg_price or 0)
     exposure_after = sum(abs(p["market_value"]) for p in get_open_positions())
-    funds, _ = core.buy_budget(get_account_summary(), exposure_after, cfg, crypto=core.is_crypto(target))
-    amount = min(proceeds, funds)
-    if amount < core.MIN_ORDER_USD:
+    funds, _ = core.buy_budget(get_account_summary(), exposure_after, cfg, crypto=core.is_crypto(target), pct=100)
+    final_amount = min(amount, funds)
+    if final_amount < core.MIN_ORDER_USD:
         log_message(f"🔄 Nessun reinvestimento in {target}: fondi entro il limite di esposizione ${funds:,.2f}.")
         return
-    execute_buy(target, amount, auto_trade, pending, label="ACQUISTO DA ROTAZIONE", stop_pct=stop_pct)
+    execute_buy(target, final_amount, auto_trade, pending, label=f"ACQUISTO DA ROTAZIONE {allocation_pct}%",
+                stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction)
 
 def describe_decision(d):
     if d["action"] == "ROTATE":
-        return f"ROTATE {d['sell_symbol']} → {d['buy_symbol']}"
+        return f"ROTATE {d.get('sell_pct') or 100:.0f}% {d['sell_symbol']} → {d['buy_symbol']}"
     if d["action"] == "BUY":
         return f"BUY {d['buy_symbol']}"
     if d["action"] == "SELL":
-        return f"SELL {d['sell_symbol']}"
+        return f"SELL {d.get('sell_pct') or 100:.0f}% {d['sell_symbol']}"
     return "HOLD"
 
-def badge(agent, value, tone="ok"):
-    return {"agent": agent, "value": value, "tone": tone}
+def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
+    """Tier 4-5: difesa del portafoglio, decisione del CIO sulle schede APPROVED_BY_RISK ed esecuzione.
 
-def run_trading_cycle(manual=False, boot=False):
-    """Ciclo del boardroom. Con boot=True (primo ciclo dopo avvio/deploy) non esegue acquisti né rotazioni:
-    solo analisi e vendite difensive, così un deploy non apre mai nuove posizioni."""
-    # Verifica che non ci sia un'altra scansione in corso
+    Con boot=True (primo ciclo dopo avvio/deploy) non esegue acquisti né rotazioni.
+    """
     if not scan_lock.acquire(blocking=False):
-        log_message("⚠️ Scansione già in corso. Attendi il completamento.")
+        log_message("⚠️ Ciclo del CIO già in corso.")
         return
 
     try:
         bot_state["status"] = "Scansione & Valutazione in corso..."
         bot_state["last_scan"] = core.now_local().strftime("%Y-%m-%d %H:%M:%S")
-        log_message("=== AVVIO VIRTUAL BOARDROOM (8 AGENTI) ===")
+        log_message(f"=== CICLO CIO · Tier 4-5 ({'manuale' if manual else trigger}) ===")
         if boot:
-            log_message("🌅 Ciclo di avvio: solo analisi e vendite difensive, nessun acquisto dopo il deploy.")
+            log_message("🌅 Ciclo di avvio: solo vendite difensive, nessun acquisto dopo il deploy.")
 
         cfg = core.get_config()
         auto_trade = cfg["auto_execute_trades"]
         if not auto_trade:
             log_message("🧭 Modalità Advisor: le decisioni vengono solo registrate, nessun ordine inviato.")
-        if not alpaca_client:
-            log_message("⚠️ Credenziali Alpaca non configurate: nessun ordine verrà inviato.")
-
-        # Ordini già aperti: evitano duplicati e accumuli a mercato chiuso
         pending = core.get_pending_order_symbols(log=log_message)
         orders_allowed = pending is not None
         if not orders_allowed:
             log_message("⚠️ Stato ordini pendenti sconosciuto: nessun ordine in questo ciclo.")
             pending = set()
-        elif pending:
-            log_message(f"Ordini pendenti su: {sorted(pending)}")
         market_open = core.is_market_open(log=log_message)
         positions = get_open_positions()
         acc = get_account_summary()
         state = core.load_state()
-        set_ai_analysis(symbol="BOARDROOM", rsi="--", sentiment="Riunione del comitato in corso",
-                        ai_verdict="ANALISI IN CORSO", reasoning="Gli 8 agenti stanno preparando i loro report...")
 
-        # Agente 1: Market Analyst
-        analysis = core.market_analyst(cfg["watchlist"] + [p["yf_symbol"] for p in positions], log=log_message)
-        if not manual and should_abort():
-            return
-        # Ufficio Virtuale: proposte già approvate dal Reparto Revisione nella coda dell'Agente Gestore
-        held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
-        inbox = [p for p in core.cio_inbox()
-                 if core.normalize_symbol(p["symbol"]) not in held_keys | pending]
-        scout_keys, scout_props = set(), {}
-        for prop in inbox:
-            key = core.normalize_symbol(prop["symbol"])
-            analysis[key] = {"symbol": prop["symbol"], "ind": prop["ind"], "score": prop["score"],
-                             "class": core.classify_score(prop["score"]), "scout": True}
-            scout_keys.add(key)
-            scout_props[key] = prop
-        log_message("📥 [CIO] Coda dell'Agente Gestore: " + (", ".join(
-            f"{p['symbol']} ({p['sector']}, score {p['score']}, scade tra {max(0, int((p['expires_epoch'] - time.time()) / 60))} min)"
-            for p in inbox) if inbox else "nessuna proposta approvata in attesa"))
-        # Storico ordini Alpaca: trade chiusi, data di apertura e stop delle posizioni (nessuno stato locale)
-        ledger = core.sync_ledger(log=log_message)
-        # Agente 7: Post-Trade Auditor (penalità allo score prima delle altre valutazioni)
-        audit = core.post_trade_auditor(analysis, log=log_message, ledger=ledger)
-        # Agente 5: Volume & Liquidity
-        volume = core.volume_agent(analysis, log=log_message)
-        # Agente 4: Macro Regime
-        macro = core.macro_regime(log=log_message)
-        # Agente 6: Drawdown Controller
+        # Post-Trade Auditor: storico e posizioni ricostruiti da Alpaca
+        ledger = core.sync_ledger(log=log_message) or {"trades": core.read_json_file(core.TRADE_HISTORY_PATH, []), "open": {}}
+        perf = core.performance_stats(ledger["trades"])
+        with state_lock:
+            bot_state["ledger_open"] = {k: {kk: (vv.isoformat() if hasattr(vv, "isoformat") else vv) for kk, vv in v.items()}
+                                        for k, v in ledger["open"].items()}
+            bot_state["performance"] = perf
+
+        # Difesa del portafoglio: stop ATR, trailing, trend ribassista, stallo (consentita anche con drawdown)
+        held_yf = [p["yf_symbol"] for p in positions]
+        analysis = core.market_analyst(held_yf, log=log_message) if positions else {}
         drawdown = core.drawdown_controller(acc, state, log=log_message)
-
-        buy_class = core.broker_candidates(analysis, held_keys, pending, market_open)
-        # Le scoperte dell'Esploratore passano sempre dal Reparto Revisione (sentiment e volatilità inclusi)
-        focus = list(dict.fromkeys([p["yf_symbol"] for p in positions] + [a["symbol"] for a in buy_class[:6]]
-                                   + [analysis[k]["symbol"] for k in scout_keys]))
-        # Agente 2: Sentiment Intelligence
-        sentiment = core.sentiment_agent(focus, log=log_message)
-        # Agente 3: Volatility Manager
-        vol, stops, trailing = core.volatility_agent(focus, positions, cfg, log=log_message, ledger=ledger)
-
-        # Risk Manager: stato delle posizioni con stop dinamici e trailing stop
+        vol, stops, trailing = core.volatility_agent(held_yf, positions, cfg, log=log_message, ledger=ledger) if positions else ({}, {}, {})
         risk = core.risk_manager(positions, analysis, acc, cfg, log=log_message, stops=stops, trailing=trailing, ledger=ledger)
-
-        # Vendite difensive obbligatorie (consentite anche con il blocco da drawdown)
         sold = set()
         for r in risk["positions"]:
             if r["status"] not in ("STOP_LOSS", "TRAILING_STOP", "RIBASSISTA", "STALLO"):
@@ -330,184 +291,104 @@ def run_trading_cycle(manual=False, boot=False):
             log_message(f"💼 [CIO] SELL difensivo {pos['symbol']} ({r['status']}): {r['reason']}")
             if execute_sell(pos, r["status"].replace("_", " "), r["reason"], auto_trade, pending, market_open) or not auto_trade:
                 sold.add(key)
-
-        # Filtri del comitato sui candidati all'acquisto
-        candidates, excluded = [], []
-        for a in buy_class:
-            key = core.normalize_symbol(a["symbol"])
-            if drawdown["blocked"]:
-                excluded.append((a["symbol"], "acquisti bloccati dal Drawdown Controller"))
-            elif sentiment.get(key, {}).get("veto"):
-                excluded.append((a["symbol"], f"veto Sentiment {sentiment[key]['sentiment']:+d}"))
-            elif volume.get(key, {}).get("status") == "FALSO_BREAKOUT":
-                excluded.append((a["symbol"], f"falso breakout, volume {volume[key]['ratio']}x"))
-            elif key not in {core.normalize_symbol(s) for s in focus}:
-                continue  # oltre i primi 6: non analizzato da Sentiment/Volatilità
-            else:
-                candidates.append(a)
-        if excluded:
-            log_message(f"⛔ [Comitato] Esclusi: {', '.join(f'{s} ({w})' for s, w in excluded)}")
-
-        # Reparto Revisione: esito per ogni scoperta dell'Esploratore
-        review = {}
-        excluded_why = {core.normalize_symbol(s): w for s, w in excluded}
-        admitted = {core.normalize_symbol(a["symbol"]) for a in candidates}
-        for key in scout_keys:
-            a, pkg = analysis[key], scout_props[key].get("package") or {}
-            checks = (f"{pkg.get('reason', '')}; target ${pkg.get('target_price', 0):,.4f}, stop {pkg.get('stop_pct', 0):.1f}%; "
-                      f"score attuale {a['score']}{' (penalità auditor)' if a.get('audit_penalty') else ''}")
-            if key in admitted:
-                review[key] = {"symbol": a["symbol"], "verdict": "APPROVATO", "detail": checks}
-            else:
-                why = excluded_why.get(key) or ("score sotto la soglia BUY dopo la revisione" if a["class"] != "BUY"
-                                                else "non acquistabile ora (mercato chiuso o ordine pendente)")
-                review[key] = {"symbol": a["symbol"], "verdict": "RESPINTO", "detail": f"{why}; {checks}"}
-        if review:
-            log_message("🏢 [Reparto Revisione] " + " | ".join(
-                f"{r['symbol']}: {r['verdict']} ({r['detail']})" for r in review.values()))
-
-        # Agente 8: Chief Investment Officer
-        board = {"risk": risk, "macro": macro, "drawdown": drawdown, "volatility": vol, "sentiment": sentiment,
-                 "volume": volume, "audit": audit, "candidates": candidates, "excluded": excluded,
-                 "scout": {"sector_scanned": "Radar multi-settore (coda dell'Agente Gestore)",
-                           "tickers_inspected": [p["symbol"] for p in inbox],
-                           "discoveries": [{"symbol": p["symbol"], "score": p["score"],
-                                            "anomalies": [p["sector"]] + p["anomalies"]} for p in inbox]},
-                 "review": review}
-        decision, source = core.ask_broker_ai(core.build_cio_prompt(board, cfg), log=log_message,
-                                              system=core.CIO_SYSTEM_PROMPT)
-        if not decision:
-            log_message("🧮 Nessuna IA disponibile: decide il CIO quantitativo di riserva.")
-            decision, source = core.ta_broker(risk, candidates), "Quant"
-        log_message(f"💼 [CIO] Proposta ({source}): {describe_decision(decision)} — {core.summarize_reason(decision['reason'], 260)}")
-
-        final = core.validate_broker_decision(decision, risk, candidates, sold_keys=sold | pending, log=log_message)
-        if describe_decision(final) != describe_decision(decision):
-            log_message(f"💼 [CIO] Decisione finale: {describe_decision(final)} — {final['reason']}")
-
-        # Esito della scoperta dell'Esploratore: approvata solo se il CIO la compra davvero
-        scout_buy = final["action"] in ("BUY", "ROTATE") and core.normalize_symbol(final["buy_symbol"]) in scout_keys
-        if scout_keys:
-            verdict = "APPROVATA" if scout_buy else "RESPINTA"
-            log_message(f"🏢 [CIO → Ufficio Virtuale] Scoperta dell'Esploratore #1 {verdict}: {describe_decision(final)}"
-                        + (" (il CIO l'aveva segnalata come approvata)" if decision.get("scout_discovery_approved") and not scout_buy else ""))
-        cio_outcome = {"approved": scout_buy, "decision": describe_decision(final), "source": source,
-                       "reason": core.summarize_reason(final["reason"] or decision["reason"], 300),
-                       "suspended": boot and final["action"] in ("BUY", "ROTATE")}
-        if inbox:
-            executed = scout_buy and auto_trade and orders_allowed and not boot
-            core.record_cio_outcome(final["buy_symbol"] if scout_buy else None, executed, describe_decision(final))
-
-        target = final["buy_symbol"] or final["sell_symbol"]
-        target_key = core.normalize_symbol(target) if target else None
-        target_info = analysis.get(target_key) if target else None
-        exec_note = ""
-        if orders_allowed and final["action"] in ("BUY", "ROTATE"):
-            crypto = core.is_crypto(final["buy_symbol"])
-            factor = macro["crypto" if crypto else "stock"]["factor"]
-            pct, pct_eff = core.cio_allocation(final, target_info["score"] if target_info else None, cfg, factor)
-            stop = core.cio_stop(final, vol.get(target_key))
-            exec_note = (f"allocazione {pct:.1f}%" + (f" → {pct_eff:.1f}% (macro RISK-OFF)" if factor < 1 else "")
-                         + (f", stop {stop:.1f}%" if stop is not None else ""))
-            log_message(f"💼 [CIO] {final['buy_symbol']}: {exec_note}")
-
-        if boot and final["action"] in ("BUY", "ROTATE"):
-            log_message(f"🌅 [Avvio] {describe_decision(final)} non eseguito: acquisti sospesi nel ciclo di avvio "
-                        f"(riprendono tra {cfg['scan_interval_min']} minuti).")
-            exec_note = (exec_note + " · " if exec_note else "") + "sospeso (ciclo di avvio)"
-        elif not orders_allowed or final["action"] == "HOLD":
-            pass
-        elif final["action"] == "BUY":
-            _, allocation = core.buy_budget(acc, risk["exposure"], cfg, crypto=crypto, pct=pct_eff)
-            execute_buy(final["buy_symbol"], allocation, auto_trade, pending, label=f"ACQUISTO CIO {pct_eff:.0f}%", stop_pct=stop)
-        else:
-            sell_report = next(r for r in risk["positions"]
-                               if core.normalize_symbol(r["pos"]["yf_symbol"]) == core.normalize_symbol(final["sell_symbol"]))
-            if final["action"] == "SELL":
-                execute_sell(sell_report["pos"], "DECISIONE CIO", final["reason"], auto_trade, pending, market_open)
-            else:
-                log_message(f"🔄 Rotazione capitale: {sell_report['pos']['symbol']} (score {sell_report['score']}) → "
-                            f"{final['buy_symbol']}")
-                rotate_capital(sell_report, final["buy_symbol"], cfg, auto_trade, pending, stop_pct=stop)
         core.save_state(state)
 
-        # Reparto Revisione: tabella delle metriche per scoperte, obiettivo del CIO e migliori candidati
-        # Ordine: scoperte, obiettivo del CIO, candidati ammessi, respinti dal comitato, poi posizioni in portafoglio
-        review_keys = [k for k in dict.fromkeys(
-            sorted(scout_keys) + ([target_key] if target_key else [])
-            + [core.normalize_symbol(a["symbol"]) for a in candidates[:3]]
-            + [core.normalize_symbol(sym) for sym, _ in excluded]
-            + [core.normalize_symbol(p["yf_symbol"]) for p in positions]) if k in analysis][:5]
-        rows = []
-        for key in review_keys:
-            a = analysis[key]
-            ind, sent, v, vf, st = a["ind"], sentiment.get(key), vol.get(key), volume.get(key, {}), audit.get(key)
-            origin = "Esploratore #1" if key in scout_keys else ("Portafoglio" if key in held_keys else "Watchlist")
-            verdict = review.get(key, {}).get("verdict") or ("APPROVATO" if key in admitted else
-                                                              ("RESPINTO" if key in excluded_why else
-                                                               ("IN PORTAFOGLIO" if key in held_keys else "—")))
-            rows.append({
-                "symbol": a["symbol"], "origin": origin, "verdict": verdict,
-                "detail": review.get(key, {}).get("detail") or excluded_why.get(key, ""),
-                "technical": {"score": a["score"], "rsi": round(ind["rsi"], 1), "macd_hist": round(ind["macd_hist"], 4),
-                              "roc": ind["roc"], "trend_up": ind["sma20"] > ind["sma50"],
-                              "audit_penalty": bool(a.get("audit_penalty"))},
-                "sentiment": {"score": sent["sentiment"], "veto": sent["veto"], "news": short_text(sent["news"], 120)} if sent else None,
-                "atr": {"atr_pct": v["atr_pct"], "stop_pct": v["stop_pct"]} if v else None,
-                "volume": {"ratio": vf.get("ratio"), "status": vf.get("status")},
-                "drawdown": {"pct": drawdown["drawdown_pct"], "blocked": drawdown["blocked"]},
-                "auditor": {"win_rate": st["win_rate"], "trades": st["trades"], "pnl": st["pnl"]} if st else None,
-            })
-        bot_state["review"] = rows
-        bot_state["cio"] = {
-            "action": final["action"], "buy_symbol": final["buy_symbol"], "sell_symbol": final["sell_symbol"],
-            "allocation_pct": round(pct_eff, 1) if final["action"] in ("BUY", "ROTATE") and orders_allowed else None,
-            "stop_pct": stop if final["action"] in ("BUY", "ROTATE") and orders_allowed else None,
-            "source": source, "reason": final["reason"] or decision["reason"],
-            "proposal": describe_decision(decision), "suspended": boot and final["action"] in ("BUY", "ROTATE"),
-            "scout_approved": scout_buy, "timestamp": core.now_local().strftime("%H:%M:%S"),
-            "macro": {c: m["regime"] for c, m in macro.items()},
-        }
+        # Tier 4: CIO sulle sole schede approvate dal Comitato Rischi
+        channels = core.latest_channels()
+        held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
+        inbox = [p for p in core.cio_inbox() if core.normalize_symbol(p["symbol"]) not in held_keys | pending]
+        log_message("📥 [CIO] Schede APPROVED_BY_RISK: " + (", ".join(
+            f"{p['symbol']} (score {p['score']}, scade tra {max(0, int((p['expires_epoch'] - time.time()) / 60))} min)"
+            for p in inbox) if inbox else "nessuna"))
+        exposure = risk["exposure"]
+        funds_stock, _ = core.buy_budget(acc, exposure, cfg, crypto=False, pct=100)
+        funds_crypto, _ = core.buy_budget(acc, exposure, cfg, crypto=True, pct=100)
+        account_ctx = {"equity": risk["equity"], "exposure": exposure, "funds": funds_stock, "funds_crypto": funds_crypto}
+        holdings = [{"symbol": r["pos"]["symbol"], "yf_symbol": r["pos"]["yf_symbol"], "market_value": r["pos"]["market_value"],
+                     "weight_pct": r["pos"]["market_value"] / risk["equity"] * 100 if risk["equity"] else 0,
+                     "pnl_pct": r["pos"]["unrealized_plpc"], "score": r["score"], "status": r["status"]}
+                    for r in risk["positions"] if core.normalize_symbol(r["pos"]["symbol"]) not in sold]
 
-        # Badge per la dashboard
-        m_s, m_c = macro["stock"], macro["crypto"]
-        vetoes = [v["symbol"] for v in sentiment.values() if v["veto"]]
-        t_sent = sentiment.get(target_key) if target else None
-        t_vol = volume.get(target_key) if target else None
-        fakes = [s for s, w in excluded if "falso breakout" in w]
-        bot_state["boardroom"] = [
-            badge("Macro", f"Azioni {m_s['regime']} · Crypto {m_c['regime']}",
-                  "bad" if "RISK-OFF" in (m_s["regime"], m_c["regime"]) else "ok"),
-            badge("Sentiment", (f"{target} {t_sent['sentiment']:+d}" if t_sent else "-")
-                  + (f" · veto: {', '.join(vetoes)}" if vetoes else ""),
-                  "bad" if vetoes else ("ok" if not t_sent or t_sent["sentiment"] >= 0 else "warn")),
-            badge("Volumi", (f"{target} {t_vol['ratio']}x {t_vol['status']}" if t_vol and t_vol["ratio"] is not None else "-")
-                  + (f" · falsi breakout: {', '.join(fakes)}" if fakes else ""),
-                  "warn" if fakes else "ok"),
-            badge("Drawdown", f"{drawdown['drawdown_pct']:+.2f}%" + (" · ACQUISTI BLOCCATI" if drawdown["blocked"] else ""),
-                  "bad" if drawdown["blocked"] else ("warn" if drawdown["drawdown_pct"] < -2 else "ok")),
-            badge("CIO", f"{describe_decision(final)} ({source})" + (f" · {exec_note}" if exec_note else ""),
-                  {"BUY": "ok", "ROTATE": "warn", "SELL": "bad"}.get(final["action"], "neutral")),
-        ]
-        set_ai_analysis(
-            symbol=target or "PORTAFOGLIO",
-            rsi=str(target_info["ind"]["rsi"]) if target_info else "--",
-            sentiment=short_text(t_sent["news"]) if t_sent else f"Esposizione ${risk['exposure']:,.0f} / capitale ${risk['equity']:,.0f}",
-            ai_verdict=f"{describe_decision(final)} ({source})",
-            reasoning=final["reason"] or decision["reason"],
-        )
+        if inbox:
+            decision, source = core.ask_desk_cio(core.build_desk_cio_prompt(inbox, holdings, account_ctx, channels, cfg), log=log_message)
+            if not decision:
+                log_message("🧮 Nessuna IA disponibile: decide il CIO quantitativo di riserva.")
+                decision, source = core.quant_desk_cio(inbox, holdings, account_ctx), "Quant"
+            log_message(f"💼 [CIO] Mandato proposto ({source}): {describe_decision(decision)}, convinzione "
+                        f"{decision.get('conviction_score')}, allocazione {decision.get('allocation_pct')}% — "
+                        f"{core.summarize_reason(decision['reason'], 240)}")
+        else:
+            decision, source = {"action": "HOLD", "buy_symbol": "", "sell_symbol": "",
+                                "reason": "Nessuna scheda approvata dal Comitato Rischi da valutare."}, "—"
+
+        final = core.validate_desk_decision(decision, inbox, holdings, account_ctx, cfg, channels, sold_keys=sold | pending)
+        if describe_decision(final) != describe_decision(decision) or final.get("notes"):
+            log_message(f"💼 [CIO] Mandato esecutivo: {describe_decision(final)}"
+                        + (f" — {'; '.join(final.get('notes', []))}" if final.get("notes") else "")
+                        + (f" — {final['reason']}" if final["action"] == "HOLD" and decision["action"] != "HOLD" else ""))
+
+        # Tier 5: Execution Desk
+        suspended = boot and final["action"] in ("BUY", "ROTATE")
+        executed = False
+        if suspended:
+            log_message(f"🌅 [Avvio] {describe_decision(final)} non eseguito: acquisti sospesi nel ciclo di avvio.")
+        elif orders_allowed and final["action"] == "BUY":
+            executed = bool(execute_buy(final["buy_symbol"], final["buy_amount"], auto_trade, pending,
+                                        label=f"ACQUISTO CIO {final['allocation_pct']}%",
+                                        stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
+                                        conviction=final["conviction_score"]))
+        elif orders_allowed and final["action"] in ("ROTATE", "SELL"):
+            pos = next(p for p in positions if core.normalize_symbol(p["yf_symbol"]) == core.normalize_symbol(final["sell_symbol"]))
+            if final["action"] == "SELL":
+                execute_sell(pos, "DECISIONE CIO", final["reason"], auto_trade, pending, market_open, pct=final["sell_pct"])
+            else:
+                rotate_capital(pos, final["sell_pct"], final["buy_symbol"], final["buy_amount"], cfg, auto_trade, pending,
+                               stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
+                               conviction=final["conviction_score"])
+                executed = auto_trade
+        if inbox:
+            core.record_cio_outcome(final.get("buy_symbol") or None, executed, describe_decision(final))
+
+        macro = (channels.get("macro") or {})
+        with state_lock:
+            bot_state["cio"] = {
+                "action": final["action"], "buy_symbol": final.get("buy_symbol", ""), "sell_symbol": final.get("sell_symbol", ""),
+                "sell_pct": final.get("sell_pct"), "conviction": final.get("conviction_score"),
+                "allocation_pct": final.get("allocation_pct"), "amount": final.get("buy_amount"),
+                "stop_pct": final.get("dynamic_stop_loss_pct"), "notes": final.get("notes", []),
+                "source": source, "reason": final["reason"] or decision["reason"], "proposal": describe_decision(decision),
+                "suspended": suspended, "scout_approved": final["action"] in ("BUY", "ROTATE"),
+                "timestamp": core.now_local().strftime("%H:%M:%S"), "trigger": "manuale" if manual else trigger,
+                "macro": macro.get("regime") or {}, "vix": macro.get("vix"),
+            }
+        set_ai_analysis(symbol=final.get("buy_symbol") or final.get("sell_symbol") or "PORTAFOGLIO", rsi="--",
+                        sentiment=f"Esposizione ${exposure:,.0f} / capitale ${risk['equity']:,.0f}",
+                        ai_verdict=f"{describe_decision(final)} ({source})", reasoning=final["reason"] or decision["reason"])
 
         bot_state["status"] = "Attivo (In attesa ciclo)" if bot_state["active"] else "In pausa"
-        log_message("=== BOARDROOM COMPLETATO ===")
+        log_message("=== CICLO CIO COMPLETATO ===")
 
     finally:
         if bot_state["status"].startswith("Scansione"):
             bot_state["status"] = "In pausa" if not bot_state["active"] else "Attivo (In attesa ciclo)"
-        # Rilascia sempre il lock alla fine della scansione
         scan_lock.release()
 
+# Risveglio event-driven del CIO (schede approvate o stop toccato)
+cio_wake = threading.Event()
+cio_trigger = {"reason": "", "urgent": False}
+_trigger_lock = threading.Lock()
+
+def request_cio(reason, urgent=False):
+    with _trigger_lock:
+        if not cio_wake.is_set() or urgent:
+            cio_trigger.update(reason=reason, urgent=urgent or cio_trigger.get("urgent", False))
+        cio_wake.set()
+
 def background_loop():
-    # Grace period: lascia stabilizzare server e connessioni API prima di toccare Alpaca
+    """CIO: ciclo programmato ogni scan_interval_min, oppure subito su richiesta (schede approvate, stop).
+
+    Il risveglio da nuove schede rispetta un intervallo minimo (CIO_MIN_GAP_SEC); gli stop sono urgenti.
+    """
     time.sleep(core.STARTUP_GRACE_SECONDS)
     try:
         core.startup_system_sync(log=log_message)
@@ -516,35 +397,58 @@ def background_loop():
     last_run = 0.0
     boot = True  # il primo ciclo dopo l'avvio non apre posizioni
     while True:
-        # L'intervallo viene riletto da config.json a ogni giro
-        interval = core.get_config()["scan_interval_min"] * 60
-        if bot_state["active"] and time.time() - last_run >= interval:
-            last_run = time.time()
-            try:
-                run_trading_cycle(boot=boot)
-                boot = False
-            except Exception as e:
-                log_message(f"Errore loop background: {e}")
-        # Controlla ogni 30s; si risveglia subito se il bot viene riattivato
-        if wake_event.wait(30):
+        if wake_event.is_set():  # bot riattivato dalla dashboard
             wake_event.clear()
             last_run = 0.0
+        now = time.time()
+        interval = core.get_config()["scan_interval_min"] * 60
+        trigger = None
+        if bot_state["active"]:
+            if now - last_run >= interval:
+                trigger = "programmato"
+            elif cio_wake.is_set() and (cio_trigger["urgent"] or now - last_run >= core.CIO_MIN_GAP_SEC):
+                trigger = cio_trigger["reason"] or "evento"
+        if trigger:
+            with _trigger_lock:
+                cio_wake.clear()
+                cio_trigger.update(reason="", urgent=False)
+            last_run = now
+            try:
+                run_trading_cycle(boot=boot, trigger=trigger)
+                boot = False
+            except Exception as e:
+                log_message(f"Errore ciclo CIO: {e}")
+        # Attesa: se c'è un evento in coda ma non è ancora passato l'intervallo minimo, pausa breve
+        if cio_wake.is_set():
+            time.sleep(5)
+        else:
+            cio_wake.wait(15)
 
 def radar_loop():
-    """Esploratore #1 + Agente Gestore: un paniere ogni RADAR_INTERVAL_SEC, indipendente dal ciclo del CIO.
+    """Tier 1-3: sciame di micro-scout + Chief of Staff + Comitato Rischi ogni RADAR_INTERVAL_SEC.
 
-    Non invia ordini. Ogni passaggio ha timeout di rete (yfinance/Alpaca) e gli errori non fermano il loop.
+    Non invia ordini. Controlla anche gli stop delle posizioni e, se toccati, sveglia subito il CIO.
     """
     time.sleep(core.STARTUP_GRACE_SECONDS + 20)  # dopo la sincronizzazione di avvio
     while True:
         started = time.time()
         if bot_state["active"]:
             try:
-                held = {core.normalize_symbol(p["yf_symbol"]) for p in cached("positions", get_open_positions)}
+                positions = get_open_positions()
+                held = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
                 pending = core.get_pending_order_symbols(log=lambda m: None) or set()
-                core.run_esploratore_radar(held_keys=held, pending=pending, log=log_message)
+                core.run_scout_swarm(held_keys=held, pending=pending, log=log_message,
+                                     on_approved=lambda: request_cio("schede approvate dal Comitato Rischi"))
+                # Controllo rapido degli stop (stop del CIO salvato nell'ordine, altrimenti quello di riserva)
+                stops = bot_state.get("ledger_open", {})
+                fallback = core.get_config()["stop_loss_pct"]
+                for p in positions:
+                    stop = (stops.get(core.normalize_symbol(p["symbol"])) or {}).get("stop_pct") or fallback
+                    if p["unrealized_plpc"] <= stop and core.normalize_symbol(p["symbol"]) not in pending:
+                        log_message(f"🛑 [Radar] {p['symbol']} a {p['unrealized_plpc']:.2f}% ha toccato lo stop {stop:.1f}%: sveglio il CIO.")
+                        request_cio(f"stop toccato su {p['symbol']}", urgent=True)
             except Exception as e:
-                log_message(f"📡 Errore radar Esploratore: {e}")
+                log_message(f"📡 Errore sciame: {e}")
         time.sleep(max(10, core.RADAR_INTERVAL_SEC - (time.time() - started)))
 
 def keep_alive_url():
@@ -669,6 +573,15 @@ def account_with_pnl():
     acc["exposure"] = round(sum(abs(p["market_value"]) for p in positions), 2)
     return acc
 
+def positions_with_allocation():
+    """Posizioni con allocazione decisa dal CIO, convinzione e stop (letti dagli ordini Alpaca)."""
+    out = []
+    for p in cached("positions", get_open_positions):
+        info = bot_state.get("ledger_open", {}).get(core.normalize_symbol(p["symbol"]), {})
+        out.append({**p, "allocation_pct": info.get("allocation_pct"), "conviction": info.get("conviction"),
+                    "stop_pct": info.get("stop_pct"), "opened_at": info.get("opened_at")})
+    return out
+
 @app.route("/api/data")
 @require_login
 def api_data():
@@ -679,19 +592,18 @@ def api_data():
             "status": bot_state["status"],
             "logs": list(bot_state["logs"]),
             "latest_ai_analysis": dict(bot_state["latest_ai_analysis"]),
-            "boardroom": list(bot_state["boardroom"]),
-            "review": list(bot_state["review"]),
             "cio": dict(bot_state["cio"]),
+            "performance": dict(bot_state["performance"]),
         }
     return jsonify({
         "account": cached("account_pnl", account_with_pnl),
-        "positions": cached("positions", get_open_positions),
+        "positions": positions_with_allocation(),
         "bot": bot,
         "radar": core.radar_snapshot(),
         "sources": {
             "yfinance": "Yahoo Finance API (News & Historical)",
             "alpaca": "Alpaca Paper Trading v2 API",
-            "ai": "Google Gemini / Groq Llama 3.3 + motore quantitativo di riserva",
+            "ai": "Groq (CIO) / Gemini di riserva + motore quantitativo",
             "ta": "Indicatori Tecnici RSI(14) e SMA"
         }
     })

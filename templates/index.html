@@ -97,196 +97,170 @@
             </div>
         </section>
 
-        <!-- ============ UFFICIO VIRTUALE ============ -->
-        <section class="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
+        <!-- ============ PERFORMANCE (Post-Trade Auditor) ============ -->
+        <section class="flex flex-wrap gap-x-8 gap-y-2 px-1 text-xs text-slate-500">
+            <span>Trade chiusi (90gg) <span class="num text-slate-200" x-text="perf.trades ?? '—'"></span></span>
+            <span>Win rate <span class="num text-slate-200" x-text="perf.win_rate != null ? perf.win_rate + '%' : '—'"></span></span>
+            <span>PnL realizzato <span class="num" :class="tone(perf.pnl)" x-text="usd(perf.pnl, true)"></span></span>
+            <span>Permanenza media <span class="num text-slate-200" x-text="duration(perf.avg_held_min)"></span></span>
+            <span x-show="perf.best">Migliore <span class="num text-emerald-400" x-text="perf.best ? perf.best.symbol + ' ' + usd(perf.best.pnl, true) : ''"></span></span>
+            <span x-show="perf.worst">Peggiore <span class="num text-rose-400" x-text="perf.worst ? perf.worst.symbol + ' ' + usd(perf.worst.pnl, true) : ''"></span></span>
+        </section>
 
-            <!-- 1. Agente Gestore Operativo & Esploratore radar -->
-            <div class="border border-slate-800 rounded-lg bg-slate-900/40 flex flex-col">
-                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Agente Gestore · Radar Esploratore #1</h2>
-                    <span class="text-[11px] text-slate-500 num" x-text="radar.next_scan_in != null ? 'prossimo ' + mmss(radar.next_scan_in) : ''"></span>
+        <!-- ============ 5 CANALI DI INTELLIGENCE ============ -->
+        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
+            <div class="px-4 py-3 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Canali di intelligence</h2>
+                <span class="text-[11px] text-slate-500 num" x-text="channels.timestamp ? shortTime(channels.timestamp) + ' · ' + channels.scouts + ' micro-scout (' + channels.workers + ' worker) · dati ' + channels.download_s + 's · calcoli ' + channels.scouts_ms + 'ms · prossima scansione ' + mmss(radar.next_scan_in) : 'In attesa della prima scansione dello sciame'"></span>
+            </div>
+            <div class="grid grid-cols-1 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-800">
+                <div class="p-4 space-y-1.5 text-xs">
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500">1 · Macro & volatilità</div>
+                    <div class="num"><span class="text-slate-400">VIX </span>
+                        <span :class="macro.risk_contraction ? 'text-rose-400' : 'text-slate-100'" x-text="macro.vix ?? '—'"></span>
+                        <span class="text-rose-400" x-show="macro.risk_contraction"> contrazione</span></div>
+                    <template x-for="(v, k) in (macro.indices || {})" :key="k">
+                        <div class="num"><span class="text-slate-400" x-text="k + ' '"></span>
+                            <span :class="v.trend === 'RIALZISTA' ? 'text-emerald-400' : 'text-rose-400'" x-text="v.trend.toLowerCase()"></span></div>
+                    </template>
+                    <div class="num text-slate-400" x-text="macro.regime ? 'Azioni ' + macro.regime.stock + ' · Crypto ' + macro.regime.crypto : ''"></div>
                 </div>
-                <div class="p-4 space-y-4 text-sm">
-                    <div class="grid grid-cols-2 gap-3">
-                        <div>
-                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Settore setacciato</div>
-                            <div class="mt-0.5 text-slate-100" x-text="radar.current_sector || '—'"></div>
-                            <div class="mt-0.5 text-[11px] text-slate-500 num" x-text="shortTime(radar.last_scan)"></div>
-                        </div>
-                        <div>
-                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Prossimo paniere</div>
-                            <div class="mt-0.5 text-slate-300" x-text="radar.next_sector || '—'"></div>
-                        </div>
+                <div class="p-4 space-y-1.5 text-xs">
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500">4 · Sentiment crypto</div>
+                    <div class="num" x-show="channels.fear_greed">
+                        <span class="text-slate-100" x-text="channels.fear_greed ? channels.fear_greed.value : ''"></span>
+                        <span class="text-slate-400" x-text="channels.fear_greed ? ' ' + channels.fear_greed.label : ''"></span>
                     </div>
-                    <div class="num text-[11px] text-slate-500 break-words" x-text="(radar.tickers_inspected || []).join('  ')"></div>
+                    <div class="text-[11px] text-slate-500">Fear &amp; Greed Index. Notizie e trimestrali sono verificate dal Comitato su ogni scheda.</div>
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500 pt-2">Panieri</div>
+                    <template x-for="b in (channels.baskets || [])" :key="b.name">
+                        <div class="flex justify-between gap-2"><span class="text-slate-400" x-text="b.name"></span>
+                            <span class="num" :class="b.anomalies ? 'text-amber-400' : 'text-slate-500'" x-text="b.tickers + ' · ' + b.anomalies + ' anomalie'"></span></div>
+                    </template>
+                </div>
+                <div class="p-4 lg:col-span-2 overflow-x-auto scroll-thin">
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">2 · Multi-timeframe · 3 · Order flow · 5 · Correlazioni — migliori score</div>
+                    <table class="w-full text-[11px] num">
+                        <thead><tr class="text-slate-500 text-left">
+                            <th class="font-medium py-1 pr-3">Ticker</th><th class="font-medium py-1 pr-3 text-right">Score</th>
+                            <th class="font-medium py-1 pr-3 text-right">MTF</th><th class="font-medium py-1 pr-3 text-right">RVOL</th>
+                            <th class="font-medium py-1 pr-3 text-right">VWAP</th><th class="font-medium py-1 pr-3 text-right">Beta</th><th class="font-medium py-1 text-right">Corr</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="t in (channels.top || [])" :key="t.symbol">
+                                <tr class="border-t border-slate-800/60">
+                                    <td class="py-1 pr-3 text-slate-200" x-text="t.symbol"></td>
+                                    <td class="py-1 pr-3 text-right text-slate-200" x-text="t.score"></td>
+                                    <td class="py-1 pr-3 text-right" :class="t.mtf >= 2 ? 'text-emerald-400' : 'text-slate-500'" x-text="t.mtf + '/3'"></td>
+                                    <td class="py-1 pr-3 text-right" :class="t.rvol >= 1.2 ? 'text-slate-200' : 'text-slate-500'" x-text="t.rvol != null ? t.rvol + 'x' : '—'"></td>
+                                    <td class="py-1 pr-3 text-right" :class="tone(t.vwap_dist)" x-text="t.vwap_dist != null ? pct(t.vwap_dist) : '—'"></td>
+                                    <td class="py-1 pr-3 text-right text-slate-400" x-text="t.beta ?? '—'"></td>
+                                    <td class="py-1 text-right text-slate-400" x-text="t.corr ?? '—'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
 
-                    <div>
-                        <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">
-                            Coda proposte <span class="normal-case tracking-normal" x-text="'(TTL ' + (radar.ttl_minutes || 20) + ' min)'"></span>
-                        </div>
-                        <template x-if="!(radar.queue || []).length">
-                            <div class="text-xs text-slate-500">Nessuna proposta attiva.</div>
-                        </template>
-                        <div class="space-y-1.5">
-                            <template x-for="q in (radar.queue || [])" :key="q.symbol + q.discovered_at">
-                                <div class="rounded border border-slate-800 px-2.5 py-2 text-xs">
-                                    <div class="flex items-center justify-between gap-2">
-                                        <span class="num text-slate-100" x-text="q.symbol + ' · ' + q.score"></span>
-                                        <span class="flex items-center gap-2">
-                                            <span class="num text-[10px] px-1.5 py-0.5 rounded border" :class="statusStyle(q.status)" x-text="statusLabel(q.status)"></span>
-                                            <span class="num text-[11px]" :class="q.ttl_seconds < 300 ? 'text-amber-400' : 'text-slate-400'" x-text="mmss(q.ttl_seconds)"></span>
-                                        </span>
+        <section class="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
+            <!-- Tier 2-3: coda delle schede e Comitato Rischi -->
+            <div class="xl:col-span-2 border border-slate-800 rounded-lg bg-slate-900/40">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Trade pitches · Chief of Staff &amp; Comitato Rischi</h2>
+                    <span class="text-[11px] text-slate-500" x-text="'TTL ' + (radar.ttl_minutes || 15) + ' min · cooldown 60 min'"></span>
+                </div>
+                <div class="p-4 space-y-2">
+                    <template x-if="!(radar.queue || []).length">
+                        <div class="text-xs text-slate-500">Nessuna scheda attiva in coda.</div>
+                    </template>
+                    <template x-for="q in (radar.queue || [])" :key="q.symbol + q.discovered_at">
+                        <div class="rounded border border-slate-800 px-3 py-2.5 text-xs">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <span class="flex items-center gap-2">
+                                    <span class="num text-slate-100" x-text="q.symbol"></span>
+                                    <span class="text-slate-500" x-text="q.sector"></span>
+                                </span>
+                                <span class="flex items-center gap-2">
+                                    <span class="num text-[10px] px-1.5 py-0.5 rounded border" :class="statusStyle(q.status)" x-text="statusLabel(q.status)"></span>
+                                    <span class="num" :class="q.ttl_seconds < 180 ? 'text-amber-400' : 'text-slate-400'" x-text="mmss(q.ttl_seconds)"></span>
+                                </span>
+                            </div>
+                            <div class="mt-1 num text-[11px] text-slate-400"
+                                 x-text="'score ' + q.score + ' · ' + (q.anomalies || []).join(', ') + ' · MTF ' + q.mtf_aligned + '/3 · RVOL ' + q.rvol + 'x · VWAP ' + pct(q.vwap_dist_pct) + (q.beta != null ? ' · beta ' + q.beta : '')"></div>
+                            <div x-show="q.package" class="mt-1 num text-[11px] text-slate-300"
+                                 x-text="q.package ? 'Target ' + usd(q.package.target_price) + ' · stop ATR ' + q.package.stop_pct + '%' : ''"></div>
+                            <div class="mt-1.5 grid grid-cols-1 sm:grid-cols-3 gap-1.5" x-show="(q.gates || []).length">
+                                <template x-for="g in (q.gates || [])" :key="g.agent">
+                                    <div class="rounded bg-slate-950/60 px-2 py-1 text-[11px]">
+                                        <span :class="g.veto ? 'text-rose-400' : 'text-emerald-400'" x-text="(g.veto ? '✕ ' : '✓ ') + g.agent"></span>
+                                        <div class="text-slate-500 num truncate" :title="g.detail" x-text="g.detail"></div>
                                     </div>
-                                    <div class="mt-1 text-slate-500" x-text="q.sector + ' · ' + (q.anomalies || []).join(', ')"></div>
-                                    <div x-show="q.package" class="mt-1 num text-[11px] text-slate-400"
-                                         x-text="q.package ? 'Target ' + usd(q.package.target_price) + ' · stop ' + q.package.stop_pct + '%' : ''"></div>
-                                    <div x-show="q.note" class="mt-1 text-[11px] text-slate-500" x-text="q.note"></div>
-                                </div>
-                            </template>
+                                </template>
+                            </div>
+                            <div x-show="q.note" class="mt-1 text-[11px] text-slate-500" x-text="q.note"></div>
                         </div>
-                    </div>
+                    </template>
 
-                    <div x-show="(radar.recent || []).length">
-                        <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Esiti recenti</div>
+                    <div x-show="vetoes().length" class="pt-2">
+                        <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Veti del Comitato Rischi</div>
                         <div class="space-y-1">
-                            <template x-for="r in (radar.recent || []).slice(0, 6)" :key="r.symbol + r.updated_at">
-                                <div class="flex items-baseline gap-2 text-[11px]">
-                                    <span class="num shrink-0 w-24" :class="statusStyle(r.status, true)" x-text="statusLabel(r.status)"></span>
-                                    <span class="num text-slate-300 shrink-0" x-text="r.symbol"></span>
-                                    <span class="text-slate-500 truncate" :title="r.reason || r.note" x-text="r.reason || r.note"></span>
+                            <template x-for="r in vetoes()" :key="r.symbol + r.updated_at">
+                                <div class="text-[11px] flex gap-2">
+                                    <span class="num text-rose-400 shrink-0 w-14" x-text="r.symbol"></span>
+                                    <span class="text-slate-400" x-text="(r.vetoes || []).join(' · ') || r.note"></span>
                                 </div>
                             </template>
                         </div>
                     </div>
-
-                    <div x-show="(radar.cooldown || []).length" class="text-[11px] text-slate-500">
+                    <div x-show="otherRecent().length" class="pt-1 space-y-1">
+                        <template x-for="r in otherRecent()" :key="r.symbol + r.updated_at + r.status">
+                            <div class="text-[11px] flex gap-2">
+                                <span class="num shrink-0 w-20" :class="statusStyle(r.status, true)" x-text="statusLabel(r.status)"></span>
+                                <span class="num text-slate-300 shrink-0" x-text="r.symbol"></span>
+                                <span class="text-slate-500 truncate" x-text="r.note"></span>
+                            </div>
+                        </template>
+                    </div>
+                    <div x-show="(radar.cooldown || []).length" class="pt-1 text-[11px] text-slate-500">
                         Cooldown: <span class="num text-slate-400" x-text="(radar.cooldown || []).map(c => c.symbol + ' ' + c.minutes + 'm').join('  ')"></span>
                     </div>
                 </div>
             </div>
 
-            <!-- 3. Decisione esecutiva del CIO -->
-            <div class="xl:col-span-2 border border-slate-800 rounded-lg bg-slate-900/40">
+            <!-- Tier 4: mandato del CIO -->
+            <div class="border border-slate-800 rounded-lg bg-slate-900/40">
                 <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Decisione esecutiva CIO</h2>
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Mandato CIO</h2>
                     <span class="text-[11px] text-slate-500 num" x-text="cio.source ? cio.source + ' · ' + (cio.timestamp || '') : ''"></span>
                 </div>
                 <div class="p-4">
                     <template x-if="!cio.action">
-                        <div class="text-sm text-slate-500">In attesa del primo ciclo del comitato.</div>
+                        <div class="text-sm text-slate-500">In attesa del primo ciclo del CIO.</div>
                     </template>
                     <template x-if="cio.action">
-                        <div class="space-y-4">
-                            <div class="flex flex-wrap items-center gap-x-6 gap-y-3">
+                        <div class="space-y-3">
+                            <div class="flex items-center gap-3">
                                 <span class="num text-xs font-medium px-2 py-1 rounded border" :class="actionStyle(cio.action)" x-text="cio.action"></span>
-                                <div>
-                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Ticker</div>
-                                    <div class="num text-slate-100" x-text="cioTarget()"></div>
-                                </div>
-                                <div>
-                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Allocazione</div>
-                                    <div class="num text-slate-100" x-text="cio.allocation_pct != null ? cio.allocation_pct + '%' : '—'"></div>
-                                </div>
-                                <div>
-                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Stop loss</div>
-                                    <div class="num text-slate-100" x-text="cio.stop_pct != null ? cio.stop_pct + '%' : '—'"></div>
-                                </div>
-                                <div>
-                                    <div class="text-[11px] uppercase tracking-wider text-slate-500">Regime macro</div>
-                                    <div class="num text-xs text-slate-300" x-text="cio.macro ? 'Azioni ' + cio.macro.stock + ' · Crypto ' + cio.macro.crypto : '—'"></div>
-                                </div>
+                                <span class="num text-slate-100" x-text="cioTarget()"></span>
                             </div>
+                            <dl class="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
+                                <div><dt class="text-[11px] uppercase tracking-wider text-slate-500">Convinzione</dt><dd class="num text-slate-100" x-text="cio.conviction ?? '—'"></dd></div>
+                                <div><dt class="text-[11px] uppercase tracking-wider text-slate-500">Allocazione</dt><dd class="num text-slate-100" x-text="cio.allocation_pct != null ? cio.allocation_pct + '%' : '—'"></dd></div>
+                                <div><dt class="text-[11px] uppercase tracking-wider text-slate-500">Importo</dt><dd class="num text-slate-100" x-text="cio.amount != null ? usd(cio.amount) : '—'"></dd></div>
+                                <div><dt class="text-[11px] uppercase tracking-wider text-slate-500">Stop ATR</dt><dd class="num text-slate-100" x-text="cio.stop_pct != null ? cio.stop_pct + '%' : '—'"></dd></div>
+                            </dl>
                             <p class="text-sm leading-relaxed text-slate-300 border-l-2 border-slate-700 pl-3" x-text="cio.reason"></p>
-                            <div class="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
-                                <span x-show="cio.proposal && cio.proposal !== cioDescription()" x-text="'Proposta originale: ' + cio.proposal"></span>
-                                <span x-show="cio.suspended" class="text-amber-400/90">Sospesa: ciclo di avvio dopo il deploy</span>
-                                <span x-show="cio.scout_approved" class="text-emerald-400/90">Proposta dell'Esploratore approvata dal CIO</span>
+                            <div class="space-y-0.5 text-[11px] text-slate-500">
+                                <div x-text="'Attivazione: ' + (cio.trigger || '—')"></div>
+                                <div x-show="cio.proposal && cio.proposal !== cioDescription()" x-text="'Proposta originale: ' + cio.proposal"></div>
+                                <template x-for="n in (cio.notes || [])" :key="n"><div x-text="'· ' + n"></div></template>
+                                <div x-show="cio.suspended" class="text-amber-400/90">Sospeso: ciclo di avvio dopo il deploy</div>
                             </div>
                         </div>
                     </template>
                 </div>
-            </div>
-        </section>
-
-        <!-- 2. Reparto Revisione -->
-        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
-            <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Reparto Revisione</h2>
-                <span class="text-[11px] text-slate-500">Parere dei 5 agenti sugli asset valutati</span>
-            </div>
-            <div class="overflow-x-auto scroll-thin">
-                <template x-if="!review.length">
-                    <div class="p-4 text-sm text-slate-500">Nessun asset in revisione.</div>
-                </template>
-                <table x-show="review.length" class="w-full text-xs">
-                    <thead>
-                        <tr class="border-b border-slate-800 text-slate-500">
-                            <th class="text-left font-medium px-4 py-2.5 w-48">Agente</th>
-                            <template x-for="r in review" :key="r.symbol">
-                                <th class="text-left font-medium px-4 py-2.5">
-                                    <div class="num text-slate-100" x-text="r.symbol"></div>
-                                    <div class="mt-0.5 flex items-center gap-2 font-normal">
-                                        <span x-text="r.origin"></span>
-                                        <span class="num text-[10px]" :class="verdictStyle(r.verdict)" x-text="r.verdict"></span>
-                                    </div>
-                                    <div class="mt-0.5 font-normal text-[10px] text-slate-500 max-w-[16rem] truncate" :title="r.detail" x-text="r.verdict === 'RESPINTO' ? r.detail.split(';')[0] : ''"></div>
-                                </th>
-                            </template>
-                        </tr>
-                    </thead>
-                    <tbody class="divide-y divide-slate-800/70 num">
-                        <tr>
-                            <td class="px-4 py-2.5 font-sans text-slate-400">Analista Tecnico</td>
-                            <template x-for="r in review" :key="r.symbol + '-t'">
-                                <td class="px-4 py-2.5 text-slate-300">
-                                    <span class="text-slate-100" x-text="'Score ' + r.technical.score"></span>
-                                    <span class="text-slate-500" x-text="' · RSI ' + r.technical.rsi + ' · MACD ' + r.technical.macd_hist + ' · ROC ' + r.technical.roc + '%'"></span>
-                                    <span x-show="r.technical.audit_penalty" class="text-amber-400"> · penalità</span>
-                                </td>
-                            </template>
-                        </tr>
-                        <tr>
-                            <td class="px-4 py-2.5 font-sans text-slate-400">News &amp; Sentiment</td>
-                            <template x-for="r in review" :key="r.symbol + '-s'">
-                                <td class="px-4 py-2.5">
-                                    <template x-if="r.sentiment">
-                                        <span>
-                                            <span :class="tone(r.sentiment.score)" x-text="(r.sentiment.score > 0 ? '+' : '') + r.sentiment.score"></span>
-                                            <span class="text-slate-500"> · Veto </span>
-                                            <span :class="r.sentiment.veto ? 'text-rose-400' : 'text-slate-300'" x-text="r.sentiment.veto ? 'Sì' : 'No'"></span>
-                                        </span>
-                                    </template>
-                                    <span x-show="!r.sentiment" class="text-slate-600">—</span>
-                                </td>
-                            </template>
-                        </tr>
-                        <tr>
-                            <td class="px-4 py-2.5 font-sans text-slate-400">Volatilità ATR</td>
-                            <template x-for="r in review" :key="r.symbol + '-a'">
-                                <td class="px-4 py-2.5 text-slate-300">
-                                    <span x-text="r.atr ? 'ATR ' + r.atr.atr_pct + '% · stop ' + r.atr.stop_pct + '%' : '—'"></span>
-                                    <span class="text-slate-500" x-text="r.volume && r.volume.ratio != null ? ' · vol ' + r.volume.ratio + 'x' : ''"></span>
-                                </td>
-                            </template>
-                        </tr>
-                        <tr>
-                            <td class="px-4 py-2.5 font-sans text-slate-400">Drawdown Risk</td>
-                            <template x-for="r in review" :key="r.symbol + '-d'">
-                                <td class="px-4 py-2.5">
-                                    <span :class="r.drawdown.blocked ? 'text-rose-400' : 'text-slate-300'"
-                                          x-text="(r.drawdown.blocked ? 'Acquisti bloccati' : 'Rischio nella norma') + ' · ' + pct(r.drawdown.pct)"></span>
-                                </td>
-                            </template>
-                        </tr>
-                        <tr>
-                            <td class="px-4 py-2.5 font-sans text-slate-400">Auditor</td>
-                            <template x-for="r in review" :key="r.symbol + '-w'">
-                                <td class="px-4 py-2.5 text-slate-300"
-                                    x-text="r.auditor ? 'Win rate ' + r.auditor.win_rate + '% su ' + r.auditor.trades + ' trade' : 'Nessuno storico'"></td>
-                            </template>
-                        </tr>
-                    </tbody>
-                </table>
             </div>
         </section>
 
@@ -302,6 +276,9 @@
                         <tr class="border-b border-slate-800 text-slate-500 text-left">
                             <th class="font-medium px-4 py-2.5">Asset</th>
                             <th class="font-medium px-4 py-2.5 text-right">Quantità</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Allocazione CIO</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Convinzione</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Stop</th>
                             <th class="font-medium px-4 py-2.5 text-right">Prezzo medio</th>
                             <th class="font-medium px-4 py-2.5 text-right">Prezzo</th>
                             <th class="font-medium px-4 py-2.5 text-right">Valore</th>
@@ -311,12 +288,15 @@
                     </thead>
                     <tbody class="divide-y divide-slate-800/70 num">
                         <template x-if="!positions.length">
-                            <tr><td colspan="7" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
+                            <tr><td colspan="10" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
                         </template>
                         <template x-for="p in positions" :key="p.symbol">
                             <tr class="hover:bg-slate-800/30">
                                 <td class="px-4 py-2.5 text-slate-100" x-text="p.symbol"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-300" x-text="qty(p.qty)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.conviction ?? '—'"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.stop_pct != null ? p.stop_pct + '%' : '—'"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-400" x-text="usd(p.avg_entry_price)"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.current_price)"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.market_value)"></td>
@@ -440,15 +420,14 @@
             return {
                 connected: true,
                 account: {}, positions: [], bot: { logs: [] },
-                radar: {}, review: [], cio: {},
+                radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
                 settings: { watchlist: [] }, envLocked: {},
                 showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
                 localLogs: [], clearedId: 0, clearedTs: 0,
                 numberFields: [
-                    { key: 'stop_loss_pct', label: 'Stop loss di riserva %', step: 0.5, min: -50, max: -0.5 },
+                    { key: 'stop_loss_pct', label: 'Stop di riserva % (se manca ATR)', step: 0.5, min: -50, max: -0.5 },
                     { key: 'scan_interval_min', label: 'Intervallo di scansione (min)', step: 1, min: 1, max: 1440 },
-                    { key: 'base_allocation_pct', label: 'Capitale per ordine BUY %', step: 0.5, min: 0.5, max: 100 },
-                    { key: 'max_allocation_pct', label: 'Capitale massimo per ordine %', step: 0.5, min: 0.5, max: 100 },
+                    { key: 'max_allocation_pct', label: 'Soffitto per operazione % (il CIO decide 5-35%)', step: 0.5, min: 0.5, max: 100 },
                     { key: 'max_exposure_pct', label: 'Esposizione massima %', step: 5, min: 10, max: 400 },
                 ],
 
@@ -481,6 +460,18 @@
                     if (!eq || this.account.exposure === undefined) return '—';
                     return (this.account.exposure / eq * 100).toFixed(1) + '%';
                 },
+                duration(min) {
+                    if (min === null || min === undefined) return '—';
+                    if (min < 60) return Math.round(min) + ' min';
+                    if (min < 1440) return (min / 60).toFixed(1) + ' h';
+                    return (min / 1440).toFixed(1) + ' g';
+                },
+                weight(p) {
+                    const eq = Number(this.account.portfolio);
+                    return eq ? (p.market_value / eq * 100).toFixed(1) + '% (peso)' : '—';
+                },
+                vetoes() { return (this.radar.recent || []).filter(r => r.status === 'REJECTED_BY_RISK').slice(0, 8); },
+                otherRecent() { return (this.radar.recent || []).filter(r => r.status !== 'REJECTED_BY_RISK').slice(0, 5); },
                 shortTime(iso) {
                     return iso ? String(iso).replace('T', ' ').slice(11, 19) : '';
                 },
@@ -490,14 +481,14 @@
                     return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
                 },
                 statusLabel(st) {
-                    return { DISCOVERED: 'SCOPERTA', UNDER_REVIEW: 'IN REVISIONE', APPROVED_FOR_CIO: 'PRONTA CIO',
-                             REJECTED: 'SCARTATA', EXPIRED: 'SCADUTA', EXECUTED: 'ESEGUITA' }[st] || st;
+                    return { SUBMITTED_PITCH: 'PITCH', UNDER_REVIEW: 'IN REVISIONE', APPROVED_BY_RISK: 'APPROVATA',
+                             REJECTED_BY_RISK: 'VETO', EXPIRED: 'SCADUTA', EXECUTED: 'ESEGUITA' }[st] || st;
                 },
                 statusStyle(st, textOnly = false) {
                     const map = {
-                        APPROVED_FOR_CIO: ['border-emerald-800 text-emerald-400', 'text-emerald-400'],
+                        APPROVED_BY_RISK: ['border-emerald-800 text-emerald-400', 'text-emerald-400'],
                         EXECUTED: ['border-sky-800 text-sky-400', 'text-sky-400'],
-                        REJECTED: ['border-rose-900 text-rose-400', 'text-rose-400'],
+                        REJECTED_BY_RISK: ['border-rose-900 text-rose-400', 'text-rose-400'],
                         EXPIRED: ['border-slate-700 text-slate-500', 'text-slate-500'],
                     };
                     const v = map[st] || ['border-amber-800 text-amber-400', 'text-amber-400'];
@@ -515,14 +506,15 @@
                 },
                 cioTarget() {
                     const c = this.cio;
-                    if (c.action === 'ROTATE') return `${c.sell_symbol} → ${c.buy_symbol}`;
+                    if (c.action === 'ROTATE') return `${c.sell_pct || 100}% ${c.sell_symbol} → ${c.buy_symbol}`;
+                    if (c.action === 'SELL') return `${c.sell_pct || 100}% ${c.sell_symbol}`;
                     return c.buy_symbol || c.sell_symbol || '—';
                 },
                 cioDescription() {
                     const c = this.cio;
-                    if (c.action === 'ROTATE') return `ROTATE ${c.sell_symbol} → ${c.buy_symbol}`;
+                    if (c.action === 'ROTATE') return `ROTATE ${c.sell_pct || 100}% ${c.sell_symbol} → ${c.buy_symbol}`;
                     if (c.action === 'BUY') return `BUY ${c.buy_symbol}`;
-                    if (c.action === 'SELL') return `SELL ${c.sell_symbol}`;
+                    if (c.action === 'SELL') return `SELL ${c.sell_pct || 100}% ${c.sell_symbol}`;
                     return 'HOLD';
                 },
 
@@ -572,7 +564,9 @@
                         this.positions = Array.isArray(data.positions) ? data.positions : [];
                         this.bot = data.bot || { logs: [] };
                         this.radar = data.radar || {};
-                        this.review = Array.isArray(this.bot.review) ? this.bot.review : [];
+                        this.channels = this.radar.channels || {};
+                        this.macro = this.channels.macro || {};
+                        this.perf = this.bot.performance || {};
                         this.cio = this.bot.cio || {};
                         this.connected = true;
                     } catch (e) {

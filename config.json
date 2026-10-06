@@ -4,11 +4,23 @@
   "anti_sleep": true,
   "stop_loss_pct": -5.0,
   "scan_interval_min": 15,
-  "buy_allocation_pct": 15.0,
-  "max_allocation_pct": 30.0,
+  "max_allocation_pct": 35.0,
   "max_exposure_pct": 100.0,
   "watchlist": [
-    "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD",
-    "NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META", "PLTR", "COIN", "SMCI"
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "AVAX-USD",
+    "NVDA",
+    "AAPL",
+    "MSFT",
+    "TSLA",
+    "AMD",
+    "GOOGL",
+    "AMZN",
+    "META",
+    "PLTR",
+    "COIN",
+    "SMCI"
   ]
 }
