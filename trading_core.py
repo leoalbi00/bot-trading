@@ -84,7 +84,17 @@ STALL_MIN_HOLD_MIN = 45        # ...con posizione aperta da almeno 45 minuti (3 
 # ---------------------------------------------------------------------------
 # Configurazione dinamica (config.json)
 # ---------------------------------------------------------------------------
-CONFIG_PATH = os.getenv("BOT_CONFIG_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# config.json (nel repository): default permanenti, senza segreti, letti a ogni avvio -> sopravvivono ai deploy.
+REPO_CONFIG_PATH = os.getenv("BOT_REPO_CONFIG_PATH", os.path.join(_BASE_DIR, "config.json"))
+# config.local.json (escluso da git): segreti generati e modifiche fatte dalla dashboard.
+CONFIG_PATH = os.getenv("BOT_CONFIG_PATH", os.path.join(_BASE_DIR, "config.local.json"))
+# Nomi brevi accettati nei file di configurazione
+CONFIG_KEY_ALIASES = {
+    "auto_execute": "auto_execute_trades",
+    "anti_sleep": "keep_alive_enabled",
+    "buy_allocation_pct": "base_allocation_pct",
+}
 
 # Valore segnaposto: se presente viene sostituito da un token casuale
 PLACEHOLDER_TOKEN = "default-secret-token"
@@ -111,7 +121,7 @@ DEFAULT_CONFIG = {
     "stop_loss_pct": -5.0,
     "scan_interval_min": 15,
     "auto_execute_trades": True,
-    "ai_provider": "gemini",
+    "ai_provider": "groq",
     "keep_alive_enabled": True,
     "bot_api_token": PLACEHOLDER_TOKEN,
 }
@@ -132,6 +142,16 @@ ENV_OVERRIDES = {
 }
 _TRUE = ("1", "true", "yes", "on", "si", "sì")
 _FALSE = ("0", "false", "no", "off")
+
+
+def config_sources():
+    """Descrizione delle fonti di configurazione in ordine di priorità crescente (per i log)."""
+    return [
+        "default del codice",
+        f"{os.path.basename(REPO_CONFIG_PATH)} ({'presente' if os.path.exists(REPO_CONFIG_PATH) else 'assente'})",
+        f"{os.path.basename(CONFIG_PATH)} ({'presente' if os.path.exists(CONFIG_PATH) else 'assente'})",
+        f"variabili d'ambiente ({', '.join(ENV_OVERRIDES[k] for k in env_overrides()) or 'nessuna'})",
+    ]
 
 
 def _parse_env_value(key, raw):
@@ -229,22 +249,56 @@ def _validate_config(data, base):
 
 
 def _save_config(cfg):
+    """Salva in config.local.json i segreti e solo i valori diversi dai default del repository."""
+    base = repo_defaults()
+    data = {k: v for k, v in cfg.items() if k in SECRET_FIELDS or v != base.get(k)}
     os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
     tmp = CONFIG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, CONFIG_PATH)  # scrittura atomica
 
 
+def _read_config_file(path, label):
+    """Legge un file di configurazione (dict). File mancante -> {}; file non valido -> {} con avviso."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"[!] {label} non valido ({e}): ignorato.", flush=True)
+        return {}
+    if not isinstance(data, dict):
+        print(f"[!] {label} non contiene un oggetto JSON: ignorato.", flush=True)
+        return {}
+    return {CONFIG_KEY_ALIASES.get(k, k): v for k, v in data.items()}
+
+
+def repo_defaults():
+    """Default permanenti: codice + config.json del repository (i segreti nel repository vengono ignorati)."""
+    repo = {k: v for k, v in _read_config_file(REPO_CONFIG_PATH, "config.json").items() if k not in SECRET_FIELDS}
+    try:
+        return _validate_config(repo, DEFAULT_CONFIG)
+    except ValueError as e:
+        print(f"[!] config.json non valido ({e}): uso i default del codice.", flush=True)
+        return dict(DEFAULT_CONFIG)
+
+
 def _load_config():
-    cfg = dict(DEFAULT_CONFIG)
+    """Configurazione salvata: default del repository + config.local.json (dashboard e segreti).
+
+    Le variabili d'ambiente vengono applicate sopra a ogni lettura (vedi get_config).
+    """
+    base = repo_defaults()
+    local = _read_config_file(CONFIG_PATH, os.path.basename(CONFIG_PATH))
     dirty = not os.path.exists(CONFIG_PATH)
-    if not dirty:
-        try:
-            with open(CONFIG_PATH, encoding="utf-8") as f:
-                cfg = _validate_config(json.load(f), DEFAULT_CONFIG)
-        except (OSError, ValueError) as e:
-            print(f"[!] config.json non valido ({e}): uso i valori di default.")
+    try:
+        cfg = _validate_config(local, base)
+    except ValueError as e:
+        print(f"[!] {os.path.basename(CONFIG_PATH)} non valido ({e}): uso i default del repository.", flush=True)
+        cfg = dict(base)
+        dirty = True
     for key, env_name in SECRET_FIELDS.items():
         if not os.getenv(env_name) and cfg.get(key) in (None, "", PLACEHOLDER_TOKEN):
             cfg[key] = secrets.token_urlsafe(32 if key == "flask_secret_key" else 12 if key == "dashboard_password" else 24)
@@ -255,7 +309,7 @@ def _load_config():
         try:
             _save_config(cfg)
         except OSError as e:
-            print(f"[!] Impossibile salvare config.json: {e}")
+            print(f"[!] Impossibile salvare {os.path.basename(CONFIG_PATH)}: {e}", flush=True)
     return cfg
 
 

@@ -592,6 +592,7 @@ def start_background_threads():
     if locked:
         log_message(f"⚙️ Impostazioni fissate da variabili d'ambiente: "
                     f"{', '.join(f'{core.ENV_OVERRIDES[k]}={v}' for k, v in locked.items())}")
+    log_message(f"⚙️ Configurazione (priorità crescente): {' → '.join(core.config_sources())}")
     log_message(f"⏳ Grace period di {core.STARTUP_GRACE_SECONDS}s, poi sincronizzazione con Alpaca e ciclo di avvio.")
 
 @app.before_request

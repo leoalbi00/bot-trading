@@ -7,8 +7,7 @@ crypto_exits.json
 scanner.pid
 bot_activity.log
 .aider*
-config.json
-config.json.tmp
+config.local.json
 credenziali.txt
 trade_history.json
 boardroom_state.json
