@@ -45,7 +45,7 @@ bot_state = {
 }
 
 def log_message(msg):
-    now = datetime.datetime.now()
+    now = core.now_local()
     entry = f"[{now.strftime('%H:%M:%S')}] {msg}"
     print(entry, flush=True)
     with state_lock:
@@ -245,7 +245,7 @@ def run_trading_cycle(manual=False):
 
     try:
         bot_state["status"] = "Scansione & Valutazione in corso..."
-        bot_state["last_scan"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bot_state["last_scan"] = core.now_local().strftime("%Y-%m-%d %H:%M:%S")
         log_message("=== AVVIO VIRTUAL BOARDROOM (8 AGENTI) ===")
 
         cfg = core.get_config()
@@ -527,7 +527,7 @@ def index():
 
 @app.route("/ping")
 def ping():
-    return jsonify({"status": "alive", "timestamp": datetime.datetime.now().isoformat()}), 200
+    return jsonify({"status": "alive", "timestamp": core.now_local().isoformat()}), 200
 
 @app.route("/api/data")
 @require_login

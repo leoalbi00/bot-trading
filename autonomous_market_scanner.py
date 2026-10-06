@@ -211,7 +211,7 @@ def evaluate_and_trade(asset, positions, pending, market_open):
         print(f"[!] Errore durante l'invio dell'ordine: {e}")
 
 def run_once():
-    print(f"=== AVVIO BOT DI TRADING AUTONOMO ({datetime.datetime.now():%Y-%m-%d %H:%M:%S}) ===")
+    print(f"=== AVVIO BOT DI TRADING AUTONOMO ({core.now_local():%Y-%m-%d %H:%M:%S %Z}) ===")
 
     # 1. Bilancio Account
     acc = get_account_summary()

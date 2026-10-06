@@ -6,6 +6,8 @@ sicurezza (ordini pendenti, mercato chiuso, ordini notional).
 """
 import os
 import re
+import datetime as dt
+from zoneinfo import ZoneInfo
 import json
 import secrets
 import threading
@@ -48,6 +50,15 @@ AI_SYSTEM_PROMPT = (
     "'DECISIONE: BUY', 'DECISIONE: SELL' o 'DECISIONE: HOLD' (solo le opzioni ammesse dal prompt), "
     "poi 'SCORE: <0-100>' e 'MOTIVO: <breve spiegazione tecnica>'."
 )
+
+# Fuso orario per log, orari e calcolo del giorno (Render usa UTC)
+TIMEZONE = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Rome"))
+
+
+def now_local():
+    """Data e ora correnti nel fuso orario del bot (default Europe/Rome)."""
+    return dt.datetime.now(TIMEZONE)
+
 
 MIN_ORDER_USD = 10.0
 HTTP_TIMEOUT = 10
@@ -1414,7 +1425,7 @@ def drawdown_controller(account, state, log=print):
     Oltre DAILY_DRAWDOWN_LIMIT blocca i nuovi acquisti per DRAWDOWN_BLOCK_HOURS (solo vendite difensive).
     """
     now = time.time()
-    today = time.strftime("%Y-%m-%d")
+    today = now_local().strftime("%Y-%m-%d")
     equity = float(account.get("portfolio", 0) or 0)
     last_equity = float(account.get("last_equity", 0) or 0) or equity
     dd_state = state.setdefault("drawdown", {})
@@ -1474,7 +1485,8 @@ def rebuild_trade_history(days=90, log=print):
             trades.append({
                 "symbol": o.symbol, "qty": round(matched, 8), "entry": round(entry, 6), "exit": round(price, 6),
                 "pnl": round((price - entry) * matched, 2), "pnl_pct": round((price / entry - 1) * 100, 2),
-                "closed_at": str(o.filled_at)[:19],
+                "closed_at": o.filled_at.astimezone(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+                if hasattr(o.filled_at, "astimezone") else str(o.filled_at)[:19],
             })
     try:
         tmp = TRADE_HISTORY_PATH + ".tmp"
