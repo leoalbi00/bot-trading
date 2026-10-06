@@ -23,9 +23,16 @@ WATCHLIST = ["BTC-USD", "ETH-USD", "SOL-USD", "NVDA", "AAPL", "TSLA", "MSFT", "A
 
 bot_state = {
     "active": True,
-    "last_scan": "In attesa di primo scan...",
+    "last_scan": "In attesa del primo scan...",
     "status": "Inizializzato",
-    "logs": []
+    "logs": [],
+    "latest_ai_analysis": {
+        "symbol": "In attesa...",
+        "rsi": "--",
+        "sentiment": "--",
+        "ai_verdict": "IN ATTESA",
+        "reasoning": "In attesa del prossimo ciclo di scansione dei mercati."
+    }
 }
 
 def log_message(msg):
@@ -62,7 +69,8 @@ def get_open_positions():
                 "qty": float(p.qty),
                 "market_value": float(p.market_value),
                 "current_price": float(p.current_price),
-                "unrealized_pl": float(p.unrealized_pl)
+                "unrealized_pl": float(p.unrealized_pl),
+                "side": getattr(p, 'side', 'long').upper()
             })
         return res
     except Exception as e:
@@ -89,7 +97,7 @@ def query_gemini_ai(prompt):
     try:
         from google import genai
         client = genai.Client(api_key=GEMINI_KEY)
-        for m in ['gemini-2.0-flash', 'gemini-3.8-flash']:
+        for m in ['gemini-2.0-flash', 'gemini-1.5-flash']:
             try:
                 res = client.models.generate_content(model=m, contents=prompt)
                 if res and res.text:
@@ -117,7 +125,6 @@ def run_trading_cycle():
         mkt_val = pos["market_value"]
         pl_percent = (unrealized_pl / (mkt_val - unrealized_pl)) * 100 if mkt_val != unrealized_pl else 0
 
-        # Recupero dati di mercato e news in tempo reale
         news_summary = get_recent_news(sym)
         rsi_val = "N/A"
         try:
@@ -129,7 +136,6 @@ def run_trading_cycle():
 
         log_message(f"Verifica Posizione {sym}: PnL ${unrealized_pl:.2f} ({pl_percent:.2f}%) | RSI: {rsi_val}")
 
-        # Prompt d'informazione e prevenzione per Gemini
         prompt = f"""
         Sei un agente di risk management per un bot quantitativo.
         Analizza la posizione aperta per l'asset {sym}:
@@ -148,7 +154,15 @@ def run_trading_cycle():
         ai_res = query_gemini_ai(prompt)
         should_sell = "SELL" in ai_res.upper()
         
-        # Paracadute di emergenza estremo (-5% Hard Stop Loss)
+        # Aggiorna monitoraggio IA per la dashboard
+        bot_state["latest_ai_analysis"] = {
+            "symbol": sym,
+            "rsi": str(rsi_val),
+            "sentiment": news_summary[:80] + "..." if len(news_summary) > 80 else news_summary,
+            "ai_verdict": "SELL (Vendita)" if should_sell else "HOLD (Mantiene)",
+            "reasoning": ai_res
+        }
+        
         if pl_percent <= -5.0:
             should_sell = True
             ai_res = "Stop Loss di sicurezza estrema (-5%)"
@@ -192,11 +206,23 @@ def run_trading_cycle():
     else:
         for asset in top_3:
             news = get_recent_news(asset['symbol'])
-            log_message(f"Analisi AI per {asset['symbol']} (${asset['price']:.2f})...")
-            prompt = f"Analizza {asset['symbol']}: Prezzo ${asset['price']:.2f}, RSI {asset['rsi']}. Notizie: '{news}'. Rispondi 'DECISIONE: BUY' se reputi opportuno acquistare."
+            log_message(f"Analisi AI in corso per {asset['symbol']} (${asset['price']:.2f})...")
+            
+            prompt = f"Analizza {asset['symbol']}: Prezzo ${asset['price']:.2f}, RSI {asset['rsi']}. Notizie: '{news}'. Rispondi 'DECISIONE: BUY' se reputi opportuno acquistare oppure 'DECISIONE: HOLD'."
             ai_res = query_gemini_ai(prompt)
 
-            if "BUY" in ai_res.upper():
+            is_buy = "BUY" in ai_res.upper()
+
+            # Aggiorna monitoraggio IA in diretta
+            bot_state["latest_ai_analysis"] = {
+                "symbol": asset['symbol'],
+                "rsi": str(asset['rsi']),
+                "sentiment": news[:80] + "..." if len(news) > 80 else news,
+                "ai_verdict": "BUY (Acquisto)" if is_buy else "HOLD (Monitora)",
+                "reasoning": ai_res
+            }
+
+            if is_buy:
                 allocation = acc["cash"] * 0.15
                 if allocation >= 10:
                     qty = max(1, int(allocation / asset['price']))
@@ -227,7 +253,6 @@ def background_loop():
 
 app = Flask(__name__)
 
-# Avvio thread automatico compatibile con Gunicorn / Render
 if not hasattr(app, 'bot_started'):
     app.bot_started = True
     bg_thread = threading.Thread(target=background_loop, daemon=True)
@@ -246,25 +271,32 @@ def api_data():
     return jsonify({
         "account": get_account_summary(),
         "positions": get_open_positions(),
-        "bot": bot_state
+        "bot": bot_state,
+        "sources": {
+            "yfinance": "Yahoo Finance API (News & Historical)",
+            "alpaca": "Alpaca Paper Trading v2 API",
+            "gemini": "Google Gemini AI (Modello Decisionale)",
+            "ta": "Indicatori Tecnici RSI(14) e SMA"
+        }
     })
 
+@app.route("/api/scan", methods=["POST"])
 @app.route("/api/trigger", methods=["POST"])
 def api_trigger():
     threading.Thread(target=run_trading_cycle).start()
-    return jsonify({"status": "Scan avviato"})
+    return jsonify({"status": "success", "message": "Scansione avviata con successo"})
 
 @app.route("/api/toggle", methods=["POST"])
 def api_toggle():
     bot_state["active"] = not bot_state["active"]
     log_message(f"Stato Bot impostato a: Active={bot_state['active']}")
-    return jsonify({"active": bot_state["active"]})
+    return jsonify({"active": bot_state["active"], "is_running": bot_state["active"]})
 
 @app.route("/api/liquidate", methods=["POST"])
 def api_liquidate():
     positions = get_open_positions()
     if not positions:
-        return jsonify({"status": "warning", "message": "Nessuna posizione da liquidare."})
+        return jsonify({"status": "warning", "message": "Nessuna posizione aperta da liquidare."})
 
     count = 0
     for pos in positions:
@@ -283,7 +315,8 @@ def api_liquidate():
         except Exception as e:
             log_message(f"Errore vendita manuale {sym}: {e}")
 
-    return jsonify({"status": "success", "closed": count})
+    return jsonify({"status": "success", "message": f"Liquidazione completata. Chiusi {count} ordini."})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+    
