@@ -254,6 +254,33 @@
             </div>
         </div>
 
+        <!-- SEZIONE UFFICIO VIRTUALE & ESPLORAZIONE -->
+        <div class="bg-surface border border-borderSubtle rounded-lg overflow-hidden">
+            <div class="px-5 py-3 border-b border-borderSubtle flex items-center justify-between bg-zinc-950/40">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="telescope" class="w-4 h-4 text-violet-400"></i>
+                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-300">🔍 Ufficio Virtuale & Esplorazione</span>
+                </div>
+                <span id="officeTimestamp" class="text-xs font-mono text-zinc-500">In attesa della prima esplorazione</span>
+            </div>
+            <div class="p-5 grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs font-mono">
+                <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
+                    <div class="text-[10px] text-zinc-400 uppercase">Esploratore #1 · Mercato perlustrato</div>
+                    <div id="officeSector" class="text-sm font-semibold text-violet-300 mt-1">--</div>
+                    <div id="officeTickers" class="text-zinc-500 mt-2 break-words">--</div>
+                </div>
+                <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
+                    <div class="text-[10px] text-zinc-400 uppercase mb-2">Proposte → Reparto Revisione</div>
+                    <div id="officeDiscoveries" class="space-y-2 text-zinc-300">--</div>
+                </div>
+                <div class="bg-zinc-900/60 p-3 rounded border border-zinc-800">
+                    <div class="text-[10px] text-zinc-400 uppercase">Decisione del CIO</div>
+                    <div id="officeCioVerdict" class="text-sm font-bold mt-1 text-zinc-300">--</div>
+                    <div id="officeCioReason" class="text-zinc-400 mt-2 leading-relaxed">--</div>
+                </div>
+            </div>
+        </div>
+
         <!-- SEZIONE 2: REGISTRO MOVIMENTAZIONI E POSIZIONI APERTE -->
         <div class="bg-surface border border-borderSubtle rounded-lg overflow-hidden">
             <div class="px-5 py-3 border-b border-borderSubtle flex items-center justify-between bg-zinc-950/40">
@@ -591,6 +618,46 @@
             }
         }
 
+        function renderOffice(office) {
+            document.getElementById('officeTimestamp').textContent =
+                `${office.scout_id} · ${String(office.timestamp || '').replace('T', ' ').slice(0, 19)}`;
+            document.getElementById('officeSector').textContent = office.sector || '--';
+            document.getElementById('officeTickers').textContent =
+                `Ispezionati: ${(office.tickers_inspected || []).join(', ') || '-'}`;
+
+            const box = document.getElementById('officeDiscoveries');
+            box.replaceChildren();
+            const discoveries = office.discoveries || [];
+            if (discoveries.length === 0) {
+                box.appendChild(el('div', 'text-zinc-500', 'Nessuna anomalia eccezionale in questo settore.'));
+            }
+            for (const d of discoveries) {
+                const approved = d.verdict === 'APPROVATO';
+                const row = el('div', 'p-2 rounded border border-zinc-800 bg-black/30');
+                const head = el('div', 'flex items-center justify-between gap-2');
+                head.appendChild(el('span', 'font-bold text-white', `${d.symbol} · score ${d.score}`));
+                head.appendChild(el('span', `px-1.5 py-0.5 rounded text-[10px] ${approved ? 'bg-emerald-950 text-emerald-300' : 'bg-rose-950 text-rose-300'}`,
+                    d.verdict || 'IN REVISIONE'));
+                row.appendChild(head);
+                row.appendChild(el('div', 'text-zinc-400 mt-1', (d.anomalies || []).join(' · ')));
+                if (d.detail) row.appendChild(el('div', 'text-zinc-500 mt-1', d.detail));
+                box.appendChild(row);
+            }
+
+            const cio = office.cio || {};
+            const verdict = document.getElementById('officeCioVerdict');
+            if (discoveries.length === 0) {
+                verdict.textContent = `${cio.decision || '--'} (nessuna scoperta da valutare)`;
+                verdict.className = 'text-sm font-bold mt-1 text-zinc-300';
+            } else {
+                verdict.textContent = (cio.approved ? '✅ SCOPERTA APPROVATA' : '❌ SCOPERTA RESPINTA')
+                    + (cio.suspended ? ' · sospesa (ciclo di avvio)' : '');
+                verdict.className = `text-sm font-bold mt-1 ${cio.approved ? 'text-emerald-400' : 'text-rose-400'}`;
+            }
+            document.getElementById('officeCioReason').textContent =
+                `${cio.decision || ''}${cio.source ? ' (' + cio.source + ')' : ''} — ${cio.reason || ''}`;
+        }
+
         async function fetchStatus() {
             try {
                 const res = await fetch('/api/data');
@@ -620,6 +687,7 @@
                 // 4. Analisi Live dell'IA e pareri del Boardroom
                 if (bot.latest_ai_analysis) renderAiAnalysis(bot.latest_ai_analysis);
                 if (Array.isArray(bot.boardroom)) renderBoardroom(bot.boardroom);
+                if (bot.office && bot.office.scout_id) renderOffice(bot.office);
 
                 if (bot.active !== undefined) isRunning = Boolean(bot.active);
                 updateBotStatusDisplay();

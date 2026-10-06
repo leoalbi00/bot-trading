@@ -1136,6 +1136,7 @@ def parse_broker_json(text):
         "score": _clean_score(data.get("score")),
         "allocation_pct": _clean_number(data.get("allocation_pct")),
         "dynamic_stop_loss_pct": _clean_number(data.get("dynamic_stop_loss_pct")),
+        "scout_discovery_approved": str(data.get("scout_discovery_approved", "")).strip().lower() in ("true", "1", "yes", "si", "sì"),
     }
 
 
@@ -1640,7 +1641,7 @@ def post_trade_auditor(analysis, log=print, ledger=None):
 
 # ---------------- Agente 8: Chief Investment Officer ----------------
 CIO_SYSTEM_PROMPT = (
-    "Sei il Chief Investment Officer del Virtual Boardroom Finanziario di un bot di trading algoritmico "
+    "Sei il Chief Investment Officer dell'Ufficio Virtuale e del Virtual Boardroom Finanziario di un bot di trading algoritmico "
     "che opera su un conto paper (simulato) Alpaca. Le tue risposte vengono lette da un programma: "
     "rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo."
 )
@@ -1675,11 +1676,26 @@ def build_cio_prompt(board, cfg):
         detail = row(key, a) if a else "indicatori N/D"
         pos_lines.append(f"  - {p['yf_symbol']}: valore ${p['market_value']:,.0f}, PnL {p['unrealized_plpc']:.2f}%, "
                          f"stato {r['status']} ({r['reason']}) | {detail}")
-    cand_lines = [f"  - {a['symbol']}: {row(normalize_symbol(a['symbol']), a)}" for a in board["candidates"][:6]]
+    cand_lines = [f"  - {a['symbol']}{' [ESPLORATORE #1]' if a.get('scout') else ''}: {row(normalize_symbol(a['symbol']), a)}"
+                  for a in board["candidates"][:8]]
+    scout = board.get("scout") or {}
+    scout_lines = [
+        f"  - {d['symbol']}: score {d['score']}, anomalie: {', '.join(d['anomalies'])} → Reparto Revisione: "
+        f"{(board.get('review') or {}).get(normalize_symbol(d['symbol']), {}).get('verdict', 'N/D')} "
+        f"({(board.get('review') or {}).get(normalize_symbol(d['symbol']), {}).get('detail', '')})"
+        for d in scout.get("discoveries", [])
+    ]
     excluded = [f"{sym} ({why})" for sym, why in board["excluded"]]
     f_stock, f_crypto = risk["funds"]["stock"][0], risk["funds"]["crypto"][0]
     return (
-        "Sei il Chief Investment Officer. Hai ricevuto le analisi dettagliate dei 7 agenti del tuo comitato:\n"
+        "Sei il CIO dell'Ufficio Virtuale. Ricevi dal tuo Agente Esploratore #1 nuove proposte scovate sui mercati "
+        "globali (metalli, obbligazioni, ETF) filtrate dal Reparto Revisione.\n"
+        "Valuta se fare una ROTAZIONE DEL CAPITALE liquidando una posizione in stallo per investire nella scoperta "
+        "dell'Esploratore.\n\n"
+        f"[Esploratore #1] Settore perlustrato: {scout.get('sector_scanned', 'N/D')} | ticker ispezionati: "
+        f"{', '.join(scout.get('tickers_inspected', [])) or '-'}\n"
+        f"Scoperte:\n{chr(10).join(scout_lines) or '  (nessuna anomalia eccezionale)'}\n\n"
+        "Hai ricevuto anche le analisi dettagliate dei 7 agenti del tuo comitato:\n"
         "1. Tecnico (RSI/MACD)\n2. Sentiment News (Veto attivo?)\n3. ATR (Stop Loss %)\n4. Macro (Regime Mercato)\n"
         "5. Volume (Conferma Volumi)\n6. Drawdown (Rischio Globale)\n7. Auditor (Win Rate Storico)\n\n"
         f"[Macro] Azioni: {macro['stock']['regime']} ({macro['stock']['detail']}); "
@@ -1701,11 +1717,15 @@ def build_cio_prompt(board, cfg):
         f"- allocation_pct tra {cfg['base_allocation_pct']:.0f} e {cfg['max_allocation_pct']:.0f} in base alla confidenza "
         "(il regime macro RISK-OFF dimezza automaticamente il budget).\n"
         f"- dynamic_stop_loss_pct negativo, coerente con l'ATR (tra {STOP_WIDEST_PCT:.0f} e {STOP_TIGHTEST_PCT:.0f}).\n\n"
-        "Restituisci la decisione in formato JSON pulito:\n"
+        "- Le scoperte dell'Esploratore sono acquistabili solo se compaiono tra i candidati ammessi "
+        "(approvate dal Reparto Revisione).\n\n"
+        "Restituisci la risposta in formato JSON pulito:\n"
         '{\n  "action": "BUY" | "SELL" | "ROTATE" | "HOLD",\n  "sell_symbol": "TICKER_DA_VENDERE",\n'
-        '  "buy_symbol": "TICKER_DA_COMPRARE",\n  "allocation_pct": 15_a_30,\n'
+        '  "buy_symbol": "TICKER_PROPOSTO_DA_COMPRARE",\n  "allocation_pct": 15_a_30,\n'
         '  "dynamic_stop_loss_pct": valore_numerico_negativo,\n'
-        '  "reason": "Sintesi esecutiva che cita il parere dei vari agenti del comitato"\n}\n'
+        '  "scout_discovery_approved": true|false,\n'
+        '  "reason": "Motivazione esecutiva della decisione dell\'Ufficio Virtuale"\n}\n'
+        "scout_discovery_approved = true solo se buy_symbol è una scoperta dell'Esploratore #1.\n"
         "Usa i ticker esattamente come scritti sopra e stringa vuota per i campi non usati."
     )
 
@@ -1772,3 +1792,140 @@ def startup_system_sync(log=print):
     if summary["kept"]:
         log(f"🔄 [Sync] Vendite pendenti mantenute: {', '.join(summary['kept'])}")
     return summary
+
+
+# ===========================================================================
+# UFFICIO VIRTUALE: Agente Esploratore #1 e registro di coordinamento
+# ===========================================================================
+SCOUT_ID = "Esploratore_1"
+SCOUT_REGISTRY_PATH = os.path.join(DATA_DIR, "scout_registry.json")
+SCOUT_SECTORS = {
+    "Metalli preziosi & Materie prime": ["GLD", "SLV", "USO", "COPX"],
+    "Obbligazioni & T-Bills": ["TLT", "BND"],
+    "ETF settoriali ad alta crescita": ["SMH", "XLE", "ARKK"],
+    "Crypto (top gainer e breakout di volume)": ["LINK-USD", "DOGE-USD", "LTC-USD", "XRP-USD", "ADA-USD",
+                                                  "DOT-USD", "AAVE-USD", "BCH-USD"],
+}
+SCOUT_MAX_PICKS = 2
+SCOUT_VOLUME_ANOMALY = 1.5      # volume >= 1.5x la media della stessa ora
+SCOUT_EXPLOSIVE_ROC = 3.0       # ROC(10) >= 3% = trend esplosivo
+SCOUT_SECTOR_LOCK_MIN = 30      # un settore ispezionato da un altro esploratore è riservato per 30 minuti
+SCOUT_HISTORY_MAX = 50
+_SCOUT_REGISTRY_DEFAULT = {"scouts": {}, "history": []}
+
+
+def load_scout_registry():
+    """Registro degli esploratori; se manca o è corrotto viene rigenerato con la struttura di default."""
+    reg = read_json_file(SCOUT_REGISTRY_PATH, _SCOUT_REGISTRY_DEFAULT)
+    if not isinstance(reg.get("scouts"), dict) or not isinstance(reg.get("history"), list):
+        reg = json.loads(json.dumps(_SCOUT_REGISTRY_DEFAULT))
+        write_json_file(SCOUT_REGISTRY_PATH, reg)
+    return reg
+
+
+def _parse_ts(value):
+    try:
+        return dt.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def choose_scout_sector(registry, scout_id, market_open):
+    """Settore ispezionato meno di recente, escludendo quelli riservati da altri esploratori.
+
+    A mercato azionario chiuso solo le crypto (le uniche acquistabili).
+    """
+    now = now_local()
+    last_scan, claimed = {}, set()
+    for entry in registry["history"]:
+        ts = _parse_ts(entry.get("timestamp"))
+        sector = entry.get("sector_scanned")
+        if not ts or sector not in SCOUT_SECTORS:
+            continue
+        last_scan[sector] = max(last_scan.get(sector, ts), ts)
+        if entry.get("scout_id") != scout_id and (now - ts).total_seconds() < SCOUT_SECTOR_LOCK_MIN * 60:
+            claimed.add(sector)
+    sectors = [s for s in SCOUT_SECTORS if s not in claimed]
+    if not market_open:
+        sectors = [s for s in sectors if all(is_crypto(t) for t in SCOUT_SECTORS[s])]
+    if not sectors:
+        return None
+    oldest = dt.datetime.min.replace(tzinfo=TIMEZONE)
+    return min(sectors, key=lambda s: last_scan.get(s, oldest))
+
+
+def run_esploratore_scout(exclude_keys=(), market_open=True, log=print, scout_id=SCOUT_ID):
+    """Agente Esploratore #1: perlustra un settore fuori dalla watchlist e propone fino a 2 anomalie.
+
+    Un ticker è una scoperta se ha Score di Forza > SCORE_BUY e almeno un'anomalia: volume >= 1.5x
+    (stessa ora) o trend esplosivo (ROC >= 3%). Ricerca e scoperte vengono scritte in scout_registry.json.
+    Restituisce (voce del registro, scoperte con indicatori).
+    """
+    registry = load_scout_registry()
+    sector = choose_scout_sector(registry, scout_id, market_open)
+    if not sector:
+        log(f"🔍 [{scout_id}] Nessun settore disponibile (riservati da altri esploratori o mercato chiuso).")
+        return None, []
+
+    inspected, picks = [], []
+    for ticker in SCOUT_SECTORS[sector]:
+        if normalize_symbol(ticker) in exclude_keys:
+            continue
+        ind = get_indicators(ticker)
+        if not ind:
+            continue
+        score = ta_score(ind)
+        inspected.append(ticker)
+        anomalies = []
+        if ind.get("vol_ratio") is not None and ind["vol_ratio"] >= SCOUT_VOLUME_ANOMALY:
+            anomalies.append(f"volume {ind['vol_ratio']}x")
+        if ind["roc"] >= SCOUT_EXPLOSIVE_ROC:
+            anomalies.append(f"trend esplosivo ROC {ind['roc']:+.2f}%")
+        if anomalies and score > SCORE_BUY:
+            picks.append({"symbol": ticker, "ind": ind, "score": score, "class": classify_score(score),
+                          "anomalies": anomalies, "scout": True})
+    picks = sorted(picks, key=lambda p: p["score"], reverse=True)[:SCOUT_MAX_PICKS]
+
+    entry = {
+        "scout_id": scout_id,
+        "sector_scanned": sector,
+        "tickers_inspected": inspected,
+        "timestamp": now_local().isoformat(timespec="seconds"),
+        "discoveries": [{"symbol": p["symbol"], "score": p["score"], "roc": p["ind"]["roc"],
+                         "vol_ratio": p["ind"].get("vol_ratio"), "anomalies": p["anomalies"]} for p in picks],
+        "status": "Inviato al Reparto Revisione" if picks else "Nessuna anomalia eccezionale",
+        "review": {},
+        "cio": None,
+    }
+    registry["scouts"][scout_id] = entry
+    registry["history"] = (registry["history"] + [entry])[-SCOUT_HISTORY_MAX:]
+    write_json_file(SCOUT_REGISTRY_PATH, registry)
+
+    found = ", ".join(f"{p['symbol']} (score {p['score']}, {' + '.join(p['anomalies'])})" for p in picks)
+    log(f"🔍 [{scout_id}] Settore: {sector} | ispezionati: {', '.join(inspected) or '-'} | "
+        + (f"scoperte → Reparto Revisione: {found}" if picks else "nessuna anomalia eccezionale"))
+    return entry, picks
+
+
+def update_scout_registry(scout_id, review, cio):
+    """Registra nel registro l'esito del Reparto Revisione e la decisione del CIO sull'ultima ricerca."""
+    registry = load_scout_registry()
+    entry = registry["scouts"].get(scout_id)
+    if not entry:
+        return
+    entry["review"] = review
+    entry["cio"] = cio
+    if not entry["discoveries"]:
+        pass
+    elif cio and cio.get("approved"):
+        entry["status"] = "Approvato dal CIO"
+    elif not any(v.get("verdict") == "APPROVATO" for v in review.values()):
+        entry["status"] = "Respinto dal Reparto Revisione"
+    else:
+        entry["status"] = "Respinto dal CIO"
+    for i in range(len(registry["history"]) - 1, -1, -1):
+        h = registry["history"][i]
+        if h.get("scout_id") == scout_id and h.get("timestamp") == entry["timestamp"]:
+            registry["history"][i] = entry
+            break
+    write_json_file(SCOUT_REGISTRY_PATH, registry)

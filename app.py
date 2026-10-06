@@ -35,6 +35,7 @@ bot_state = {
     "status": "Inizializzato",
     "logs": deque(maxlen=150),  # ordine cronologico: il più recente è in fondo
     "boardroom": [],  # badge con il parere dei principali agenti (dashboard)
+    "office": {},     # Ufficio Virtuale: ricerca dell'Esploratore #1, revisione e decisione del CIO
     "latest_ai_analysis": {
         "symbol": "INIZIALIZZO...",
         "rsi": "--",
@@ -278,6 +279,15 @@ def run_trading_cycle(manual=False, boot=False):
         analysis = core.market_analyst(cfg["watchlist"] + [p["yf_symbol"] for p in positions], log=log_message)
         if not manual and should_abort():
             return
+        # Ufficio Virtuale: l'Esploratore #1 perlustra un settore fuori dalla watchlist
+        held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
+        scout_entry, scout_picks = core.run_esploratore_scout(
+            exclude_keys=set(analysis) | held_keys | pending, market_open=market_open, log=log_message)
+        scout_keys = set()
+        for pick in scout_picks:
+            key = core.normalize_symbol(pick["symbol"])
+            analysis[key] = {k: pick[k] for k in ("symbol", "ind", "score", "class", "scout")}
+            scout_keys.add(key)
         # Storico ordini Alpaca: trade chiusi, data di apertura e stop delle posizioni (nessuno stato locale)
         ledger = core.sync_ledger(log=log_message)
         # Agente 7: Post-Trade Auditor (penalità allo score prima delle altre valutazioni)
@@ -289,9 +299,10 @@ def run_trading_cycle(manual=False, boot=False):
         # Agente 6: Drawdown Controller
         drawdown = core.drawdown_controller(acc, state, log=log_message)
 
-        held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
         buy_class = core.broker_candidates(analysis, held_keys, pending, market_open)
-        focus = [p["yf_symbol"] for p in positions] + [a["symbol"] for a in buy_class[:6]]
+        # Le scoperte dell'Esploratore passano sempre dal Reparto Revisione (sentiment e volatilità inclusi)
+        focus = list(dict.fromkeys([p["yf_symbol"] for p in positions] + [a["symbol"] for a in buy_class[:6]]
+                                   + [analysis[k]["symbol"] for k in scout_keys]))
         # Agente 2: Sentiment Intelligence
         sentiment = core.sentiment_agent(focus, log=log_message)
         # Agente 3: Volatility Manager
@@ -331,9 +342,30 @@ def run_trading_cycle(manual=False, boot=False):
         if excluded:
             log_message(f"⛔ [Comitato] Esclusi: {', '.join(f'{s} ({w})' for s, w in excluded)}")
 
+        # Reparto Revisione: esito per ogni scoperta dell'Esploratore
+        review = {}
+        excluded_why = {core.normalize_symbol(s): w for s, w in excluded}
+        admitted = {core.normalize_symbol(a["symbol"]) for a in candidates}
+        for key in scout_keys:
+            a = analysis[key]
+            sent, vol_f = sentiment.get(key, {}), volume.get(key, {})
+            checks = (f"tecnico {a['score']}{' (penalità auditor)' if a.get('audit_penalty') else ''}, "
+                      f"sentiment {sent.get('sentiment', 0):+d}, volume {vol_f.get('ratio')}x, "
+                      f"drawdown {drawdown['drawdown_pct']:+.2f}%")
+            if key in admitted:
+                review[key] = {"symbol": a["symbol"], "verdict": "APPROVATO", "detail": checks}
+            else:
+                why = excluded_why.get(key) or ("score sotto la soglia BUY dopo la revisione" if a["class"] != "BUY"
+                                                else "non acquistabile ora (mercato chiuso o ordine pendente)")
+                review[key] = {"symbol": a["symbol"], "verdict": "RESPINTO", "detail": f"{why}; {checks}"}
+        if review:
+            log_message("🏢 [Reparto Revisione] " + " | ".join(
+                f"{r['symbol']}: {r['verdict']} ({r['detail']})" for r in review.values()))
+
         # Agente 8: Chief Investment Officer
         board = {"risk": risk, "macro": macro, "drawdown": drawdown, "volatility": vol, "sentiment": sentiment,
-                 "volume": volume, "audit": audit, "candidates": candidates, "excluded": excluded}
+                 "volume": volume, "audit": audit, "candidates": candidates, "excluded": excluded,
+                 "scout": scout_entry, "review": review}
         decision, source = core.ask_broker_ai(core.build_cio_prompt(board, cfg), log=log_message,
                                               system=core.CIO_SYSTEM_PROMPT)
         if not decision:
@@ -344,6 +376,24 @@ def run_trading_cycle(manual=False, boot=False):
         final = core.validate_broker_decision(decision, risk, candidates, sold_keys=sold | pending, log=log_message)
         if describe_decision(final) != describe_decision(decision):
             log_message(f"💼 [CIO] Decisione finale: {describe_decision(final)} — {final['reason']}")
+
+        # Esito della scoperta dell'Esploratore: approvata solo se il CIO la compra davvero
+        scout_buy = final["action"] in ("BUY", "ROTATE") and core.normalize_symbol(final["buy_symbol"]) in scout_keys
+        if scout_keys:
+            verdict = "APPROVATA" if scout_buy else "RESPINTA"
+            log_message(f"🏢 [CIO → Ufficio Virtuale] Scoperta dell'Esploratore #1 {verdict}: {describe_decision(final)}"
+                        + (" (il CIO l'aveva segnalata come approvata)" if decision.get("scout_discovery_approved") and not scout_buy else ""))
+        cio_outcome = {"approved": scout_buy, "decision": describe_decision(final), "source": source,
+                       "reason": core.summarize_reason(final["reason"] or decision["reason"], 300),
+                       "suspended": boot and final["action"] in ("BUY", "ROTATE")}
+        if scout_entry:
+            core.update_scout_registry(core.SCOUT_ID, review, cio_outcome)
+            bot_state["office"] = {
+                "scout_id": scout_entry["scout_id"], "sector": scout_entry["sector_scanned"],
+                "tickers_inspected": scout_entry["tickers_inspected"], "timestamp": scout_entry["timestamp"],
+                "discoveries": [{**d, **review.get(core.normalize_symbol(d["symbol"]), {})} for d in scout_entry["discoveries"]],
+                "cio": cio_outcome,
+            }
 
         target = final["buy_symbol"] or final["sell_symbol"]
         target_key = core.normalize_symbol(target) if target else None
@@ -563,6 +613,7 @@ def api_data():
             "logs": list(bot_state["logs"]),
             "latest_ai_analysis": dict(bot_state["latest_ai_analysis"]),
             "boardroom": list(bot_state["boardroom"]),
+            "office": dict(bot_state["office"]),
         }
     return jsonify({
         "account": cached("account", get_account_summary),
