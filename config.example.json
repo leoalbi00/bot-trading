@@ -16,7 +16,8 @@
     "COIN",
     "SMCI"
   ],
-  "max_allocation_pct": 15.0,
+  "base_allocation_pct": 15.0,
+  "max_allocation_pct": 30.0,
   "max_exposure_pct": 100.0,
   "stop_loss_pct": -5.0,
   "scan_interval_min": 15,

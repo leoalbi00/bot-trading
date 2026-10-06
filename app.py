@@ -319,8 +319,13 @@ def run_trading_cycle(manual=False):
             pass
         elif final["action"] == "BUY":
             crypto = core.is_crypto(final["buy_symbol"])
-            _, allocation = risk["funds"]["crypto" if crypto else "stock"]
-            execute_buy(final["buy_symbol"], allocation, auto_trade, pending)
+            buy_info = analysis.get(core.normalize_symbol(final["buy_symbol"]))
+            score = final.get("score") if final.get("score") is not None else (buy_info["score"] if buy_info else None)
+            pct = core.allocation_pct_for_score(score, cfg)
+            _, allocation = core.buy_budget(acc, risk["exposure"], cfg, crypto=crypto, score=score)
+            label = "STRONG BUY" if score is not None and score >= core.STRONG_BUY_SCORE else "BUY"
+            log_message(f"💼 [Broker] {label} {final['buy_symbol']}: score {score} → allocazione {pct:.1f}% del capitale (${allocation:,.2f})")
+            execute_buy(final["buy_symbol"], allocation, auto_trade, pending, label=f"ACQUISTO {label}")
         else:
             sell_report = next(r for r in risk["positions"]
                                if core.normalize_symbol(r["pos"]["yf_symbol"]) == core.normalize_symbol(final["sell_symbol"]))
@@ -411,8 +416,8 @@ def start_background_threads():
     threading.Thread(target=background_loop, daemon=True).start()
     threading.Thread(target=keep_alive_loop, daemon=True).start()
     log_message(f"🧵 Thread di trading e Keep-Alive avviati (PID {os.getpid()})")
-    mode = "Auto (ordini automatici)" if core.get_config()["auto_execute_trades"] else "Advisor (nessun ordine)"
-    log_message(f"⚙️ Modalità di avvio: {mode} — BOT_AUTO_EXECUTE={os.getenv('BOT_AUTO_EXECUTE', 'non impostata')}")
+    mode = "Auto-Trading attivo" if core.get_config()["auto_execute_trades"] else "Advisor (nessun ordine)"
+    log_message(f"⚙️ Modalità di avvio: {mode} — BOT_AUTO_EXECUTE={os.getenv('BOT_AUTO_EXECUTE', 'non impostata (default true)')}")
 
 @app.before_request
 def ensure_background_threads():

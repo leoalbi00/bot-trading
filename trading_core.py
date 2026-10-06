@@ -62,6 +62,7 @@ ROTATION_MIN_EDGE = 10         # vantaggio minimo di score sul titolo venduto (e
 
 # Desk multi-agente: soglie dello Score di Forza (0-100)
 SCORE_BUY = 75                 # > 75: candidato BUY
+STRONG_BUY_SCORE = 85          # >= 85: STRONG BUY, allocazione maggiorata (25-30%)
 SCORE_SELL = 45                # < 45: candidato SELL / debolezza
 STALL_SCORE = 55               # stallo: ROC vicino a 0 e score < 55...
 STALL_STREAK = 3               # ...per più di 2 cicli consecutivi
@@ -90,7 +91,8 @@ DEFAULT_CONFIG = {
         "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD",
         "NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META", "PLTR", "COIN", "SMCI",
     ],
-    "max_allocation_pct": 15.0,
+    "base_allocation_pct": 15.0,
+    "max_allocation_pct": 30.0,
     "max_exposure_pct": 100.0,
     "stop_loss_pct": -5.0,
     "scan_interval_min": 15,
@@ -102,12 +104,12 @@ DEFAULT_CONFIG = {
 
 
 def env_auto_execute():
-    """Valore iniziale di Auto-Trading da BOT_AUTO_EXECUTE (default: false = Advisor).
+    """Valore iniziale di Auto-Trading (default: true = ordini automatici).
 
-    config.json su Render si azzera a ogni deploy: senza questa variabile il bot
-    riparte sempre in modalità Advisor e non invia ordini finché non viene attivato.
+    config.json su Render si azzera a ogni deploy: il bot riparte sempre con questo valore.
+    Per avviarlo in modalità Advisor impostare BOT_AUTO_EXECUTE=false.
     """
-    return os.getenv("BOT_AUTO_EXECUTE", "false").strip().lower() in ("1", "true", "yes", "on", "si", "sì")
+    return os.getenv("BOT_AUTO_EXECUTE", "true").strip().lower() in ("1", "true", "yes", "on", "si", "sì")
 
 
 DEFAULT_CONFIG["auto_execute_trades"] = env_auto_execute()
@@ -147,7 +149,10 @@ def _validate_config(data, base):
                 raise ValueError(f"{key} deve essere tra {lo} e {hi}")
             cfg[key] = value
 
+    number("base_allocation_pct", 0.5, 100.0)
     number("max_allocation_pct", 0.5, 100.0)
+    if cfg.get("base_allocation_pct", 0) > cfg.get("max_allocation_pct", 100):
+        raise ValueError("base_allocation_pct non può superare max_allocation_pct")
     number("max_exposure_pct", 10.0, 400.0)
     number("stop_loss_pct", -50.0, -0.5)
     number("scan_interval_min", 1, 1440, int)
@@ -775,10 +780,25 @@ def close_position(alpaca_symbol):
     return alpaca_client.close_position(alpaca_symbol)
 
 
-def buy_budget(account, exposure, cfg, crypto=False):
+def allocation_pct_for_score(score, cfg):
+    """Percentuale del capitale per ordine in base alla confidenza (score 0-100).
+
+    - score < 85 (BUY standard): base_allocation_pct (default 15%)
+    - score 85-100 (STRONG BUY): da 25% a 30% in proporzione allo score,
+      senza superare max_allocation_pct
+    """
+    base, cap = cfg["base_allocation_pct"], cfg["max_allocation_pct"]
+    if score is None or score < STRONG_BUY_SCORE:
+        return min(base, cap)
+    strong = 25.0 + (min(score, 100) - STRONG_BUY_SCORE) / (100 - STRONG_BUY_SCORE) * 5.0
+    return max(min(base, cap), min(strong, cap))
+
+
+def buy_budget(account, exposure, cfg, crypto=False, score=None):
     """(fondi disponibili, importo del prossimo ordine) rispettando i limiti di rischio.
 
-    - L'ordine è max_allocation_pct del CAPITALE (equity), non del buying power a margine.
+    - L'ordine è una percentuale del CAPITALE (equity) che cresce con lo score
+      (vedi allocation_pct_for_score), non del buying power a margine.
     - L'esposizione totale (valore delle posizioni + nuovi ordini) non supera max_exposure_pct
       del capitale: con 100% il bot non usa mai il margine.
     """
@@ -788,7 +808,7 @@ def buy_budget(account, exposure, cfg, crypto=False):
         equity = 0.0
     room = equity * cfg["max_exposure_pct"] / 100 - exposure
     funds = max(0.0, min(available_funds(account, crypto), room))
-    allocation = min(equity * cfg["max_allocation_pct"] / 100, funds)
+    allocation = min(equity * allocation_pct_for_score(score, cfg) / 100, funds)
     return funds, allocation
 
 
@@ -951,7 +971,9 @@ def build_broker_prompt(risk, candidates, cfg, news=None):
         "- Le vendite per stop loss, trend ribassista e stallo prolungato sono già gestite dal Risk Manager.\n\n"
         "Restituisci la risposta in formato JSON pulito:\n"
         '{\n  "action": "BUY" | "SELL" | "ROTATE" | "HOLD",\n  "sell_symbol": "TICKER_DA_VENDERE",\n'
-        '  "buy_symbol": "TICKER_DA_COMPRARE",\n  "reason": "Spiegazione focalizzata su rotazione capitale e stallo"\n}\n'
+        '  "buy_symbol": "TICKER_DA_COMPRARE",\n  "score": 0-100,\n'
+        '  "reason": "Spiegazione focalizzata su rotazione capitale e stallo"\n}\n'
+        "score = tua confidenza nell'operazione (85-100 = STRONG BUY, aumenta il capitale investito).\n"
         "Usa i ticker esattamente come scritti sopra e stringa vuota per i campi non usati."
     )
 
@@ -977,7 +999,15 @@ def parse_broker_json(text):
         "sell_symbol": str(data.get("sell_symbol") or "").strip().upper(),
         "buy_symbol": str(data.get("buy_symbol") or "").strip().upper(),
         "reason": str(data.get("reason") or "").strip(),
+        "score": _clean_score(data.get("score")),
     }
+
+
+def _clean_score(value):
+    try:
+        return max(0, min(100, int(float(value))))
+    except (TypeError, ValueError):
+        return None
 
 
 def ask_broker_ai(prompt, log=print):
