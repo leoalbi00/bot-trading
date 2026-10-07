@@ -62,14 +62,18 @@ class MacroSentimentAgent:
     def evaluate_cross_asset_stress(
         self, 
         vix: float, 
-        us10y_yield: float = 4.0, 
-        us02y_yield: float = 4.1, 
+        us10y_yield: Optional[float] = None, 
+        us02y_yield: Optional[float] = None, 
         dxy_change_pct: float = 0.0
     ) -> Dict[str, Any]:
         """
         Valuta lo stress finanziario globale monitorando VIX, Inversione della Curva (10Y-2Y) e DXY.
+        Senza i rendimenti reali la curva viene considerata neutra (nessuna penalità inventata).
         """
-        yield_curve_spread = us10y_yield - us02y_yield  # Se < 0 -> Curva Invertita (Segnale Recessione)
+        if us10y_yield is None or us02y_yield is None:
+            yield_curve_spread = 0.0
+        else:
+            yield_curve_spread = us10y_yield - us02y_yield  # Se < 0 -> Curva Invertita (Segnale Recessione)
         
         stress_level = "LOW"
         size_multiplier = 1.0
@@ -80,7 +84,7 @@ class MacroSentimentAgent:
         elif vix >= self.vix_moderate_threshold or yield_curve_spread < -0.5:
             stress_level = "HIGH_STRESS"
             size_multiplier = 0.4
-        elif yield_curve_spread < 0 or dxy_change_pct > 0.015:
+        elif yield_curve_spread < -0.05 or dxy_change_pct > 0.015:
             stress_level = "MODERATE_HEADWIND"
             size_multiplier = 0.75
 

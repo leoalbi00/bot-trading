@@ -174,6 +174,8 @@ def journal_operation(status, pos=None):
     """Tipo di operazione per il registro: STOP LOSS / TAKE PROFIT dai trigger difensivi, altrimenti SELL."""
     if status == "STOP_LOSS":
         return "STOP LOSS"
+    if status == "TAKE_PROFIT":
+        return "TAKE PROFIT"
     if status == "TRAILING_STOP":
         return "TAKE PROFIT" if pos and pos["unrealized_pl"] > 0 else "STOP LOSS"
     return "SELL"
@@ -303,10 +305,11 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         analysis = core.market_analyst(held_yf, log=log_message) if positions else {}
         drawdown = core.drawdown_controller(acc, state, log=log_message)
         vol, stops, trailing = core.volatility_agent(held_yf, positions, cfg, log=log_message, ledger=ledger) if positions else ({}, {}, {})
-        risk = core.risk_manager(positions, analysis, acc, cfg, log=log_message, stops=stops, trailing=trailing, ledger=ledger)
+        risk = core.risk_manager(positions, analysis, acc, cfg, log=log_message, stops=stops, trailing=trailing, ledger=ledger,
+                                 market_open=market_open)
         sold = set()
         for r in risk["positions"]:
-            if r["status"] not in ("STOP_LOSS", "TRAILING_STOP", "RIBASSISTA", "STALLO"):
+            if r["status"] not in ("STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP", "RIBASSISTA", "STALLO"):
                 continue
             pos = r["pos"]
             key = core.normalize_symbol(pos["symbol"])
@@ -361,6 +364,11 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                        "ok" if final["action"] in ("BUY", "ROTATE") else "info")
 
         # Tier 5: Execution Desk
+        if drawdown["blocked"] and final["action"] in ("BUY", "ROTATE"):
+            log_message(f"🚫 [Drawdown] {describe_decision(final)} annullato: acquisti bloccati "
+                        f"(perdita giornaliera {drawdown['drawdown_pct']:+.2f}%).")
+            final = {"action": "HOLD", "buy_symbol": "", "sell_symbol": "", "notes": [],
+                     "reason": f"Acquisti bloccati dal Drawdown Controller ({drawdown['drawdown_pct']:+.2f}%)"}
         suspended = boot and final["action"] in ("BUY", "ROTATE")
         executed = False
         entry_rationale, entry_price = None, None

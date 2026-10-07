@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+from scipy.signal import lfilter
 from scipy.stats import norm
 from typing import Dict, Any
 
@@ -42,27 +43,28 @@ class HyperQuantAgent:
         hurst = poly[0] * 2.0
         return float(np.clip(hurst, 0.0, 1.0))
 
-    def garch_volatility(self, series: pd.Series) -> float:
+    def garch_volatility(self, series: pd.Series, max_obs: int = 750) -> float:
         """
         Volatilità condizionale GARCH(1,1) prevista per la prossima barra (in % per barra).
-        Parametri stimati per massima verosimiglianza; se l'ottimizzazione fallisce si usano
+        Parametri stimati per massima verosimiglianza sulle ultime `max_obs` osservazioni
+        (ricorsione della varianza vettorizzata con lfilter); se l'ottimizzazione fallisce si usano
         valori standard (alpha 0.08, beta 0.90) con varianza di lungo periodo pari a quella campionaria.
         """
-        returns = series.pct_change().dropna().values * 100.0
+        returns = series.pct_change().dropna().values[-max_obs:] * 100.0
         if len(returns) < 30:
             return float(np.std(returns)) if len(returns) > 1 else 0.0
         returns = returns - returns.mean()
         sample_var = float(returns.var())
         if sample_var <= 0:
             return 0.0
+        shocks = np.concatenate(([0.0], returns[:-1] ** 2))
 
         def variance_path(params):
+            # var[t] = omega + alpha * r[t-1]^2 + beta * var[t-1], con var[0] = varianza campionaria
             omega, alpha, beta = params
-            var = np.empty(len(returns))
-            var[0] = sample_var
-            for t in range(1, len(returns)):
-                var[t] = omega + alpha * returns[t - 1] ** 2 + beta * var[t - 1]
-            return var
+            drive = omega + alpha * shocks
+            drive[0] = sample_var
+            return lfilter([1.0], [1.0, -beta], drive)
 
         def neg_log_likelihood(params):
             if params[1] + params[2] >= 0.999:

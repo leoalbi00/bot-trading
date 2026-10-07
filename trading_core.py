@@ -80,6 +80,8 @@ STRONG_BUY_SCORE = 85          # >= 85: STRONG BUY, allocazione maggiorata (25-3
 SCORE_SELL = 45                # < 45: candidato SELL / debolezza
 STALL_SCORE = 55               # stallo: ROC vicino a 0 e score < 55...
 STALL_MIN_HOLD_MIN = 45        # ...con posizione aperta da almeno 45 minuti (3 cicli), letta da Alpaca
+TECH_EXIT_MIN_HOLD_MIN = 60    # uscite tecniche (RIBASSISTA) solo dopo 60 minuti: evita compra-vendi sul rumore
+MAX_RISK_PER_TRADE_PCT = 2.0   # perdita massima allo stop per operazione, in % del capitale (sizing vs stop)
 
 # ---------------------------------------------------------------------------
 # Configurazione dinamica (config.json)
@@ -739,16 +741,34 @@ def _finnhub_headlines(yf_symbol, limit):
         return []
 
 
+def completed_bars(df, bar=dt.timedelta(hours=1)):
+    """Solo le candele chiuse: l'ultima di yfinance è ancora in formazione e fa oscillare gli indicatori."""
+    if df is None or not len(df):
+        return df
+    last = df.index[-1]
+    now = dt.datetime.now(last.tzinfo) if getattr(last, "tzinfo", None) else dt.datetime.now()
+    return df.iloc[:-1] if last + bar > now else df
+
+
+def indicators_on_closed_bars(df):
+    """Indicatori sulle candele 1h chiuse, con il prezzo aggiornato all'ultima quotazione disponibile."""
+    closed = completed_bars(df)
+    if closed is None or len(closed) < 60:
+        return None
+    # vol_ratio usa già la penultima candela: gli si passa la serie completa per non saltarne due
+    ind = compute_indicators(closed["Close"], volume=df["Volume"])
+    ind["price"] = float(df["Close"].iloc[-1])
+    return ind
+
+
 def get_indicators(yf_symbol):
-    """Indicatori su candele 1h degli ultimi 3 mesi, oppure None se i dati sono insufficienti.
+    """Indicatori su candele 1h CHIUSE degli ultimi 3 mesi, oppure None se i dati sono insufficienti.
 
     RSI(14), MACD(12,26,9) con istogramma e incroci recenti, ROC(10), SMA20, SMA50.
     """
     try:
         df = yf.Ticker(yf_data_symbol(yf_symbol)).history(period="3mo", interval="1h")
-        if len(df) < 60:
-            return None
-        return compute_indicators(df["Close"], volume=df["Volume"])
+        return indicators_on_closed_bars(df)
     except Exception:
         return None
 
@@ -1055,13 +1075,15 @@ def market_analyst(symbols, log=print):
     return analysis
 
 
-def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trailing=None, ledger=None):
+def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trailing=None, ledger=None, market_open=True):
     """FASE 2: classifica ogni posizione e calcola fondi ed esposizione.
 
     Senza stato in memoria: il tempo di permanenza in posizione viene dalla data del primo acquisto
     ancora aperto negli ordini Alpaca (ledger["open"]), non da contatori di cicli.
-    Stati: STOP_LOSS, TRAILING_STOP, RIBASSISTA, STALLO -> vendita obbligatoria;
-           IN_STALLO (in osservazione), OK, NO_DATA -> mantenute.
+    Stati: STOP_LOSS, TAKE_PROFIT, TRAILING_STOP, RIBASSISTA, STALLO -> vendita obbligatoria;
+           IN_STALLO, IN_OSSERVAZIONE (segnale ribassista troppo presto o su dati fermi), OK, NO_DATA -> mantenute.
+    Take profit al target del Comitato Rischi: rischio/rendimento TARGET_RISK_REWARD rispetto allo stop.
+    A mercato azionario chiuso le uscite tecniche delle azioni vengono rimandate: le barre non si aggiornano.
     """
     open_info = (ledger or {}).get("open", {})
     now = now_local()
@@ -1078,19 +1100,30 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
         held_txt = "da oltre 90 giorni" if held_min is None else f"da {held_min:.0f} min"
 
         stop = (stops or {}).get(key, cfg["stop_loss_pct"])
+        take_profit = abs(stop) * TARGET_RISK_REWARD
         trail = (trailing or {}).get(key)
+        stale = not market_open and not pos.get("is_crypto")
+        too_early = held_min is not None and held_min < TECH_EXIT_MIN_HOLD_MIN
         if pl <= stop:
             status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ stop loss {stop:.1f}%"
+        elif pl >= take_profit:
+            status, reason = "TAKE_PROFIT", f"PnL {pl:.2f}% ≥ target {take_profit:.1f}% (rischio/rendimento {TARGET_RISK_REWARD:.0f}:1)"
         elif trail and trail.get("hit"):
             status, reason = "TRAILING_STOP", trail["reason"]
         elif not a:
             status, reason = "NO_DATA", "indicatori non disponibili"
         else:
             kind, why = ta_exit_signal(a["ind"])
-            if kind == "ribassista":
+            if kind != "ribassista" and a["score"] < SCORE_SELL:
+                kind, why = "ribassista", f"Score di Forza {a['score']} < {SCORE_SELL}"
+            if kind == "ribassista" and stale:
+                status, reason = "IN_OSSERVAZIONE", f"{why} · mercato chiuso: uscita rimandata all'apertura (dati fermi)"
+            elif kind == "ribassista" and too_early:
+                status, reason = "IN_OSSERVAZIONE", f"{why} · in posizione {held_txt} (uscita tecnica dopo {TECH_EXIT_MIN_HOLD_MIN} min)"
+            elif kind == "ribassista":
                 status, reason = "RIBASSISTA", why
-            elif a["score"] < SCORE_SELL:
-                status, reason = "RIBASSISTA", f"Score di Forza {a['score']} < {SCORE_SELL}"
+            elif stalled_now and held_long and stale:
+                status, reason = "IN_STALLO", f"ROC {a['ind']['roc']:.2f}% · mercato chiuso: valutazione rimandata all'apertura"
             elif stalled_now and held_long:
                 status, reason = "STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']}, in posizione {held_txt}"
             elif stalled_now:
@@ -1616,13 +1649,24 @@ def sync_ledger(days=90, log=print):
     if not alpaca_client:
         return None
     from datetime import datetime, timedelta, timezone
+    # Paginazione: Alpaca restituisce al massimo 500 ordini per richiesta (in ordine cronologico)
+    orders, seen = [], set()
+    after = datetime.now(timezone.utc) - timedelta(days=days)
     try:
-        orders = alpaca_client.get_orders(GetOrdersRequest(
-            status=QueryOrderStatus.CLOSED, limit=500, direction="asc",
-            after=datetime.now(timezone.utc) - timedelta(days=days)))
+        while True:
+            page = alpaca_client.get_orders(GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED, limit=500, direction="asc", after=after))
+            fresh = [o for o in page if o.id not in seen]
+            seen.update(o.id for o in fresh)
+            orders.extend(fresh)
+            if len(page) < 500 or not fresh:
+                break
+            after = max(o.submitted_at for o in page)
     except Exception as e:
         log(f"Errore lettura storico ordini: {e}")
         return None
+    # I lotti vanno abbinati nell'ordine di esecuzione, non di invio
+    orders.sort(key=lambda o: o.filled_at or o.submitted_at)
 
     lots, trades = {}, []
     for o in orders:
@@ -2258,11 +2302,11 @@ def micro_scout(sym, sector, f15, f1h, f1d, ref_daily):
     elapsed_ms = tempo di CPU del singolo scout (thread_time): esclude l'attesa del GIL tra i worker.
     """
     started = time.thread_time()
-    if f1h is None or len(f1h) < 60:
+    ind = indicators_on_closed_bars(f1h) if f1h is not None else None
+    if ind is None:
         return None
-    ind = compute_indicators(f1h["Close"], volume=f1h["Volume"])
-    mtf = {"15m": timeframe_trend(f15["Close"]) if f15 is not None else None,
-           "1h": timeframe_trend(f1h["Close"]),
+    mtf = {"15m": timeframe_trend(completed_bars(f15, dt.timedelta(minutes=15))["Close"]) if f15 is not None else None,
+           "1h": timeframe_trend(completed_bars(f1h)["Close"]),
            "1d": timeframe_trend(f1d["Close"]) if f1d is not None else None}
     aligned = sum(1 for v in mtf.values() if v and v["bullish"])
     vwap, vwap_dist = session_vwap(f15)
@@ -2341,6 +2385,23 @@ def gate_risk_atr(p, ctx):
             "detail": detail, "stop_pct": stop}
 
 
+def gate_quant_ensemble(p):
+    """Ensemble dei 5 agenti quantitativi (quant_core): veto se Risk/Macro bocciano o se l'Agente #5 dà SELL.
+
+    Senza una valutazione recente (es. agenti non disponibili) non blocca: il veto è dei gate classici.
+    """
+    r = quant_rationale(p["symbol"], max_age_sec=RADAR_INTERVAL_SEC * 3)
+    if not r:
+        return {"agent": "Quant Ensemble", "veto": False, "reason": "ok", "detail": "valutazione dei 5 agenti non disponibile"}
+    cio = r["agent_05_cio"]
+    decision = str(cio.get("decision") or "")
+    veto = decision.startswith("VETO") or decision == "SELL"
+    detail = (f"ensemble {cio.get('score')}/100 → {decision} (Q {r['agent_01_quant']['score']} · M {r['agent_02_micro']['score']} · "
+              f"R {r['agent_03_risk']['score']} · Macro {r['agent_04_macro']['score']})")
+    return {"agent": "Quant Ensemble", "veto": veto, "reason": (cio.get("reason") or decision) if veto else "ok",
+            "detail": detail, "ensemble_score": cio.get("score")}
+
+
 def is_tradable(yf_symbol):
     """Asset negoziabile su Alpaca (cache 6 ore). Se Alpaca non risponde si assume negoziabile."""
     key = normalize_symbol(yf_symbol)
@@ -2392,6 +2453,7 @@ def risk_committee(pitch, ctx, fng):
         if st["trades"] >= AUDIT_MIN_TRADES and st["win_rate"] < AUDIT_LOW_WINRATE:
             score = max(0, score - AUDIT_PENALTY)
             audit_note += f" → score -{AUDIT_PENALTY}"
+    gates.append(gate_quant_ensemble(pitch))
     vetoes = [f"{g['agent']}: {g['reason']}" for g in gates if g["veto"]]
     if score <= SCORE_BUY:
         vetoes.append(f"Auditor: score {score} non superiore a {SCORE_BUY} ({audit_note})")
@@ -2775,7 +2837,12 @@ def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_ke
     stop = d.get("dynamic_stop_loss_pct")
     stop = -abs(stop) if stop else pitch["package"]["stop_pct"]
     stop = round(max(STOP_WIDEST_PCT, min(STOP_TIGHTEST_PCT, stop)), 2)
-    target_amount = account["equity"] * pct / 100
+    # Sizing coerente con lo stop: allo stop non si perde più di MAX_RISK_PER_TRADE_PCT del capitale
+    risk_cap = MAX_RISK_PER_TRADE_PCT / abs(stop) * 100
+    if pct > risk_cap:
+        notes.append(f"allocazione {pct:.1f}% → {risk_cap:.1f}% (stop {stop:.1f}%: rischio max {MAX_RISK_PER_TRADE_PCT:.0f}% del capitale)")
+        pct = risk_cap
+    target_amount = round(account["equity"] * pct / 100, 2)
     funds = account["funds_crypto"] if is_crypto(pitch["symbol"]) else account["funds"]
     out = {**d, "action": "BUY", "buy_symbol": pitch["symbol"], "conviction_score": conviction, "allocation_pct": round(pct, 2),
            "dynamic_stop_loss_pct": stop, "target_amount": round(target_amount, 2), "notes": notes, "sell_symbol": "",
