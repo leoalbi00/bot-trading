@@ -299,6 +299,133 @@
             </div>
         </section>
 
+        <!-- ============ AUDIT AGENTI & REVISIONI ============ -->
+        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
+            <div class="px-4 py-3 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">📜 Audit agenti &amp; revisioni (ultime 5h)</h2>
+                <div class="flex flex-wrap gap-1 text-[11px]">
+                    <template x-for="t in auditTabs" :key="t.id">
+                        <button @click="auditTab = t.id" class="px-2.5 py-1 rounded border"
+                                :class="auditTab === t.id ? 'border-sky-500/60 bg-sky-500/10 text-sky-300' : 'border-slate-800 text-slate-400 hover:text-slate-200'"
+                                x-text="t.label + (t.id === 'rejected' ? ' · ' + (audit.rejected?.total ?? 0) : t.id === 'executed' ? ' · ' + (audit.executed || []).length : '')"></button>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Bocciate (5h) -->
+            <div x-show="auditTab === 'rejected'" class="p-4 space-y-3">
+                <div class="flex flex-wrap gap-1 text-[11px]">
+                    <button @click="auditStage = ''" class="px-2 py-0.5 rounded border"
+                            :class="auditStage === '' ? 'border-slate-500 text-slate-200' : 'border-slate-800 text-slate-500'">Tutte</button>
+                    <template x-for="[st, n] in Object.entries(audit.rejected?.by_stage || {})" :key="st">
+                        <button @click="auditStage = st" class="px-2 py-0.5 rounded border num"
+                                :class="auditStage === st ? 'border-slate-500 text-slate-200' : 'border-slate-800 text-slate-500'"
+                                x-text="st + ' ' + n"></button>
+                    </template>
+                </div>
+                <div class="overflow-x-auto max-h-96 overflow-y-auto scroll-thin">
+                    <table class="w-full text-xs">
+                        <thead class="sticky top-0 bg-slate-900">
+                            <tr class="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                                <th class="py-1.5 pr-3 font-medium">Ora</th><th class="py-1.5 pr-3 font-medium">Ticker</th>
+                                <th class="py-1.5 pr-3 font-medium">Stage</th><th class="py-1.5 pr-3 font-medium text-right">Score</th>
+                                <th class="py-1.5 pr-3 font-medium">Veto</th><th class="py-1.5 font-medium">Motivazione</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800/70">
+                            <template x-if="!auditRejected().length">
+                                <tr><td colspan="6" class="py-3 text-slate-500">Nessuna scheda bocciata nelle ultime 5 ore.</td></tr>
+                            </template>
+                            <template x-for="r in auditRejected()" :key="r.symbol + r.stage">
+                                <tr class="align-top">
+                                    <td class="py-1.5 pr-3 num text-slate-400 whitespace-nowrap" x-text="(r.time || '').slice(11, 19)"></td>
+                                    <td class="py-1.5 pr-3 num text-slate-100 whitespace-nowrap" x-text="r.symbol"></td>
+                                    <td class="py-1.5 pr-3 whitespace-nowrap" :class="r.status === 'EXPIRED' ? 'text-amber-400/90' : 'text-slate-400'"
+                                        x-text="r.stage + (r.status === 'EXPIRED' ? ' · scaduta' : '')"></td>
+                                    <td class="py-1.5 pr-3 num text-right text-slate-300" x-text="r.score ?? '—'"></td>
+                                    <td class="py-1.5 pr-3 text-rose-400 whitespace-nowrap" x-text="r.veto_agent"></td>
+                                    <td class="py-1.5 text-slate-400">
+                                        <span x-text="r.reason"></span>
+                                        <span x-show="r.count > 1" class="num text-slate-600" x-text="' · ×' + r.count"></span>
+                                        <span x-show="r.outcome" class="num" :class="r.outcome === 'lifesaver' ? 'text-emerald-400' : 'text-amber-400'"
+                                              x-text="r.outcome === 'lifesaver' ? ' · veto salvavita (' + pct(r.outcome_move_pct) + ')' : ' · falso allarme (' + pct(r.outcome_move_pct) + ')'"></span>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Approvate & storico -->
+            <div x-show="auditTab === 'executed'" class="p-4 space-y-3">
+                <template x-if="!(audit.executed || []).length">
+                    <div class="text-xs text-slate-500">Nessuna scheda approvata ed eseguita registrata.</div>
+                </template>
+                <template x-for="e in (audit.executed || [])" :key="e.symbol + e.time">
+                    <div class="rounded border px-3 py-2.5 text-xs" :class="e.in_portfolio ? 'border-emerald-500/40' : 'border-slate-800'">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <span class="flex items-center gap-2">
+                                <span class="num text-slate-100" x-text="e.symbol"></span>
+                                <span x-show="e.in_portfolio" class="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/40 text-emerald-300">in portafoglio</span>
+                                <span class="text-slate-500" x-text="e.origin || ''"></span>
+                            </span>
+                            <span class="num text-slate-500" x-text="(e.time || '').replace('T', ' ').slice(0, 19)"></span>
+                        </div>
+                        <div class="mt-1 num text-[11px] text-slate-300"
+                             x-text="e.decision + (e.cio?.conviction != null ? ' · convinzione ' + e.cio.conviction : '') + (e.cio?.allocation_pct != null ? ' · allocazione ' + e.cio.allocation_pct + '%' : '') + (e.cio?.amount != null ? ' · ' + usd(e.cio.amount) : '')"></div>
+                        <p x-show="e.cio?.reason" class="mt-1.5 text-[12px] leading-relaxed text-slate-300 border-l-2 border-slate-700 pl-2" x-text="'Perché il CIO ha comprato: ' + (e.cio?.reason || '')"></p>
+                        <div x-show="e.package" class="mt-1 num text-[11px] text-slate-400"
+                             x-text="e.package ? 'Ingresso ' + usd(e.package.entry_price) + ' · target ' + usd(e.package.target_price) + ' · stop ATR ' + e.package.stop_pct + '%' : ''"></div>
+                        <div x-show="(e.anomalies || []).length" class="mt-1 text-[11px] text-slate-500" x-text="'Anomalie Scout: ' + (e.anomalies || []).join(', ') + (e.score != null ? ' · score ' + e.score : '')"></div>
+                        <div class="mt-2 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-1.5">
+                            <template x-for="v in agentVotes(e.agents)" :key="v.name">
+                                <div class="rounded bg-slate-950/60 px-2 py-1 text-[11px]">
+                                    <div class="text-slate-500" x-text="v.name"></div>
+                                    <div class="num" :class="v.cls" x-text="v.value"></div>
+                                </div>
+                            </template>
+                        </div>
+                        <div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5" x-show="(e.risk_gates || []).length">
+                            <template x-for="g in (e.risk_gates || [])" :key="g.agent">
+                                <span class="text-[11px]" :class="g.veto ? 'text-rose-400' : 'text-emerald-400'" :title="g.detail" x-text="(g.veto ? '✕ ' : '✓ ') + g.agent"></span>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Pagella agenti -->
+            <div x-show="auditTab === 'scorecard'" class="p-4">
+                <div class="overflow-x-auto scroll-thin">
+                    <table class="w-full text-xs">
+                        <thead>
+                            <tr class="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                                <th class="py-1.5 pr-3 font-medium">#</th><th class="py-1.5 pr-3 font-medium">Agente</th>
+                                <th class="py-1.5 pr-3 font-medium text-right">Win rate</th><th class="py-1.5 pr-3 font-medium text-right">Contributo PnL</th>
+                                <th class="py-1.5 pr-3 font-medium text-right">Campioni</th><th class="py-1.5 font-medium">Metrica</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800/70">
+                            <template x-for="a in (audit.scorecard?.agents || [])" :key="a.no">
+                                <tr class="align-top">
+                                    <td class="py-1.5 pr-3 num text-slate-500" x-text="a.rank"></td>
+                                    <td class="py-1.5 pr-3 text-slate-100 whitespace-nowrap" x-text="a.name"></td>
+                                    <td class="py-1.5 pr-3 num text-right text-slate-300" x-text="a.win_rate != null ? a.win_rate + '%' : '—'"></td>
+                                    <td class="py-1.5 pr-3 num text-right" :class="a.pnl > 0 ? 'text-emerald-400' : a.pnl < 0 ? 'text-rose-400' : 'text-slate-400'"
+                                        x-text="a.pnl != null ? usd(a.pnl, true) : '—'"></td>
+                                    <td class="py-1.5 pr-3 num text-right text-slate-400" x-text="a.samples ?? '—'"></td>
+                                    <td class="py-1.5 text-slate-400"><div class="text-slate-300" x-text="a.metric"></div><div class="text-[11px] text-slate-500" x-text="a.detail"></div></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="mt-2 text-[11px] text-slate-500"
+                     x-text="(audit.scorecard?.closed_trades ?? 0) + ' trade chiusi analizzati, ' + (audit.scorecard?.voted_trades ?? 0) + ' con i voti degli agenti all\'ingresso'"></div>
+            </div>
+        </section>
+
         <!-- ============ POSIZIONI ============ -->
         <section class="border border-slate-800 rounded-lg bg-slate-900/40">
             <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
@@ -591,6 +718,8 @@
                 showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
                 showPosition: false, posSymbol: '', posDetail: null, posLoading: false, posError: '', posNotice: '', posNoticeError: false, selling: false,
                 showHistory: false, historyRows: [], historyOffline: true, historyLoading: false,
+                audit: {}, auditTab: 'rejected', auditStage: '',
+                auditTabs: [{ id: 'rejected', label: 'Bocciate (5h)' }, { id: 'executed', label: 'Approvate & Storico' }, { id: 'scorecard', label: 'Pagella Agenti' }],
                 localLogs: [], clearedId: 0, clearedTs: 0,
                 logs: [], lastLogId: 0, dialogue: [], lastDialogueId: 0, fetching: false, streamPinned: true,
                 numberFields: [
@@ -604,6 +733,8 @@
                     this.fetchStatus();
                     this.loadSettings();
                     setInterval(() => this.fetchStatus(), 1000);
+                    this.loadAudit();
+                    setInterval(() => this.loadAudit(), 15000);
                     this.$nextTick(() => window.lucide && lucide.createIcons());
                 },
 
@@ -882,6 +1013,35 @@
                     } finally {
                         this.selling = false;
                     }
+                },
+
+                // ---------- audit agenti & revisioni ----------
+                async loadAudit() {
+                    try {
+                        const res = await fetch('/api/audit');
+                        if (res.ok) this.audit = await res.json();
+                    } catch (e) { /* riprova al prossimo giro */ }
+                },
+                auditRejected() {
+                    const rows = this.audit.rejected?.rows || [];
+                    return this.auditStage ? rows.filter(r => r.stage === this.auditStage) : rows;
+                },
+                agentVotes(a) {
+                    a = a || {};
+                    const sc = (x, ok = 60) => x?.score == null ? { value: '—', cls: 'text-slate-500' }
+                        : { value: Number(x.score).toFixed(1), cls: x.score >= ok ? 'text-emerald-400' : 'text-slate-300' };
+                    const ap = (x) => x?.approved == null ? { value: '—', cls: 'text-slate-500' }
+                        : { value: x.approved ? 'OK' : 'VETO', cls: x.approved ? 'text-emerald-400' : 'text-rose-400' };
+                    const risk = a.agent_03_risk;
+                    return [
+                        { name: '#1 Quant', ...sc(a.agent_01_quant) },
+                        { name: '#2 Micro', ...sc(a.agent_02_micro, 50) },
+                        { name: '#3 Risk', ...(risk ? { value: (risk.approved ? 'OK ' : 'VETO ') + (risk.score != null ? Number(risk.score).toFixed(0) : ''), cls: risk.approved ? 'text-emerald-400' : 'text-rose-400' } : ap(risk)) },
+                        { name: '#4 Macro', ...sc(a.agent_04_macro, 50) },
+                        { name: '#5 CIO', value: a.agent_05_cio ? (a.agent_05_cio.decision + ' ' + (a.agent_05_cio.score ?? '')) : '—', cls: a.agent_05_cio?.decision === 'BUY' ? 'text-emerald-400' : 'text-slate-300' },
+                        { name: '#6 Guardian', ...ap(a.agent_06_guardian) },
+                        { name: '#7 CHOP', value: a.agent_07_chop ? ((a.agent_07_chop.scouts || []).length + ' scout' + (a.agent_07_chop.latency_ms ? ' · ' + a.agent_07_chop.latency_ms.stage3 + 'ms' : '')) : '—', cls: 'text-slate-300' },
+                    ];
                 },
 
                 // ---------- storico offline ----------

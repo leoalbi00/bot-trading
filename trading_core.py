@@ -2067,6 +2067,57 @@ ACTIVE_STATES = (SUBMITTED_PITCH, UNDER_REVIEW, APPROVED_BY_RISK)
 
 _registry_lock = threading.RLock()   # registro condiviso tra thread dello sciame e del CIO
 
+# Agents HR & Pitch Audit Register: bocciate/scadute per 5 ore, eseguite permanenti, pagella dei 7 Agenti
+AUDIT_LOG_PATH = os.getenv("BOT_AUDIT_LOG_PATH", os.path.join(DATA_DIR, "data", "pitch_audit_log.json"))
+_audit_ref = {"obj": None}
+_audit_init_lock = threading.Lock()
+
+
+def pitch_audit():
+    with _audit_init_lock:
+        if _audit_ref["obj"] is None:
+            from agents.hr_audit import PitchAuditRegister
+            _audit_ref["obj"] = PitchAuditRegister(AUDIT_LOG_PATH, clock=lambda: now_local().isoformat(timespec="seconds"))
+        return _audit_ref["obj"]
+
+
+def _audit_safe(fn, *args, **kwargs):
+    """Il registro di audit non deve mai interrompere la pipeline di trading."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        _warn_throttled("audit", f"⚠️ [Audit Agenti] Registro non aggiornato: {type(e).__name__}: {e}", print, every=600)
+        return None
+
+
+def _audit_close(pitch, status, note):
+    """Scheda chiusa dal registro dello sciame: bocciata/scaduta (5h) o eseguita (permanente)."""
+    audit = pitch_audit()
+    review = pitch.get("review") or {}
+    risk_gate = next((g for g in review.get("gates", []) if g.get("agent") == "Risk & ATR"), {})
+    price = (pitch.get("ind") or {}).get("price")
+    if status == REJECTED_BY_RISK:
+        gates = [g["agent"] for g in review.get("gates", []) if g.get("veto")] or ["Auditor"]
+        audit.record_review(pitch["symbol"], "Comitato Rischi", "REJECTED",
+                            f"Bocciata da Agente #3 (Comitato Rischi · {', '.join(gates)}) per: {note}",
+                            "Agente #3 · Comitato Rischi", 3, score=pitch.get("score"), price=price,
+                            stop_pct=risk_gate.get("stop_pct"), agents=quant_rationale(pitch["symbol"]),
+                            details={"gates": review.get("gates", []), "anomalies": pitch.get("anomalies", []),
+                                     "origin": pitch.get("origin", "Sciame classico")})
+    elif status == EXPIRED:
+        by_cio = bool(pitch.get("cio_note"))
+        audit.record_review(pitch["symbol"], "CIO" if by_cio else "Chief of Staff", "EXPIRED",
+                            (f"Scaduta: {pitch['cio_note']}" if by_cio else f"Scaduta (TTL {PROPOSAL_TTL_MIN} min): {note}"),
+                            "Agente #5 · CIO" if by_cio else "Chief of Staff (TTL)", 5 if by_cio else None,
+                            score=pitch.get("score"), price=price)
+    elif status == EXECUTED:
+        audit.record_executed(pitch["symbol"], {
+            "status": EXECUTED, "decision": note, "score": pitch.get("score"), "ensemble": pitch.get("ensemble"),
+            "origin": pitch.get("origin", "Sciame classico"), "sector": pitch.get("sector"),
+            "anomalies": pitch.get("anomalies", []), "package": pitch.get("package"),
+            "risk_gates": review.get("gates", []), "agents": quant_rationale(pitch["symbol"]),
+            "cio": pitch.get("cio_details") or {}, "discovered_at": pitch.get("discovered_at")})
+
 # Agent dialogue: telemetria in tempo reale degli agenti (buffer circolare in memoria)
 from collections import deque as _deque
 import itertools as _itertools
@@ -2125,6 +2176,7 @@ def _close(reg, pitch, status, note=""):
         pitch["note"] = note
     reg["queue"] = [p for p in reg["queue"] if p["id"] != pitch["id"]]
     reg["recent"] = ([pitch] + reg["recent"])[:RECENT_MAX]
+    _audit_safe(_audit_close, pitch, status, note)
 
 
 def _transition(pitch_ids, new_status):
@@ -2753,6 +2805,10 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             if q and q["agent_05_cio"]["decision"] == "BUY" and r["score"] < PIPELINE_MIN_TA_SCORE:
                 agent_say("Pipeline", f"{r['symbol']} → BUY dallo Stage 3 (ensemble {q['agent_05_cio']['score']}) non promosso: "
                                       f"score tecnico {r['score']} < {PIPELINE_MIN_TA_SCORE} (tecnica ribassista)", "muted")
+                _audit_safe(pitch_audit().record_review, r["symbol"], "Stage 1", "REJECTED",
+                            f"Scartata dallo Stage 1 per score tecnico {r['score']} < {PIPELINE_MIN_TA_SCORE} "
+                            f"(BUY dello Stage 3 con ensemble {q['agent_05_cio']['score']} non promosso)",
+                            "Stage 1 · filtro score tecnico (#1)", 1, score=r["score"], price=r["ind"]["price"], agents=q)
                 continue
             if q and q["agent_05_cio"]["decision"] == "BUY" and (q["agent_06_guardian"] or {}).get("approved"):
                 r.update(pitch=True, origin=PIPELINE_ORIGIN,
@@ -2789,6 +2845,10 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
                         "rvol": r["rvol"], "vwap_dist": r["vwap_dist_pct"], "beta": r["beta"], "corr": r["corr"]}
                        for r in merged), key=lambda x: x["score"], reverse=True)[:12],
     }
+
+    # Agents HR: esito dei veti dell'Agente #3 con i prezzi appena scansionati, poi salvataggio del registro
+    _audit_safe(pitch_audit().resolve_vetoes, {r["symbol"]: r["ind"]["price"] for r in results})
+    _audit_safe(pitch_audit().flush)
 
     new_pitches, skipped = [], []
     with _registry_lock:
@@ -3103,8 +3163,11 @@ def close_position_pct(alpaca_symbol, pct):
 
 
 # ---------------------------------------------------------------- dopo il CIO / dashboard
-def record_cio_outcome(selected_symbol, executed, decision_text):
-    """La scheda acquistata diventa EXECUTED; le altre restano in coda fino al TTL con una nota."""
+def record_cio_outcome(selected_symbol, executed, decision_text, details=None):
+    """La scheda acquistata diventa EXECUTED; le altre restano in coda fino al TTL con una nota.
+
+    details: mandato del CIO (convinzione, allocazione, importo, motivazione) salvato nel registro di audit.
+    """
     selected = normalize_symbol(selected_symbol) if selected_symbol else None
     with _registry_lock:
         reg = load_scout_registry()
@@ -3113,6 +3176,7 @@ def record_cio_outcome(selected_symbol, executed, decision_text):
                 continue
             if selected and normalize_symbol(p["symbol"]) == selected:
                 if executed:
+                    p["cio_details"] = details or {}
                     _close(reg, p, EXECUTED, f"eseguita dal CIO: {decision_text}")
                 else:
                     p["cio_note"] = "selezionata dal CIO, ordine non eseguito (Advisor o ciclo di avvio)"
@@ -3147,6 +3211,49 @@ def radar_snapshot():
         "recent": [item(p) for p in reg["recent"][:12]],
         "cooldown": [{"symbol": s, "minutes": int((u - now) / 60) + 1} for s, u in reg["cooldown"].items() if u > now],
     }
+
+
+_PROCESS_START = time.time()
+
+
+def _chop_health():
+    """Telemetria dell'Agente #7 per la pagella (senza azzerare i contatori della riga di audit)."""
+    core = _quant_engine_ref["core"]
+    if not core:
+        return {}
+    wd, now = core.watchdog, time.time()
+    with wd._lock:
+        lat = {s: (sum(v) / len(v) if v else None) for s, v in wd.latencies.items()}
+        stale = sorted(m for m, ts in wd.heartbeats.items() if m in ("Scout", "Pipeline") and now - ts > wd.module_silence_s)
+        heals = len(wd.heals)
+    return {"latency_ms": lat, "restarts": core.swarm.restarts, "heals": heals, "stale": stale,
+            "uptime_s": now - _PROCESS_START}
+
+
+def audit_board(held_symbols=(), stage=None, limit=300):
+    """📜 Audit Agenti & Revisioni: bocciate (5h), approvate/eseguite (permanenti) e pagella dei 7 Agenti."""
+    audit = pitch_audit()
+    held = {normalize_symbol(h) for h in held_symbols}
+
+    def fallback_votes(symbol, _ts):
+        return ((last_entry_execution(symbol) or {}).get("rationale") or {}).get("agents")
+
+    executed = audit.executed_history()
+    for e in executed:
+        e["in_portfolio"] = normalize_symbol(e["symbol"]) in held
+    # Posizioni aperte prima del registro di audit: report dal registro operazioni (executions.db)
+    for key in held - {normalize_symbol(e["symbol"]) for e in executed}:
+        entry = next((x for x in list_executions(limit=500) if x["side"] == "BUY" and normalize_symbol(x["symbol"]) == key), None)
+        if entry:
+            r = entry.get("rationale") or {}
+            executed.append({"symbol": entry["symbol"], "ts": 0, "time": entry["timestamp"], "in_portfolio": True,
+                             "decision": f"{entry['operation']} · {entry.get('note') or ''}", "agents": r.get("agents") or {},
+                             "cio": {**(r.get("desk_cio") or {}), "amount": entry.get("notional")},
+                             "package": r.get("risk_package"), "risk_gates": [], "anomalies": [],
+                             "origin": "registro operazioni"})
+    executed.sort(key=lambda e: (not e["in_portfolio"], -e["ts"]))
+    return {"rejected": audit.rejected(limit=limit, stage=stage), "executed": executed,
+            "scorecard": audit.scorecard(read_json_file(TRADE_HISTORY_PATH, []), _chop_health(), fallback_votes)}
 
 
 # ===========================================================================
@@ -3382,6 +3489,7 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
     held = {normalize_symbol(h) for h in held_keys}
     exposure_pct = (exposure_usd / balance * 100) if exposure_usd is not None and balance else 0.0
 
+    cycle_start = time.time()
     with _quant_lock:
         # Agente #6 e slot dell'Agente #5 riflettono le posizioni reali su Alpaca
         engine.portfolio_context = {"held": held, "pending": {normalize_symbol(x) for x in pending},
@@ -3397,7 +3505,9 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
     agent_say("Pipeline", f"{len(payloads)} ticker · {engine.swarm.active_last_cycle} Scout al lavoro → Stage 1 passano "
                           f"{got['stage1_pass']}/{got['received']} → Stage 2 passano {got['stage2_pass']} → "
                           f"Stage 3 valutati {got['stage3_done']}", "muted" if not got["stage3_done"] else "info")
-    for _, sym, _ in scout_frames:
+    for _, sym, frame in scout_frames:
+        if normalize_symbol(sym) not in held:
+            _audit_safe(_audit_stages, engine, sym, frame, cycle_start, (scout_meta or {}).get(sym))
         r = engine.rationale_for(sym, max_age_sec=120)
         if r:
             cio = r["agent_05_cio"]
@@ -3410,6 +3520,41 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
             f"{o['action']} {o['data']['symbol']} {o['data']['cio_result']['final_decision']} "
             f"({o['data']['cio_result']['cio_ensemble_score']})" for o in plan))
     return plan
+
+
+_STAGE3_VETO_AGENTS = {"VETO RISK": (3, "Agente #3 · Risk"), "VETO MACRO": (4, "Agente #4 · Macro/News"),
+                       "VETO GUARDIAN": (6, "Agente #6 · Guardian")}
+
+
+def _audit_stages(engine, sym, frame, cycle_start, meta):
+    """Esito della pipeline a 3 Stage per un ticker non in portafoglio: le bocciature vanno nel registro (5h)."""
+    audit = pitch_audit()
+    price = float(frame["Close"].iloc[-1]) if "Close" in frame else None
+    score = (meta or {}).get("score")
+    filtered = engine.stage_filtered.get(normalize_symbol(sym))
+    if filtered and filtered.get("at", 0) >= cycle_start:
+        if filtered["stage"] == 1:
+            audit.record_review(sym, "Stage 1", "REJECTED", f"Scartata dallo Stage 1 (Fast-Quant): {filtered['reason']}",
+                                "Stage 1 · Fast-Quant (#1 + Scout)", 1, score=score, price=price)
+        else:
+            audit.record_review(sym, "Stage 2", "REJECTED", f"Scartata dallo Stage 2 (Deep Filter): {filtered['reason']}",
+                                "Stage 2 · Deep Filter (#1 #2 #4)", 2, score=score, price=price)
+        return
+    r = engine.rationale_for(sym, max_age_sec=120)
+    if not r or r["evaluated_at"] < cycle_start:
+        return
+    cio = r["agent_05_cio"]
+    decision = str(cio.get("decision") or "")
+    if decision == "BUY":
+        return
+    first_veto = next((v for v in _STAGE3_VETO_AGENTS if decision.startswith(v)), None)
+    agent_no, agent = _STAGE3_VETO_AGENTS[first_veto] if first_veto else (5, "Agente #5 · CIO")
+    reason = (f"Bocciata da {agent} per: {cio.get('reason') or decision}" if first_veto
+              else f"Agente #5: ensemble {cio.get('score')}/100 → {decision} (soglia BUY {engine.agent_cio.buy_threshold:.0f})")
+    stop_price = _clean_number((r["agent_03_risk"] or {}).get("stop_loss_price"))
+    stop_pct = (stop_price / price - 1) * 100 if stop_price and price and stop_price < price else None
+    audit.record_review(sym, "Stage 3", "REJECTED", reason, agent, agent_no, score=cio.get("score"), price=price,
+                        stop_pct=stop_pct, agents=r)
 
 
 def refresh_held_evaluations(held_yf, log=print):
@@ -3493,6 +3638,8 @@ def record_execution(symbol, operation, side, price=None, quantity=None, notiona
            None if realized_pnl is None else round(float(realized_pnl), 2),
            json.dumps(rationale, default=str) if rationale else None, int(offline),
            str(order_id) if order_id else None, source, note)
+    if side == "SELL":
+        _audit_safe(pitch_audit().record_exit, symbol, operation, note, realized_pnl=realized_pnl, price=price)
     try:
         with _db_lock, _db() as conn:
             conn.execute("INSERT INTO executions (timestamp, symbol, operation, side, price, quantity, notional, realized_pnl, "
@@ -3584,6 +3731,7 @@ if __name__ == "__main__":
     _review_context = lambda macro: {"drawdown_pct": -0.5, "drawdown_blocked": False, "market_open": True,
                                      "macro": macro, "stats": {}}
     SCOUT_REGISTRY_PATH = os.path.join(tempfile.mkdtemp(prefix="sim-registry-"), "scout_registry.json")
+    AUDIT_LOG_PATH = os.path.join(os.path.dirname(SCOUT_REGISTRY_PATH), "data", "pitch_audit_log.json")
     _balance_cache.update(ts=time.time(), value=100000.0)
     say = lambda m: print(m, flush=True)
 
@@ -3629,11 +3777,34 @@ if __name__ == "__main__":
         print(f"✅ [Execution Desk · SIMULATO] BUY {final['buy_symbol']} ${final['buy_amount']:,.2f} "
               f"(convinzione {final['conviction_score']}, allocazione {final['allocation_pct']}%, stop {final['dynamic_stop_loss_pct']}%)"
               + (f" — {'; '.join(final['notes'])}" if final.get("notes") else ""), flush=True)
-        record_cio_outcome(final["buy_symbol"], True, f"BUY {final['buy_symbol']}")
+        record_cio_outcome(final["buy_symbol"], True, f"BUY {final['buy_symbol']}",
+                           details={"source": "Quant (simulato)", "conviction": final["conviction_score"],
+                                    "allocation_pct": final["allocation_pct"], "amount": final["buy_amount"],
+                                    "stop_pct": final["dynamic_stop_loss_pct"], "reason": final["reason"]})
         account["funds"] -= final["buy_amount"]
         account["funds_crypto"] -= final["buy_amount"]
         holdings.append({"symbol": final["buy_symbol"], "yf_symbol": final["buy_symbol"], "market_value": final["buy_amount"],
                          "weight_pct": final["allocation_pct"], "pnl_pct": 0.0, "score": None, "status": "OK"})
         inbox = cio_inbox()
     chop_audit(log=say, force=True)
+
+    pitch_audit().flush(force=True)
+    board = audit_board(held_symbols=[h["symbol"] for h in holdings])
+    rej = board["rejected"]
+    print(f"\n--- 📜 Audit Agenti & Revisioni ({AUDIT_LOG_PATH}) ---", flush=True)
+    print(f"  Bocciate/scadute consultabili per {rej['retention_hours']:.0f}h: {rej['total']} "
+          f"({', '.join(f'{k} {v}' for k, v in sorted(rej['by_stage'].items()))})", flush=True)
+    for r in rej["rows"][:8]:
+        print(f"    {r['time'][11:19]} {r['symbol']:9s} [{r['stage']}] score {r['score']} · {r['veto_agent']} · {r['reason'][:110]}",
+              flush=True)
+    print(f"  Approvate & eseguite (permanenti): {len(board['executed'])}", flush=True)
+    for e in board["executed"][:5]:
+        a = e.get("agents") or {}
+        votes = " · ".join(f"#{i} {(a.get(k) or {}).get('score', (a.get(k) or {}).get('approved'))}" for i, k in enumerate(
+            ("agent_01_quant", "agent_02_micro", "agent_03_risk", "agent_04_macro", "agent_05_cio", "agent_06_guardian"), 1))
+        print(f"    {e['symbol']:9s} {'in portafoglio' if e['in_portfolio'] else 'chiusa':14s} {e['decision']} | voti {votes} "
+              f"| CIO convinzione {e['cio'].get('conviction')}", flush=True)
+    print("  Pagella Agenti:", flush=True)
+    for a in board["scorecard"]["agents"]:
+        print(f"    {a['rank']}. {a['name']:28s} {a['metric']} — {a['detail']}", flush=True)
     quant_engine().shutdown()

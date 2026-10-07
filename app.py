@@ -409,7 +409,10 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                                conviction=final["conviction_score"], rationale=entry_rationale, price=entry_price)
                 executed = auto_trade
         if inbox:
-            core.record_cio_outcome(final.get("buy_symbol") or None, executed, describe_decision(final))
+            core.record_cio_outcome(final.get("buy_symbol") or None, executed, describe_decision(final),
+                                    details={**((entry_rationale or {}).get("desk_cio") or {}),
+                                             "amount": final.get("buy_amount"), "stop_pct": final.get("dynamic_stop_loss_pct"),
+                                             "entry_price": entry_price})
         if suspended:
             # La scheda resta APPROVED_BY_RISK: il CIO la rivaluta appena finito il ciclo di avvio, prima che scada
             request_cio(f"scheda {final['buy_symbol']} sospesa nel ciclo di avvio")
@@ -783,6 +786,15 @@ def api_history():
     offline = request.args.get("offline", "0") in ("1", "true")
     limit = max(1, min(request.args.get("limit", default=200, type=int), 1000))
     return jsonify({"executions": core.list_executions(offline_only=offline, limit=limit)})
+
+@app.route("/api/audit")
+@require_login
+def api_audit():
+    """📜 Audit Agenti & Revisioni: bocciate (ultime 5h), approvate/eseguite e pagella dei 7 Agenti."""
+    stage = request.args.get("stage") or None
+    limit = max(1, min(request.args.get("limit", default=300, type=int), 1000))
+    held = [p["yf_symbol"] for p in get_open_positions()]
+    return jsonify(core.audit_board(held_symbols=held, stage=stage, limit=limit))
 
 @app.route("/api/settings", methods=["GET"])
 @require_login
