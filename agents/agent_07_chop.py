@@ -55,6 +55,7 @@ class ChopWatchdog:
         self.heals: Deque[str] = deque(maxlen=50)
         self.stage_counts = {"received": 0, "stage1_pass": 0, "stage2_pass": 0, "stage3_done": 0}
         self._last_audit = 0.0
+        self.universe: Dict[str, Any] = {}   # copertura dell'universo dinamico (impostata dallo sciame)
         self._cpu_mark = (time.process_time(), time.time())
 
     # ------------------------------------------------------------------ telemetria
@@ -158,6 +159,10 @@ class ChopWatchdog:
                 f" | Scout al lavoro (ultimi {self.audit_interval:.0f}s) {snap['scouts_active']} · riavvii {snap['scout_restarts']}"
                 f" | Worker {snap['workers']} | rumore filtrato {noise:.0f}% "
                 f"({counts['stage1_pass']}/{counts['received']} passano lo Stage 1)")
+        u = self.universe
+        if u:
+            line += (f" | 🌐 Universo {u['total']} ticker ({u['stocks']} USA · {u['crypto']} crypto) · "
+                     f"blocco {u['chunk']}/{u['chunks']} · giri completi {u['cycles']}")
         if snap["stale_modules"]:
             line += f" | ⚠️ senza heartbeat: {', '.join(snap['stale_modules'])}"
         if snap["heals"]:

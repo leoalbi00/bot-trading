@@ -15,3 +15,4 @@ boardroom_state.json
 scout_registry.json
 executions.db
 quant_agents.log*
+universe_cache.json

@@ -505,6 +505,7 @@ def radar_loop():
                 core.run_scout_swarm(held_keys=held, pending=pending, log=log_message, rotate=True,
                                      exposure_usd=sum(abs(p["market_value"]) for p in positions), positions_count=len(positions),
                                      on_approved=lambda: request_cio("schede approvate dal Comitato Rischi"))
+                core.release_memory()   # i dati del blocco appena scansionato non servono più
                 # Mercato USA chiuso: pulse silenzioso dei panieri azionari (si autolimita a 1 volta ogni 15 min)
                 core.run_closed_market_pulse(log=log_message)
                 # Controllo rapido degli stop (stop del CIO salvato nell'ordine, altrimenti quello di riserva)

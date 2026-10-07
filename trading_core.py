@@ -24,6 +24,16 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
 dotenv.load_dotenv()
 
+# Memoria: con molti thread glibc crea un'arena di allocazione per thread e il processo cresce senza
+# restituire memoria al sistema. Si limitano le arene a 2 (prima che partano i thread) e, dopo ogni blocco
+# dello sciame, release_memory() chiama malloc_trim. Solo Linux/glibc: altrove non fa nulla.
+try:
+    import ctypes as _ctypes
+    _libc = _ctypes.CDLL("libc.so.6")
+    _libc.mallopt(-8, 2)   # M_ARENA_MAX = 2
+except Exception:
+    _libc = None
+
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -413,7 +423,9 @@ YF_DATA_ALIASES = {"UNI-USD": "UNI7083-USD"}
 
 
 def yf_data_symbol(yf_symbol):
-    return YF_DATA_ALIASES.get(yf_symbol.upper(), yf_symbol)
+    """Simbolo per Yahoo: alias noti, e classi di azioni con il trattino (BRK.B -> BRK-B)."""
+    s = YF_DATA_ALIASES.get(yf_symbol.upper(), yf_symbol)
+    return s.replace(".", "-") if "." in s and not s.startswith("^") else s
 
 
 def to_yf_symbol(alpaca_symbol, crypto=None):
@@ -2145,31 +2157,62 @@ def run_orchestrator_service(log=print):
 
 
 # ---------------------------------------------------------------- dati di mercato in batch
-def _download(tickers, period, interval, prepost=False):
-    """yf.download in batch -> {ticker: DataFrame}. Gestisce colonne MultiIndex, ticker singolo e alias Yahoo."""
+YF_BATCH = int(os.getenv("BOT_YF_BATCH", "25"))      # ticker per richiesta a Yahoo: limita il picco di memoria
+YF_THREADS = int(os.getenv("BOT_YF_THREADS", "8"))   # thread per richiesta (ognuno tiene buffer HTTP nativi)
+YF_MISSING_TTL_SEC = 6 * 3600       # ticker senza dati su Yahoo: esclusi dall'universo per 6 ore...
+YF_MISSING_CONFIRM = 2              # ...dopo 2 scansioni consecutive senza candele 1h (un vuoto isolato è rate limit)
+_yf_missing = {}                    # simbolo -> (mancanze consecutive, ultima mancanza)
+
+
+def yf_missing(symbol):
+    """True se Yahoo non ha dati per il simbolo (confermato in due scansioni nelle ultime 6 ore)."""
+    misses, last = _yf_missing.get(symbol, (0, 0.0))
+    return misses >= YF_MISSING_CONFIRM and time.time() - last < YF_MISSING_TTL_SEC
+
+
+def _download(tickers, period, interval, prepost=False, track_missing=False):
+    """yf.download a blocchi di YF_BATCH -> {ticker: DataFrame}. Gestisce MultiIndex, ticker singolo e alias Yahoo.
+
+    Ogni DataFrame restituito è una copia: senza, la vista terrebbe in memoria l'intero download del blocco.
+    Con track_missing i ticker senza dati vengono contati (yf_missing) e, se confermati, saltati dall'universo.
+    """
     tickers = list(dict.fromkeys(t for t in tickers if t))
-    if not tickers:
-        return {}
-    data_syms = {t: yf_data_symbol(t) for t in tickers}
-    try:
-        df = yf.download(list(data_syms.values()), period=period, interval=interval, group_by="ticker",
-                         progress=False, threads=True, auto_adjust=True, prepost=prepost)
-    except Exception:
-        return {}
     out = {}
-    multi = hasattr(df.columns, "levels")
-    for t in tickers:
-        d = data_syms[t]
+    for i in range(0, len(tickers), YF_BATCH):
+        batch = tickers[i:i + YF_BATCH]
+        data_syms = {t: yf_data_symbol(t) for t in batch}
         try:
-            sub = df[d] if multi and d in df.columns.get_level_values(0) else (df if not multi else None)
-            if sub is None:
-                continue
-            sub = sub.dropna(subset=["Close"])
-            if len(sub):
-                out[t] = sub
+            df = yf.download(list(data_syms.values()), period=period, interval=interval, group_by="ticker",
+                             progress=False, threads=YF_THREADS, auto_adjust=True, prepost=prepost)
         except Exception:
             continue
+        multi = hasattr(df.columns, "levels")
+        for t in batch:
+            d = data_syms[t]
+            try:
+                sub = df[d] if multi and d in df.columns.get_level_values(0) else (df if not multi else None)
+                sub = sub.dropna(subset=["Close"]).copy() if sub is not None else None
+                if sub is not None and len(sub):
+                    out[t] = sub
+                    if track_missing:
+                        _yf_missing.pop(t, None)
+                elif track_missing and len(df):   # il blocco ha dati ma questo ticker no
+                    _yf_missing[t] = (_yf_missing.get(t, (0, 0.0))[0] + 1, time.time())
+            except Exception:
+                continue
+        del df
     return out
+
+
+def release_memory():
+    """Restituisce al sistema la memoria liberata dai download (glibc la tratterrebbe altrimenti)."""
+    import gc
+    gc.collect()
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
 
 
 def _daily_frames(tickers):
@@ -2539,6 +2582,57 @@ def swarm_baskets(market_open=True, include=None):
     return baskets
 
 
+# ---------------------------------------------------------------- universo dinamico
+DYNAMIC_UNIVERSE = os.getenv("BOT_DYNAMIC_UNIVERSE", "1").strip().lower() not in _FALSE
+UNIVERSE_CHUNK_SIZE = 100            # ticker per giro dello sciame (rotazione continua sull'universo)
+UNIVERSE_RESULT_TTL_SEC = 20 * 60    # i risultati restano nei canali aggregati finché il giro completo non li rinnova
+_screener_ref = {"obj": None, "last_line": None}
+
+
+def universe_screener():
+    if _screener_ref["obj"] is None:
+        from scouts.universe_screener import DynamicUniverseScreener
+        _screener_ref["obj"] = DynamicUniverseScreener(os.path.join(DATA_DIR, "universe_cache.json"), alpaca_client,
+                                                       (ALPACA_KEY, ALPACA_SECRET))
+    return _screener_ref["obj"]
+
+
+def universe_chunk(market_open, log=print):
+    """Blocco successivo dell'universo dinamico: (baskets, tickers in ordine, negoziabilità, info) o None."""
+    release_memory()        # libera i dati del blocco precedente prima di scaricare il successivo
+    screener = universe_screener()
+    snap = screener.refresh()
+    listed = screener.tickers(snap, market_open)
+    universe = [u for u in listed if not yf_missing(u[0])]
+    if not universe:
+        return None
+    chunk, k, n = screener.next_chunk(universe, UNIVERSE_CHUNK_SIZE)
+    in_chunk = {t for t, _, _ in chunk}
+    # La watchlist dell'utente viene scansionata a ogni giro, non solo quando arriva il suo blocco
+    for t in get_config()["watchlist"]:
+        if t not in in_chunk and (market_open or is_crypto(t)):
+            chunk.append((t, "Watchlist", True))
+            in_chunk.add(t)
+    groups = {}
+    for t, src, _ in chunk:
+        groups.setdefault(src, []).append(t)
+    info = {"stocks": len(snap["stocks"]), "crypto": len(snap["crypto"]), "total": len(universe),
+            "chunk": k, "chunks": n, "cycles": screener.cycles, "scanned": len(chunk),
+            "crypto_tradable": sum(1 for c in snap["crypto"] if c["tradable"]), "no_data": len(listed) - len(universe),
+            "index": {t: i + 1 for i, (t, _, _) in enumerate(universe)}}
+    line = (f"🌐 [UNIVERSE SCREENER] Caricati {info['stocks']} Titoli USA e {info['crypto']} Pair Crypto "
+            f"({info['crypto_tradable']} negoziabili su Alpaca) | {QUANT_SWARM_SIZE} Scout operativi su "
+            f"{info['total']} Ticker totali{'' if market_open else ' (mercato USA chiuso: solo crypto 24/7)'}"
+            + (f" · {info['no_data']} esclusi per 6h (nessun dato su Yahoo)" if info["no_data"] else ""))
+    if k == 1 or _screener_ref["last_line"] != line:
+        log(line)
+        errors = [f"{name}: {v['error']}" for name, v in snap["sources"].items() if v.get("error")]
+        if errors:
+            log(f"⚠️ [UNIVERSE SCREENER] Fonti con errori (uso l'ultimo elenco valido): {'; '.join(errors)}")
+        _screener_ref["last_line"] = line
+    return list(groups.items()), [t for t, _, _ in chunk], {t: tr for t, _, tr in chunk}, info
+
+
 def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotate=False, exposure_usd=None,
                     positions_count=None):
     """Tier 1 -> 2 -> 3: scansione parallela, schede all'Orchestrator, revisione immediata.
@@ -2548,42 +2642,60 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     """
     reg = run_orchestrator_service(log=log)
     market_open = is_us_market_open()
-    if market_open:
-        # A. Mercato aperto: round-robin sui 6 panieri classici
-        mode_baskets, cursor = [n for n, _ in DESK_BASKETS], "basket_index"
-    else:
-        # B. Mercato chiuso: focus 24/7 sulle crypto, alternando i 2 sotto-panieri
-        mode_baskets, cursor = [n for n, _ in CRYPTO_SUB_BASKETS], "crypto_index"
-    names = mode_baskets
-    if rotate:
-        with _registry_lock:
-            reg = load_scout_registry()
-            idx = int(reg["radar"].get(cursor, 0)) % len(names)
-            reg["radar"][cursor] = (idx + 1) % len(names)
-            reg["radar"]["mode"] = "open" if market_open else "closed"
-            _save_registry(reg)
+    tradable, uinfo = {}, None
+    if DYNAMIC_UNIVERSE and rotate:
+        try:
+            dyn = universe_chunk(market_open, log=log)
+        except Exception as e:
+            dyn = None
+            log(f"⚠️ [UNIVERSE SCREENER] Errore ({type(e).__name__}: {e}): uso i panieri statici.")
+        if dyn:
+            baskets, tickers, tradable, uinfo = dyn
+            all_baskets, names = baskets, [n for n, _ in baskets]
+            universe = {t: name for name, ts in baskets for t in ts}
+            scout_no = {t: uinfo["index"].get(t, 0) for t in tickers}
+            quant_engine().watchdog.universe = {k: v for k, v in uinfo.items() if k != "index"}
+            agent_say("Chief of Staff", f"🌐 Blocco {uinfo['chunk']}/{uinfo['chunks']} dell'universo dinamico "
+                                        f"({uinfo['total']} ticker): {len(tickers)} ticker ai {QUANT_SWARM_SIZE} Scout"
+                                        + ("" if market_open else " · mercato USA chiuso, solo crypto"))
+    if not uinfo:
+        # Panieri statici: universo dinamico disattivato (BOT_DYNAMIC_UNIVERSE=0) o non disponibile
         if market_open:
-            all_baskets = swarm_baskets(True, include={names[idx]})
+            # A. Mercato aperto: round-robin sui 6 panieri classici
+            mode_baskets, cursor = [n for n, _ in DESK_BASKETS], "basket_index"
         else:
-            all_baskets = [(n, list(t)) for n, t in CRYPTO_SUB_BASKETS]
-        baskets = [b for b in all_baskets if b[0] == names[idx]]
-        if not baskets[0][1]:
-            agent_say("Chief of Staff", f"Paniere {names[idx]}: nessun ticker disponibile (screener vuoto), passo al successivo", "muted")
-            return None
-    else:
-        all_baskets = swarm_baskets(True) if market_open else [(n, list(t)) for n, t in CRYPTO_SUB_BASKETS]
-        baskets = [b for b in all_baskets if b[1]]
-    universe = {t: name for name, tickers in baskets for t in tickers}
-    tickers = list(universe)
-    scout_no = {t: i + 1 for i, t in enumerate(dict.fromkeys(t for _, ts in all_baskets for t in ts))}
+            # B. Mercato chiuso: focus 24/7 sulle crypto, alternando i 2 sotto-panieri
+            mode_baskets, cursor = [n for n, _ in CRYPTO_SUB_BASKETS], "crypto_index"
+        names = mode_baskets
+        if rotate:
+            with _registry_lock:
+                reg = load_scout_registry()
+                idx = int(reg["radar"].get(cursor, 0)) % len(names)
+                reg["radar"][cursor] = (idx + 1) % len(names)
+                reg["radar"]["mode"] = "open" if market_open else "closed"
+                _save_registry(reg)
+            if market_open:
+                all_baskets = swarm_baskets(True, include={names[idx]})
+            else:
+                all_baskets = [(n, list(t)) for n, t in CRYPTO_SUB_BASKETS]
+            baskets = [b for b in all_baskets if b[0] == names[idx]]
+            if not baskets[0][1]:
+                agent_say("Chief of Staff", f"Paniere {names[idx]}: nessun ticker disponibile (screener vuoto), passo al successivo", "muted")
+                return None
+        else:
+            all_baskets = swarm_baskets(True) if market_open else [(n, list(t)) for n, t in CRYPTO_SUB_BASKETS]
+            baskets = [b for b in all_baskets if b[1]]
+        universe = {t: name for name, tickers in baskets for t in tickers}
+        tickers = list(universe)
+        scout_no = {t: i + 1 for i, t in enumerate(dict.fromkeys(t for _, ts in all_baskets for t in ts))}
+        mode_label = "" if market_open else " · focus crypto 24/7"
+        agent_say("Chief of Staff", f"Paniere {', '.join(f'{names.index(n) + 1}/{len(names)} {n}' for n, _ in baskets)}: "
+                                    f"{len(tickers)} micro-scout in partenza{mode_label}")
     closed_note = ""
-    mode_label = "" if market_open else " · focus crypto 24/7"
-    agent_say("Chief of Staff", f"Paniere {', '.join(f'{names.index(n) + 1}/{len(names)} {n}' for n, _ in baskets)}: "
-                                f"{len(tickers)} micro-scout in partenza{mode_label}")
 
     t_dl = time.perf_counter()
     f15 = _download(tickers, "5d", "15m")
-    f1h = _download(tickers, "3mo", "1h")
+    f1h = _download(tickers, "3mo", "1h", track_missing=bool(uinfo))
     f1d = _daily_frames(tickers + REFERENCE_TICKERS)
     download_s = round(time.perf_counter() - t_dl, 1)
     macro = macro_channel({t: f1d.get(t) for t in REFERENCE_TICKERS})
@@ -2597,10 +2709,18 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         r = micro_scout(sym, universe[sym], f15.get(sym), f1h.get(sym), f1d.get(sym), ref_for(sym), pitch_score=pitch_score)
         tag = f"Scout #{scout_no.get(sym, 0):02d}"
         if not r:
-            agent_say(tag, f"{sym} → dati insufficienti", "muted")
+            if not uinfo:
+                agent_say(tag, f"{sym} → dati insufficienti", "muted")
         else:
-            monitoring = not market_open and not is_crypto(sym)
-            if monitoring and r["pitch"]:
+            not_tradable = tradable.get(sym, True) is False
+            monitoring = (not market_open and not is_crypto(sym)) or not_tradable
+            r["tradable"] = not not_tradable
+            if not_tradable and r["pitch"]:
+                r["pitch"] = False   # non negoziabile su Alpaca: solo intelligence di mercato
+                verdict = "anomalia rilevata · non negoziabile su Alpaca, solo monitoraggio"
+            elif not_tradable:
+                verdict = "non negoziabile su Alpaca, solo monitoraggio"
+            elif monitoring and r["pitch"]:
                 r["pitch"] = False   # mercato chiuso: l'anomalia viene solo segnalata, nessuna scheda
                 verdict = "anomalia rilevata · mercato USA chiuso, nessuna scheda (solo monitoraggio)"
             elif monitoring:
@@ -2608,9 +2728,11 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             else:
                 verdict = ("ANOMALIA → pitch al Chief of Staff" if r["pitch"]
                            else (f"anomalia senza forza (score ≤ {pitch_score})" if r["anomalies"] else "nessuna anomalia"))
-            agent_say(tag, f"{sym} → score {r['score']} · MTF {r['mtf_aligned']}/3 · RVOL {r['rvol']}x · "
-                           f"VWAP {r['vwap_dist_pct']}% · {verdict} ({r['elapsed_ms']}ms CPU)",
-                      "alert" if r["pitch"] else "info")
+            # Universo dinamico (100+ ticker per giro): nel feed solo le anomalie, per non coprire il resto
+            if not uinfo or r["anomalies"]:
+                agent_say(tag, f"{sym} → score {r['score']} · MTF {r['mtf_aligned']}/3 · RVOL {r['rvol']}x · "
+                               f"VWAP {r['vwap_dist_pct']}% · {verdict} ({r['elapsed_ms']}ms CPU)",
+                          "alert" if r["pitch"] else "info")
         return r
 
     t_sc = time.perf_counter()
@@ -2629,7 +2751,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             force=[r["symbol"] for r in results if r["pitch"] or normalize_symbol(r["symbol"]) in held_keys],
             scout_meta={r["symbol"]: {"rvol": r["rvol"], "score": r["score"]} for r in results})
         for r in results:
-            if r["pitch"] or not (market_open or is_crypto(r["symbol"])):
+            if r["pitch"] or not (market_open or is_crypto(r["symbol"])) or not r.get("tradable", True):
                 continue
             q = quant_rationale(r["symbol"], max_age_sec=120)
             if q and q["agent_05_cio"]["decision"] == "BUY" and r["score"] < PIPELINE_MIN_TA_SCORE:
@@ -2650,7 +2772,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     for r in results:
         _last_scout_results[r["symbol"]] = {**r, "_ts": now_ts}
     for sym, r in list(_last_scout_results.items()):
-        if now_ts - r["_ts"] > RADAR_INTERVAL_SEC * 3:
+        if now_ts - r["_ts"] > (UNIVERSE_RESULT_TTL_SEC if uinfo else RADAR_INTERVAL_SEC * 3):
             _last_scout_results.pop(sym, None)
     merged = list(_last_scout_results.values())
 
@@ -2659,7 +2781,10 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         "macro": macro, "fear_greed": fng,
         "scouts": len(merged), "workers": min(SCOUT_MAX_WORKERS, len(tickers)), "download_s": download_s,
         "scouts_ms": scouts_ms, "max_scout_ms": max_scout_ms, "last_basket": ", ".join(n for n, _ in baskets),
-        "mode": "Mercato USA aperto · rotazione 6 panieri" if market_open else "Mercato USA chiuso · focus crypto 24/7",
+        "mode": (f"Universo dinamico · {uinfo['total']} ticker ({uinfo['stocks']} USA · {uinfo['crypto']} crypto) · "
+                 f"blocco {uinfo['chunk']}/{uinfo['chunks']}" + ("" if market_open else " · mercato USA chiuso: solo crypto")
+                 if uinfo else "Mercato USA aperto · rotazione 6 panieri" if market_open else "Mercato USA chiuso · focus crypto 24/7"),
+        "universe": {k: v for k, v in uinfo.items() if k != "index"} if uinfo else None,
         "baskets": [{"name": n, "tickers": sum(1 for r in merged if r["sector"] == n),
                      "anomalies": sum(1 for r in merged if r["sector"] == n and r["anomalies"]),
                      "current": n in {b for b, _ in baskets}}
@@ -2699,7 +2824,9 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         reg["radar"]["last_scan_epoch"] = _now_epoch()
         _save_registry(reg)
 
-    log(f"📡 [Sciame] {', '.join(n for n, _ in baskets)}{closed_note}: {len(results)} micro-scout | dati {download_s}s, calcoli {scouts_ms}ms "
+    where = (f"🌐 Blocco {uinfo['chunk']}/{uinfo['chunks']} ({len(tickers)} ticker, {len(results)} con dati)" if uinfo
+             else f"{', '.join(n for n, _ in baskets)}{closed_note}")
+    log(f"📡 [Sciame] {where}: {len(results)} micro-scout | dati {download_s}s, calcoli {scouts_ms}ms "
         f"(CPU max {max_scout_ms}ms/scout) | VIX {macro['vix']} (soglia anomalie {pitch_score}) | "
         + (f"schede → Chief of Staff: {', '.join(p['symbol'] + ' (' + ', '.join(p['anomalies']) + ')' for p in new_pitches)}"
            if new_pitches else "nessuna nuova anomalia")
@@ -3416,27 +3543,31 @@ def last_entry_execution(symbol):
 
 # ===========================================================================
 # CICLO DI TEST SIMULATO:  python trading_core.py
-#   Percorre il flusso reale di produzione con dati sintetici e senza rete né ordini:
-#   run_scout_swarm (sciame classico + 100 Scout + Stage 1-3) -> Comitato Rischi -> APPROVED_BY_RISK
-#   -> CIO del desk (motore quantitativo) -> ordine SIMULATO. Il registro è in una cartella temporanea.
+#   Universo reale dal Dynamic Universe Screener (solo elenchi pubblici; se la rete manca si usa la cache o
+#   i panieri statici) e prezzi SINTETICI. Percorre tutti i blocchi della rotazione con il flusso di produzione:
+#   run_scout_swarm (100 Scout + Stage 1-3) -> Comitato Rischi -> APPROVED_BY_RISK -> CIO del desk -> ordine SIMULATO.
+#   Nessun ordine inviato; registro in una cartella temporanea. SIM_VERBOSE=1 mostra ogni riga degli agenti.
 # ===========================================================================
 if __name__ == "__main__":
+    import logging
     import tempfile
+    import zlib
     import numpy as np
 
+    if not os.getenv("SIM_VERBOSE"):
+        logging.getLogger("quant_core").setLevel(logging.WARNING)
     _now = pd.Timestamp.now(tz="UTC")
-    UPTREND = {"NVDA", "AMD", "SOL-USD", "LINK-USD", "TSLA", "GLD"}   # trend rialzista
-    SPIKE = {"NVDA", "SOL-USD", "TSLA"}                               # + anomalia di volume -> scheda dello sciame classico
-    REFS = {"^VIX": "flat15", "SPY": "up", "QQQ": "up", "BTC-USD": "up"}
+    UPTREND = {"NVDA", "AMD", "SOL-USD", "LINK-USD", "TSLA", "GLD", "MSFT", "AAPL", "ETH-USD"}
+    SPIKE = {"NVDA", "SOL-USD", "TSLA", "AMD"}
 
     def _frame(sym, interval, bars):
-        seed = abs(hash((sym, interval))) % (2 ** 32)
+        seed = zlib.crc32(f"{sym}/{interval}".encode())
         rng = np.random.default_rng(seed)
-        kind = REFS.get(sym) or ("up" if sym in UPTREND else "flat")
+        kind = "flat15" if sym == "^VIX" else ("up" if sym in UPTREND or sym in ("SPY", "QQQ", "BTC-USD") or seed % 9 == 0 else "flat")
         drift, noise = {"up": (0.0009, 0.005), "flat": (0.0, 0.006), "flat15": (0.0, 0.0)}[kind]
         close = 100 * np.exp(np.cumsum(rng.normal(drift, noise, bars))) if kind != "flat15" else np.full(bars, 15.3)
         vol = rng.integers(900, 1100, bars).astype(float)
-        if sym in SPIKE and interval == "1h":
+        if interval == "1h" and (sym in SPIKE or seed % 23 == 0):
             vol[-2] *= 3.2                       # ultima candela CHIUSA (la -1 è in formazione)
         freq = {"15m": "15min", "1h": "h", "1d": "D"}[interval]
         index = pd.date_range(end=_now.floor(freq), periods=bars, freq=freq)
@@ -3444,11 +3575,10 @@ if __name__ == "__main__":
         return pd.DataFrame({"Open": open_, "High": np.maximum(open_, close) * 1.001,
                              "Low": np.minimum(open_, close) * 0.999, "Close": close, "Volume": vol}, index=index)
 
-    # Sostituzione delle funzioni di rete con dati sintetici (solo in questo test)
-    _download = lambda tickers, period, interval, prepost=False: {
-        t: _frame(t, interval, {"15m": 400, "1h": 700, "1d": 300}[interval]) for t in tickers}
-    _daily_frames = lambda tickers: {t: _frame(t, "1d", 300) for t in tickers}
-    dynamic_volume_spikes = lambda limit=10: []
+    # Rete simulata per i prezzi (lo screener usa invece gli elenchi reali)
+    _download = lambda tickers, period, interval, prepost=False, track_missing=False: {
+        t: _frame(t, interval, {"15m": 300, "1h": 400, "1d": 260}[interval]) for t in tickers}
+    _daily_frames = lambda tickers: {t: _frame(t, "1d", 260) for t in tickers}
     is_us_market_open = lambda: True
     crypto_fear_greed = lambda: {"value": 55, "label": "Greed"}
     get_recent_news = lambda sym, limit=3: "Nessuna notizia rilevante recente."
@@ -3461,15 +3591,34 @@ if __name__ == "__main__":
     _balance_cache.update(ts=time.time(), value=100000.0)
     say = lambda m: print(m, flush=True)
 
-    print(f"=== Ciclo simulato: sciame classico + {QUANT_SWARM_SIZE} Scout -> 3 Stage -> Comitato Rischi -> CIO ===", flush=True)
-    run_scout_swarm(held_keys={"AMZN"}, pending=set(), log=say, rotate=False, exposure_usd=20000.0, positions_count=1,
-                    on_approved=lambda: say("📣 Schede APPROVED_BY_RISK: CIO svegliato"))
+    print(f"=== Ciclo simulato: Dynamic Universe Screener + {QUANT_SWARM_SIZE} Scout -> 3 Stage -> Comitato Rischi -> CIO ===",
+          flush=True)
+    seen, approved_total = {}, []
+    t0 = time.time()
+    while True:
+        before = universe_screener().cycles
+        run_scout_swarm(held_keys={"AMZN"}, pending=set(), log=say, rotate=True, exposure_usd=20000.0, positions_count=1,
+                        on_approved=lambda: say("📣 Schede APPROVED_BY_RISK: CIO svegliato"))
+        for sym, r in _last_scout_results.items():
+            seen[sym] = r
+        if universe_screener().cycles > before:      # giro completo dell'universo
+            break
+
+    snap = universe_screener().snapshot()
+    stocks = {s["symbol"] for s in snap["stocks"]}
+    crypto = {c["symbol"] for c in snap["crypto"]}
+    print(f"\n--- Copertura: {len(seen)} ticker elaborati dagli Scout in {time.time() - t0:.0f}s "
+          f"({len(stocks & set(seen))}/{len(stocks)} azioni USA · {len(crypto & set(seen))}/{len(crypto)} crypto) ---", flush=True)
+    for sym in ("NVDA", "TSLA", "AAPL", "AMD", "MSFT", "BTC-USD", "ETH-USD", "SOL-USD"):
+        r = seen.get(sym)
+        print(f"  {sym:8s} " + (f"score {r['score']:3d} · RVOL {r['rvol']}x · MTF {r['mtf_aligned']}/3 · anomalie: "
+                                f"{', '.join(r['anomalies']) or '-'}" if r else "NON elaborato"), flush=True)
 
     reg = load_scout_registry()
     print("\n--- Registro del Chief of Staff ---", flush=True)
     for p in reg["queue"] + reg["recent"]:
         print(f"  {p['symbol']:9s} {p['status']:17s} origine {p.get('origin', 'Sciame classico'):15s} score {p['score']} "
-              f"ensemble {p.get('ensemble')} | {p.get('note', '')[:110]}", flush=True)
+              f"ensemble {p.get('ensemble')} | {p.get('note', '')[:100]}", flush=True)
 
     inbox = cio_inbox()
     account = {"equity": 100000.0, "exposure": 20000.0, "funds": 80000.0, "funds_crypto": 80000.0}
@@ -3490,6 +3639,5 @@ if __name__ == "__main__":
         holdings.append({"symbol": final["buy_symbol"], "yf_symbol": final["buy_symbol"], "market_value": final["buy_amount"],
                          "weight_pct": final["allocation_pct"], "pnl_pct": 0.0, "score": None, "status": "OK"})
         inbox = cio_inbox()
-    print("\nStati finali: " + ", ".join(f"{p['symbol']} {p['status']}" for p in load_scout_registry()["recent"]), flush=True)
     chop_audit(log=say, force=True)
     quant_engine().shutdown()

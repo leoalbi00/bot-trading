@@ -70,7 +70,8 @@ def _build_logger() -> logging.Logger:
     log = logging.getLogger("quant_core")
     if log.handlers:
         return log
-    log.setLevel(logging.INFO)
+    if log.level == logging.NOTSET:   # rispetta un livello impostato prima dell'import (es. test simulato)
+        log.setLevel(logging.INFO)
     log.propagate = False
     fmt = "%(asctime)s [%(levelname)s] %(message)s"
     console = logging.StreamHandler()
