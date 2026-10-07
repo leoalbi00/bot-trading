@@ -410,6 +410,9 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                 executed = auto_trade
         if inbox:
             core.record_cio_outcome(final.get("buy_symbol") or None, executed, describe_decision(final))
+        if suspended:
+            # La scheda resta APPROVED_BY_RISK: il CIO la rivaluta appena finito il ciclo di avvio, prima che scada
+            request_cio(f"scheda {final['buy_symbol']} sospesa nel ciclo di avvio")
 
         macro = (channels.get("macro") or {})
         with state_lock:

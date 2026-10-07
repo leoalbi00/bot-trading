@@ -40,6 +40,8 @@ QUANT_LOG_PATH = os.path.join(os.getenv("BOT_DATA_DIR", os.path.dirname(os.path.
 DEFAULT_ACCOUNT_BALANCE = 10000.0
 STREAM_END = None   # sentinella: fine del pacchetto inviato dagli Scout sulla coda
 SWARM_SIZE = 100
+RVOL_STAGE1_BYPASS = 2.5        # volume relativo eccezionale: passa lo Stage 1...
+STAGE1_BYPASS_MIN_SCORE = 35    # ...se lo score tecnico dello Scout è almeno intermedio
 
 
 class _ColorFormatter(logging.Formatter):
@@ -110,6 +112,7 @@ def build_scout_payload(
     account_balance: Optional[float] = None,
     scout_id: Optional[Union[int, str]] = None,
     force_full: bool = False,
+    scout_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Payload standard di un candidato.
 
@@ -129,6 +132,8 @@ def build_scout_payload(
         "account_balance": balance,
         "scout_id": scout_id if scout_id is not None else "?",
         "force_full": bool(force_full),
+        # Esito dello Scout classico (score tecnico 0-100 e RVOL): abilita il bypass RVOL dello Stage 1
+        "scout_meta": dict(scout_meta or {}),
     }
 
 
@@ -214,10 +219,7 @@ class QuantitativeTradingCore:
 
     def _best_case_score(self, quant: float, micro: float, macro: float) -> float:
         """Ensemble massimo raggiungibile con Agente #3 a 100: se è sotto la soglia BUY lo Stage 3 è inutile."""
-        normal = self.agent_cio.get_dynamic_weights(False)
-        high = self.agent_cio.get_dynamic_weights(True)
-        return max(w["quant"] * quant + w["microstructure"] * micro + w["risk"] * 100 + w["macro"] * macro
-                   for w in (normal, high))
+        return max(self.agent_cio.ensemble_score(quant, micro, 100.0, macro, high) for high in (False, True))
 
     def _filtered(self, symbol: str, stage: int, reason: str, extra: Dict[str, Any]) -> None:
         with self._eval_lock:
@@ -248,15 +250,24 @@ class QuantitativeTradingCore:
         triggered = [s for s in signals if s.get("triggered")]
         # Il bot apre solo posizioni long: i segnali ribassisti contano solo per le posizioni aperte (forzate)
         bullish = [s for s in triggered if s.get("side") == "LONG"]
-        passed = force or (fast["interesting"] and bool(bullish))
+        meta = candidate_data.get("scout_meta") or {}
+        rvol, scout_score = meta.get("rvol"), meta.get("score")
+        rvol_bypass = (rvol is not None and rvol > RVOL_STAGE1_BYPASS and scout_score is not None
+                       and scout_score >= STAGE1_BYPASS_MIN_SCORE)
+        passed = force or rvol_bypass or (fast["interesting"] and bool(bullish))
         ms1 = (time.perf_counter() - t1) * 1000
         self.watchdog.record_latency("stage1", ms1)
         self.watchdog.count("received")
         scout_txt = ", ".join(f"{s['category']}{'↑' if s['side'] == 'LONG' else '↓'}" for s in triggered) or "nessuno"
-        verdict = "PASSA → Stage 2" + (" (forzato: posizione/scheda)" if force and not (fast["interesting"] and triggered) else "") \
+        natural = fast["interesting"] and bool(bullish)
+        verdict = "PASSA → Stage 2" + (" (forzato: posizione/scheda)" if force and not natural
+                                       else f" (RVOL {rvol}x > {RVOL_STAGE1_BYPASS}x, score {scout_score})"
+                                       if rvol_bypass and not natural else "") \
             if passed else ("FILTRATO (rumore: nessuno Scout attivato)" if not triggered
                             else "FILTRATO (solo segnali ribassisti: il bot non va short)" if not bullish
-                            else "FILTRATO (rumore: prezzo statisticamente casuale)")
+                            else "FILTRATO (rumore: prezzo statisticamente casuale)") \
+            + (f" [RVOL {rvol}x ma score {scout_score} < {STAGE1_BYPASS_MIN_SCORE}]"
+               if not passed and rvol is not None and rvol > RVOL_STAGE1_BYPASS else "")
         logger.info(f"[STAGE 1 · FAST-QUANT] ⚡ {symbol} -> Hurst: {fast['hurst']:.3f}, Z-Score: {fast['z_score']:+.2f}, "
                     f"Vol Spike: {fast['vol_spike']:.1f}σ | Scout attivati: {scout_txt} -> {verdict} ({ms1:.2f}ms)")
         if not passed:
@@ -325,7 +336,7 @@ class QuantitativeTradingCore:
         logger.info(f"[AGENTE #3 RISK] 🛡️ {symbol} -> ATR Stop: {_fmt(stop)}, "
                     f"Risk Approved: {res_risk.get('risk_approved')} ({res_risk.get('reason', 'N/D')})")
         if not res_risk.get("risk_approved"):
-            logger.warning(f"[AGENTE #3 RISK] ⚠️ {symbol} respinto dal Risk Manager: {res_risk.get('reason', 'N/D')}")
+            logger.warning(f"🛡️ [RISK VETO] {symbol} bocciato per: {res_risk.get('reason', 'N/D')}")
 
         # Le posizioni già aperte non vanno giudicate come nuovi ingressi dal Guardian
         res_guard = None

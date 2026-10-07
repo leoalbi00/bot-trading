@@ -2025,7 +2025,25 @@ EARNINGS_VETO_HOURS = 24
 TARGET_RISK_REWARD = 2.0
 
 # Sizing dinamico del CIO in base alla convinzione (percentuale del capitale)
-CONVICTION_BANDS = [(90, 25.0, 35.0), (80, 10.0, 20.0), (70, 5.0, 10.0)]
+# Fascia 60-69: segnali con ensemble dei 7 agenti >= 60 (soglia BUY dell'Agente #5), taglia ridotta
+CONVICTION_BANDS = [(90, 25.0, 35.0), (80, 10.0, 20.0), (70, 5.0, 10.0), (60, 3.0, 5.0)]
+MIN_CONVICTION = CONVICTION_BANDS[-1][0]
+
+# Soglia dello score tecnico per trasformare un'anomalia in scheda: 50 con volatilità standard (VIX < 20),
+# 75 con volatilità elevata o VIX non disponibile
+SCOUT_PITCH_SCORE_STANDARD = 50
+VIX_STANDARD_MAX = 20.0
+# Stage 1: volume relativo eccezionale -> passa anche con score intermedio (filtraggio fine ad Agenti #1 e #5)
+RVOL_STAGE1_BYPASS = 2.5
+STAGE1_BYPASS_MIN_SCORE = 35
+# Schede nate dalla pipeline: score tecnico minimo (sotto 35 la tecnica è fortemente ribassista)
+PIPELINE_MIN_TA_SCORE = 35
+
+
+def scout_pitch_threshold(macro):
+    """Soglia di attivazione delle anomalie degli Scout in base al regime di volatilità (VIX)."""
+    vix = (macro or {}).get("vix")
+    return SCOUT_PITCH_SCORE_STANDARD if vix is not None and vix < VIX_STANDARD_MAX else SCORE_BUY
 ROTATE_SELL_STEPS = (30, 50, 100)
 CIO_MIN_GAP_SEC = 180           # il CIO può essere svegliato da una scheda approvata al massimo ogni 3 minuti
 
@@ -2313,7 +2331,7 @@ def macro_channel(daily_refs):
 
 
 # ---------------------------------------------------------------- Tier 1: micro-scout
-def micro_scout(sym, sector, f15, f1h, f1d, ref_daily):
+def micro_scout(sym, sector, f15, f1h, f1d, ref_daily, pitch_score=SCORE_BUY):
     """Analisi di un singolo ticker sui 5 canali (solo calcoli, nessuna chiamata di rete).
 
     elapsed_ms = tempo di CPU del singolo scout (thread_time): esclude l'attesa del GIL tra i worker.
@@ -2339,7 +2357,7 @@ def micro_scout(sym, sector, f15, f1h, f1d, ref_daily):
         "symbol": sym, "sector": sector, "score": score, "ind": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in ind.items()},
         "mtf": mtf, "mtf_aligned": aligned, "vwap": vwap, "vwap_dist_pct": vwap_dist,
         "rvol": ind.get("vol_ratio"), "beta": beta, "corr": corr, "atr_pct": atr,
-        "anomalies": anomalies, "pitch": bool(anomalies) and score > SCORE_BUY,
+        "anomalies": anomalies, "pitch": bool(anomalies) and score > pitch_score, "pitch_threshold": pitch_score,
         "elapsed_ms": round((time.thread_time() - started) * 1000, 1),
     }
 
@@ -2467,6 +2485,15 @@ def risk_committee(pitch, ctx, fng):
                    pool.submit(gate_risk_atr, pitch, ctx)]
         gates = [f.result() for f in futures]
     score = pitch["score"]
+    from_pipeline = pitch.get("origin") == PIPELINE_ORIGIN
+    if from_pipeline:
+        # Schede dallo Stage 3: la decisione è di Agente #3 + Agente #5 (gate quant sotto); il gate tecnico
+        # resta informativo, tranne le trappole anti-inseguimento (RSI estremo, movimento già esteso)
+        for g in gates:
+            if g["agent"] == "Technical & Liquidity" and g["veto"]:
+                hard = [x for x in g["reason"].split("; ") if x.startswith(("trappola RSI", "movimento già esteso"))]
+                g["advisory"] = g["reason"]
+                g["veto"], g["reason"] = bool(hard), "; ".join(hard) or f"informativo per schede della pipeline ({g['reason']})"
     st = ctx["stats"].get(normalize_symbol(pitch["symbol"]))
     audit_note = "nessuno storico"
     if st:
@@ -2478,9 +2505,10 @@ def risk_committee(pitch, ctx, fng):
     gates.append(quant_gate)
     vetoes = [f"{g['agent']}: {g['reason']}" for g in gates if g["veto"]]
     # Le schede nate dallo Stage 3 hanno già superato la soglia dell'Agente #5 (ensemble >= 60)
-    from_pipeline = pitch.get("origin") == PIPELINE_ORIGIN and (quant_gate.get("ensemble_score") or 0) >= PIPELINE_BUY_SCORE
-    if score <= SCORE_BUY and not from_pipeline:
-        vetoes.append(f"Auditor: score {score} non superiore a {SCORE_BUY} ({audit_note})")
+    ensemble_ok = from_pipeline and (quant_gate.get("ensemble_score") or 0) >= PIPELINE_BUY_SCORE
+    threshold = pitch.get("pitch_threshold", SCORE_BUY)
+    if score <= threshold and not ensemble_ok:
+        vetoes.append(f"Auditor: score {score} non superiore a {threshold} ({audit_note})")
     stop = next(g["stop_pct"] for g in gates if g["agent"] == "Risk & ATR")
     package = None
     if not vetoes:
@@ -2490,6 +2518,7 @@ def risk_committee(pitch, ctx, fng):
                    "reason": f"{pitch['sector']}: {', '.join(pitch['anomalies'])}; MTF {pitch['mtf_aligned']}/3, "
                              f"RVOL {pitch['rvol']}x, VWAP {pitch['vwap_dist_pct']:+.2f}%, stop {stop:.1f}% (ATR)"}
     return {"approved": not vetoes, "gates": gates, "vetoes": vetoes, "score": score, "audit": audit_note,
+            "ensemble": quant_gate.get("ensemble_score"),
             "package": package, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1)}
 
 
@@ -2559,12 +2588,13 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     download_s = round(time.perf_counter() - t_dl, 1)
     macro = macro_channel({t: f1d.get(t) for t in REFERENCE_TICKERS})
     fng = crypto_fear_greed()
+    pitch_score = scout_pitch_threshold(macro)
 
     def ref_for(sym):
         return f1d.get("BTC-USD") if is_crypto(sym) else f1d.get("SPY")
 
     def run_one(sym):
-        r = micro_scout(sym, universe[sym], f15.get(sym), f1h.get(sym), f1d.get(sym), ref_for(sym))
+        r = micro_scout(sym, universe[sym], f15.get(sym), f1h.get(sym), f1d.get(sym), ref_for(sym), pitch_score=pitch_score)
         tag = f"Scout #{scout_no.get(sym, 0):02d}"
         if not r:
             agent_say(tag, f"{sym} → dati insufficienti", "muted")
@@ -2577,7 +2607,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
                 verdict = f"prezzo ${r['ind']['price']:,.2f} · mercato USA chiuso, solo monitoraggio"
             else:
                 verdict = ("ANOMALIA → pitch al Chief of Staff" if r["pitch"]
-                           else ("anomalia senza forza (score ≤ 75)" if r["anomalies"] else "nessuna anomalia"))
+                           else (f"anomalia senza forza (score ≤ {pitch_score})" if r["anomalies"] else "nessuna anomalia"))
             agent_say(tag, f"{sym} → score {r['score']} · MTF {r['mtf_aligned']}/3 · RVOL {r['rvol']}x · "
                            f"VWAP {r['vwap_dist_pct']}% · {verdict} ({r['elapsed_ms']}ms CPU)",
                       "alert" if r["pitch"] else "info")
@@ -2596,11 +2626,16 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             [(scout_no.get(r["symbol"], 0), r["symbol"], f1h.get(r["symbol"])) for r in results],
             macro, fng, held_keys=held_keys, log=log, pending=pending, exposure_usd=exposure_usd,
             positions_count=positions_count,
-            force=[r["symbol"] for r in results if r["pitch"] or normalize_symbol(r["symbol"]) in held_keys])
+            force=[r["symbol"] for r in results if r["pitch"] or normalize_symbol(r["symbol"]) in held_keys],
+            scout_meta={r["symbol"]: {"rvol": r["rvol"], "score": r["score"]} for r in results})
         for r in results:
             if r["pitch"] or not (market_open or is_crypto(r["symbol"])):
                 continue
             q = quant_rationale(r["symbol"], max_age_sec=120)
+            if q and q["agent_05_cio"]["decision"] == "BUY" and r["score"] < PIPELINE_MIN_TA_SCORE:
+                agent_say("Pipeline", f"{r['symbol']} → BUY dallo Stage 3 (ensemble {q['agent_05_cio']['score']}) non promosso: "
+                                      f"score tecnico {r['score']} < {PIPELINE_MIN_TA_SCORE} (tecnica ribassista)", "muted")
+                continue
             if q and q["agent_05_cio"]["decision"] == "BUY" and (q["agent_06_guardian"] or {}).get("approved"):
                 r.update(pitch=True, origin=PIPELINE_ORIGIN,
                          anomalies=r["anomalies"] + [f"Pipeline Quant: ensemble {q['agent_05_cio']['score']}/100"])
@@ -2665,7 +2700,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         _save_registry(reg)
 
     log(f"📡 [Sciame] {', '.join(n for n, _ in baskets)}{closed_note}: {len(results)} micro-scout | dati {download_s}s, calcoli {scouts_ms}ms "
-        f"(CPU max {max_scout_ms}ms/scout) | VIX {macro['vix']} | "
+        f"(CPU max {max_scout_ms}ms/scout) | VIX {macro['vix']} (soglia anomalie {pitch_score}) | "
         + (f"schede → Chief of Staff: {', '.join(p['symbol'] + ' (' + ', '.join(p['anomalies']) + ')' for p in new_pitches)}"
            if new_pitches else "nessuna nuova anomalia")
         + (f" | in cooldown: {', '.join(skipped)}" if skipped else ""))
@@ -2686,12 +2721,15 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             if not v:
                 continue
             p["review"] = {k: v[k] for k in ("gates", "vetoes", "score", "audit", "elapsed_ms")}
+            p["ensemble"] = v.get("ensemble")
             p["updated_at"] = now_local().isoformat(timespec="seconds")
             for g in v["gates"]:
                 agent_say(g["agent"], f"{p['symbol']} → {'VETO: ' + g['reason'] if g['veto'] else 'ok'} ({g['detail']})",
                           "veto" if g["veto"] else "info")
             if v["approved"]:
                 p["status"], p["package"], p["score"] = APPROVED_BY_RISK, v["package"], v["score"]
+                # La scheda approvata resta valida un TTL pieno da ora: non scade mentre aspetta il CIO
+                p["expires_epoch"] = max(p.get("expires_epoch", 0), _now_epoch() + PROPOSAL_TTL_MIN * 60)
                 approved.append(p["symbol"])
                 agent_say("Chief of Staff", f"{p['symbol']} → APPROVED_BY_RISK, in attesa del CIO", "ok")
                 log(f"🛡️ [Comitato Rischi] {p['symbol']} APPROVATO in {v['elapsed_ms']}ms → CIO "
@@ -2700,7 +2738,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
                 reg["cooldown"][normalize_symbol(p["symbol"])] = _now_epoch() + REJECT_COOLDOWN_MIN * 60
                 _close(reg, p, REJECTED_BY_RISK, " | ".join(v["vetoes"]))
                 agent_say("Chief of Staff", f"{p['symbol']} → REJECTED_BY_RISK, cooldown {REJECT_COOLDOWN_MIN} min", "veto")
-                log(f"⛔ [Comitato Rischi] {p['symbol']} VETO: {' | '.join(v['vetoes'])} "
+                log(f"🛡️ [RISK VETO] {p['symbol']} bocciato per: {' | '.join(v['vetoes'])} "
                     f"(cooldown {REJECT_COOLDOWN_MIN} min, feedback allo sciame)")
         _save_registry(reg)
     if approved and on_approved:
@@ -2771,7 +2809,8 @@ def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
         f"Schede approvate dal Comitato Rischi (canali 2 multi-timeframe, 3 order flow, 5 correlazioni):\n"
         f"{chr(10).join(pitch_lines) or '  (nessuna)'}\n\n"
         "Regole:\n"
-        f"- Assegna una convinzione 0-100 e un'allocazione coerente: {bands}. Sotto 70 rispondi HOLD.\n"
+        f"- Assegna una convinzione 0-100 e un'allocazione coerente: {bands}. Sotto {MIN_CONVICTION} rispondi HOLD. "
+        "Tieni conto dell'ensemble dei 7 agenti indicato nel Comitato (Quant Ensemble).\n"
         f"- Soffitto di sicurezza: {cfg['max_allocation_pct']:.0f}% per operazione ed esposizione totale "
         f"{cfg['max_exposure_pct']:.0f}%. In regime RISK-OFF l'allocazione viene dimezzata.\n"
         f"- ROTATE se la liquidità non basta: indica sell_symbol (la posizione meno performante) e sell_pct "
@@ -2819,17 +2858,23 @@ def ask_desk_cio(prompt, log=print):
     return None, None
 
 
+def pitch_conviction(p):
+    """Convinzione di una scheda: il migliore tra score tecnico ed ensemble dei 7 agenti (stessa scala 0-100)."""
+    return int(round(max(p.get("score") or 0, p.get("ensemble") or 0)))
+
+
 def quant_desk_cio(pitches, holdings, account):
     """CIO quantitativo di riserva: convinzione = score della scheda migliore, taglia a metà banda."""
     if not pitches:
         return {"action": "HOLD", "buy_symbol": "", "sell_symbol": "", "reason": "[Quant] Nessuna scheda approvata"}
-    best = max(pitches, key=lambda p: p["score"])
-    band = conviction_band(best["score"])
+    best = max(pitches, key=pitch_conviction)
+    conviction = pitch_conviction(best)
+    band = conviction_band(conviction)
     if not band:
-        return {"action": "HOLD", "buy_symbol": "", "sell_symbol": "", "reason": f"[Quant] Convinzione {best['score']} < 70"}
-    decision = {"action": "BUY", "buy_symbol": best["symbol"], "sell_symbol": "", "conviction_score": best["score"],
+        return {"action": "HOLD", "buy_symbol": "", "sell_symbol": "", "reason": f"[Quant] Convinzione {conviction} < {MIN_CONVICTION}"}
+    decision = {"action": "BUY", "buy_symbol": best["symbol"], "sell_symbol": "", "conviction_score": conviction,
                 "allocation_pct": (band[0] + band[1]) / 2, "dynamic_stop_loss_pct": best["package"]["stop_pct"],
-                "reason": f"[Quant] {best['symbol']} scheda con score più alto ({best['score']})"}
+                "reason": f"[Quant] {best['symbol']} scheda più convincente (score {best['score']}, ensemble {best.get('ensemble')})"}
     return decision
 
 
@@ -2856,10 +2901,10 @@ def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_ke
     pitch = pitch_map.get(normalize_symbol(d.get("buy_symbol", "")))
     if not pitch:
         return hold(f"{action} scartato: {d.get('buy_symbol') or '?'} non è una scheda APPROVED_BY_RISK")
-    conviction = d.get("conviction_score") if d.get("conviction_score") is not None else pitch["score"]
+    conviction = d.get("conviction_score") if d.get("conviction_score") is not None else pitch_conviction(pitch)
     band = conviction_band(conviction)
     if not band:
-        return hold(f"Convinzione {conviction} sotto 70: nessuna operazione su {pitch['symbol']}")
+        return hold(f"Convinzione {conviction} sotto {MIN_CONVICTION}: nessuna operazione su {pitch['symbol']}")
     requested = d.get("allocation_pct")
     pct = band[0] if requested is None else max(band[0], min(band[1], requested))
     if requested is not None and pct != requested:
@@ -3188,7 +3233,7 @@ def crypto_order_books(yf_symbols, depth=10):
 
 
 def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, order_books=None, force=(),
-                            pending=(), exposure_usd=None, positions_count=None):
+                            pending=(), exposure_usd=None, positions_count=None, scout_meta=None):
     """Sciame di 100 Scout -> asyncio.Queue -> pipeline a 3 Stage (7 agenti). Restituisce il piano dell'Agente #5.
 
     scout_frames: [(scout_id, yf_symbol, DataFrame 1h di yfinance), ...] (si usano solo le candele chiuse)
@@ -3209,7 +3254,7 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
     forced = {normalize_symbol(f) for f in force}
     payloads = [build_scout_payload(sym, frame, order_book=books.get(sym), macro_inputs=macro_inputs,
                                     account_balance=balance, scout_id=f"{scout_id:02d}",
-                                    force_full=normalize_symbol(sym) in forced)
+                                    force_full=normalize_symbol(sym) in forced, scout_meta=(scout_meta or {}).get(sym))
                 for scout_id, sym, frame in scout_frames]
     held = {normalize_symbol(h) for h in held_keys}
     exposure_pct = (exposure_usd / balance * 100) if exposure_usd is not None and balance else 0.0
@@ -3371,52 +3416,80 @@ def last_entry_execution(symbol):
 
 # ===========================================================================
 # CICLO DI TEST SIMULATO:  python trading_core.py
-#   Sciame di 100 Scout su 17 ticker (11 crypto + 6 azioni) con dati sintetici
-#   -> asyncio.Queue -> Stage 1-3 (7 agenti) -> audit del CHOP Watchdog.
-#   Nessuna chiamata di rete e nessun ordine.
+#   Percorre il flusso reale di produzione con dati sintetici e senza rete né ordini:
+#   run_scout_swarm (sciame classico + 100 Scout + Stage 1-3) -> Comitato Rischi -> APPROVED_BY_RISK
+#   -> CIO del desk (motore quantitativo) -> ordine SIMULATO. Il registro è in una cartella temporanea.
 # ===========================================================================
 if __name__ == "__main__":
+    import tempfile
     import numpy as np
 
-    SIM_STOCKS = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "META"]
+    _now = pd.Timestamp.now(tz="UTC")
+    UPTREND = {"NVDA", "AMD", "SOL-USD", "LINK-USD", "TSLA", "GLD"}   # trend rialzista
+    SPIKE = {"NVDA", "SOL-USD", "TSLA"}                               # + anomalia di volume -> scheda dello sciame classico
+    REFS = {"^VIX": "flat15", "SPY": "up", "QQQ": "up", "BTC-USD": "up"}
 
-    def _simulated_frame(seed, kind=None, bars=400):
-        """Barre 1h sintetiche (formato yfinance) con eventuale anomalia iniettata nell'ultima candela."""
+    def _frame(sym, interval, bars):
+        seed = abs(hash((sym, interval))) % (2 ** 32)
         rng = np.random.default_rng(seed)
-        close = 100 * np.exp(np.cumsum(rng.normal(0, 0.006, bars)))
-        volume = rng.integers(800, 1200, bars).astype(float)
-        if kind == "breakout":
-            close[-1] = close[-21:-1].max() * 1.025
-            volume[-1] *= 3.5
-        elif kind == "trend":
-            close = 100 * np.exp(np.cumsum(rng.normal(0.0025, 0.004, bars)))
-            close[-1] = close[-2] * 1.012
-            volume[-1] *= 2.4
-        elif kind == "selloff":
-            close[-1] = close[-2] * 0.95
-            volume[-1] *= 6
+        kind = REFS.get(sym) or ("up" if sym in UPTREND else "flat")
+        drift, noise = {"up": (0.0009, 0.005), "flat": (0.0, 0.006), "flat15": (0.0, 0.0)}[kind]
+        close = 100 * np.exp(np.cumsum(rng.normal(drift, noise, bars))) if kind != "flat15" else np.full(bars, 15.3)
+        vol = rng.integers(900, 1100, bars).astype(float)
+        if sym in SPIKE and interval == "1h":
+            vol[-2] *= 3.2                       # ultima candela CHIUSA (la -1 è in formazione)
+        freq = {"15m": "15min", "1h": "h", "1d": "D"}[interval]
+        index = pd.date_range(end=_now.floor(freq), periods=bars, freq=freq)
         open_ = np.concatenate(([close[0]], close[:-1]))
-        high = np.maximum(open_, close) * (1 + rng.random(bars) * 0.002)
-        low = np.minimum(open_, close) * (1 - rng.random(bars) * 0.002)
-        index = pd.date_range(end=pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=1), periods=bars, freq="h")
-        return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume}, index=index)
+        return pd.DataFrame({"Open": open_, "High": np.maximum(open_, close) * 1.001,
+                             "Low": np.minimum(open_, close) * 0.999, "Close": close, "Volume": vol}, index=index)
 
-    tickers = CRYPTO_EXTENDED + SIM_STOCKS
-    anomalies = {"SOL-USD": "breakout", "LINK-USD": "trend", "NVDA": "trend", "DOGE-USD": "selloff", "AMD": "breakout"}
-    frames = [(i + 1, sym, _simulated_frame(i, anomalies.get(sym))) for i, sym in enumerate(tickers)]
-    books = {"BTC-USD": {"bids": [[100.0, 9.0], [99.9, 8.0], [99.8, 7.5]], "asks": [[100.1, 1.0], [100.2, 1.5], [100.3, 1.2]]},
-             "ETH-USD": {"bids": [[100.0, 1.0], [99.9, 1.2], [99.8, 0.9]], "asks": [[100.1, 1.1], [100.2, 30.0], [100.3, 1.0]]}}
-    print(f"=== Ciclo simulato: {QUANT_SWARM_SIZE} Scout su {len(frames)} ticker -> asyncio.Queue -> 3 Stage · 7 Agenti ===",
-          flush=True)
-    _balance_cache.update(ts=time.time(), value=50000.0)
-    _news_cache.update({sym: (time.time(), {"sentiment": 0.2, "headlines": 3, "keywords": 2, "events": [], "source": "sim"})
-                        for _, sym, _ in frames})
-    plan = stream_scouts_to_agents(frames, {"vix": 17.0}, {"value": 55}, log=lambda m: print(m, flush=True),
-                                   order_books=books, held_keys=["BTC-USD"], force=["BTC-USD"],
-                                   exposure_usd=10000.0, positions_count=1)
-    engine = quant_engine()
-    evaluated = [s for _, s, _ in frames if engine.rationale_for(s)]
-    print(f"\nAgente #5: {len(evaluated)}/{len(frames)} arrivati allo Stage 3 ({', '.join(evaluated) or '-'}) · piano: "
-          + (", ".join(f"{o['action']} {o['data']['symbol']}" for o in plan) or "nessuna apertura"), flush=True)
-    chop_audit(log=lambda m: print(m, flush=True), force=True)
-    engine.shutdown()
+    # Sostituzione delle funzioni di rete con dati sintetici (solo in questo test)
+    _download = lambda tickers, period, interval, prepost=False: {
+        t: _frame(t, interval, {"15m": 400, "1h": 700, "1d": 300}[interval]) for t in tickers}
+    _daily_frames = lambda tickers: {t: _frame(t, "1d", 300) for t in tickers}
+    dynamic_volume_spikes = lambda limit=10: []
+    is_us_market_open = lambda: True
+    crypto_fear_greed = lambda: {"value": 55, "label": "Greed"}
+    get_recent_news = lambda sym, limit=3: "Nessuna notizia rilevante recente."
+    earnings_within = lambda sym, hours=EARNINGS_VETO_HOURS: "2026-10-08" if sym == "TSLA" else None
+    is_tradable = lambda sym: True
+    crypto_order_books = lambda syms, depth=10: {}
+    _review_context = lambda macro: {"drawdown_pct": -0.5, "drawdown_blocked": False, "market_open": True,
+                                     "macro": macro, "stats": {}}
+    SCOUT_REGISTRY_PATH = os.path.join(tempfile.mkdtemp(prefix="sim-registry-"), "scout_registry.json")
+    _balance_cache.update(ts=time.time(), value=100000.0)
+    say = lambda m: print(m, flush=True)
+
+    print(f"=== Ciclo simulato: sciame classico + {QUANT_SWARM_SIZE} Scout -> 3 Stage -> Comitato Rischi -> CIO ===", flush=True)
+    run_scout_swarm(held_keys={"AMZN"}, pending=set(), log=say, rotate=False, exposure_usd=20000.0, positions_count=1,
+                    on_approved=lambda: say("📣 Schede APPROVED_BY_RISK: CIO svegliato"))
+
+    reg = load_scout_registry()
+    print("\n--- Registro del Chief of Staff ---", flush=True)
+    for p in reg["queue"] + reg["recent"]:
+        print(f"  {p['symbol']:9s} {p['status']:17s} origine {p.get('origin', 'Sciame classico'):15s} score {p['score']} "
+              f"ensemble {p.get('ensemble')} | {p.get('note', '')[:110]}", flush=True)
+
+    inbox = cio_inbox()
+    account = {"equity": 100000.0, "exposure": 20000.0, "funds": 80000.0, "funds_crypto": 80000.0}
+    holdings = [{"symbol": "AMZN", "yf_symbol": "AMZN", "market_value": 20000.0, "weight_pct": 20.0,
+                 "pnl_pct": 0.7, "score": 83, "status": "OK"}]
+    while inbox:
+        decision = quant_desk_cio(inbox, holdings, account)
+        final = validate_desk_decision(decision, inbox, holdings, account, get_config(), latest_channels())
+        if final["action"] != "BUY":
+            print(f"💼 [CIO] {final['action']}: {final['reason']}", flush=True)
+            break
+        print(f"✅ [Execution Desk · SIMULATO] BUY {final['buy_symbol']} ${final['buy_amount']:,.2f} "
+              f"(convinzione {final['conviction_score']}, allocazione {final['allocation_pct']}%, stop {final['dynamic_stop_loss_pct']}%)"
+              + (f" — {'; '.join(final['notes'])}" if final.get("notes") else ""), flush=True)
+        record_cio_outcome(final["buy_symbol"], True, f"BUY {final['buy_symbol']}")
+        account["funds"] -= final["buy_amount"]
+        account["funds_crypto"] -= final["buy_amount"]
+        holdings.append({"symbol": final["buy_symbol"], "yf_symbol": final["buy_symbol"], "market_value": final["buy_amount"],
+                         "weight_pct": final["allocation_pct"], "pnl_pct": 0.0, "score": None, "status": "OK"})
+        inbox = cio_inbox()
+    print("\nStati finali: " + ", ".join(f"{p['symbol']} {p['status']}" for p in load_scout_registry()["recent"]), flush=True)
+    chop_audit(log=say, force=True)
+    quant_engine().shutdown()

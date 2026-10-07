@@ -14,12 +14,16 @@ class CIOStrategistAgent:
         self, 
         buy_threshold: float = 60.0,   # BUY se ensemble >= 60 (ricalibrato, era 68.0)
         sell_threshold: float = 40.0,  # SHORT/SELL se ensemble <= 40 (era 32.0)
-        min_conviction_multiplier: float = 0.5
+        min_conviction_multiplier: float = 0.5,
+        micro_damp_quant_min: float = 70.0,
+        micro_damp_factor: float = 0.5
     ):
         self.agent_id = "AGENT_05_CIO_STRATEGIST"
         self.buy_threshold = buy_threshold
         self.sell_threshold = sell_threshold
         self.min_conviction_multiplier = min_conviction_multiplier
+        self.micro_damp_quant_min = micro_damp_quant_min
+        self.micro_damp_factor = micro_damp_factor
 
     def get_dynamic_weights(self, is_high_volatility: bool = False) -> Dict[str, float]:
         """
@@ -41,6 +45,23 @@ class CIOStrategistAgent:
                 "risk": 0.20,
                 "macro": 0.20
             }
+
+    def effective_micro_score(self, quant: float, micro: float, risk: float) -> float:
+        """
+        Bilanciamento Q vs M: con segnale Quant forte (Q >= micro_damp_quant_min) e rischio pienamente
+        approvato (R = 100) una microstruttura debole pesa la metà sotto la neutralità (50).
+        Es. M 17.11 -> 33.56: un order flow momentaneamente negativo non annulla da solo un alpha quantitativo forte.
+        """
+        if quant >= self.micro_damp_quant_min and risk >= 99.99 and micro < 50.0:
+            return 50.0 - (50.0 - micro) * self.micro_damp_factor
+        return micro
+
+    def ensemble_score(self, quant: float, micro: float, risk: float, macro: float, is_high_volatility: bool = False) -> float:
+        weights = self.get_dynamic_weights(is_high_volatility=is_high_volatility)
+        micro_eff = self.effective_micro_score(quant, micro, risk)
+        score = (quant * weights["quant"]) + (micro_eff * weights["microstructure"]) + \
+                (risk * weights["risk"]) + (macro * weights["macro"])
+        return float(np.clip(score, 0.0, 100.0))
 
     def determine_execution_router(self, micro_metrics: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -101,17 +122,14 @@ class CIOStrategistAgent:
         is_high_vol = agent_03_risk_res.get("metrics", {}).get("cvar_99_tail_risk", 0.0) > 0.06
         weights = self.get_dynamic_weights(is_high_volatility=is_high_vol)
 
-        cio_score = (
-            (score_quant * weights["quant"]) +
-            (score_micro * weights["microstructure"]) +
-            (score_risk * weights["risk"]) +
-            (score_macro * weights["macro"])
-        )
-        cio_score = float(np.clip(cio_score, 0.0, 100.0))
+        cio_score = self.ensemble_score(score_quant, score_micro, score_risk, score_macro, is_high_vol)
+        micro_eff = self.effective_micro_score(score_quant, score_micro, score_risk)
         agent_scores = {
             "quant": score_quant, "microstructure": score_micro,
             "risk": score_risk, "macro": score_macro
         }
+        if micro_eff != score_micro:
+            agent_scores["microstructure_effective"] = round(micro_eff, 2)
 
         # 3. Controllo Veto Hard (Risk Manager & Macro Agent)
         vetoes = []
