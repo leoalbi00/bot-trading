@@ -3,9 +3,10 @@
 Azioni USA (negoziabili su Alpaca, prezzo >= $5):
   - S&P 500 (CSV pubblico datasets/s-and-p-500-companies) e Nasdaq-100 (API di nasdaq.com);
   - titoli più attivi e in rialzo del giorno (screener Yahoo Finance e Market Movers di Alpaca).
-Crypto (coppie USD/USDT/USDC con volume 24h > $1M):
-  - Coinbase Exchange (products + stats) e Binance (ticker 24h, con Binance.US come riserva).
-  Le crypto non negoziabili su Alpaca vengono scansionate ma marcate come solo monitoraggio.
+Crypto (SOLO le coppie /USD negoziabili su Alpaca):
+  - elenco degli asset crypto attivi e tradable di Alpaca, ordinati per volume 24h di Coinbase Exchange
+    e Binance (ticker 24h, con Binance.US come riserva). Le crypto non negoziabili su Alpaca sono escluse
+    dall'universo: gli Scout scansionano solo asset su cui il CIO può inviare ordini reali.
 
 Ogni fonte ha la sua cadenza di aggiornamento; se una fonte non risponde si tiene l'ultimo elenco valido,
 salvato su disco (universe_cache.json) così sopravvive anche ai riavvii.
@@ -28,6 +29,12 @@ CRYPTO_BASE_RE = re.compile(r"^[A-Z0-9]{2,12}$")
 CRYPTO_EXCLUDED = {
     "USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDP", "PYUSD", "USDE", "USDS", "USDG", "GUSD", "EURC", "EUR", "GBP",
     "AUD", "TRY", "BRL", "UST", "BUSD", "USD1", "RLUSD", "XUSD", "AEUR", "EURI", "WBTC", "WETH", "CBETH", "STETH",
+}
+# Crypto negoziabili su Alpaca (coppie /USD): usate solo se l'elenco live degli asset Alpaca non è disponibile
+ALPACA_CRYPTO_FALLBACK = {
+    "AAVE", "ADA", "ARB", "AVAX", "BAT", "BCH", "BONK", "BTC", "CRV", "DOGE", "DOT", "ETH", "FIL", "GRT", "HYPE", "LDO",
+    "LINK", "LTC", "ONDO", "PAXG", "PEPE", "POL", "RENDER", "SHIB", "SKY", "SOL", "SUSHI", "TRUMP", "UNI", "WIF", "XRP",
+    "XTZ", "YFI",
 }
 USD_QUOTES = ("FDUSD", "BUSD", "TUSD", "USDT", "USDC", "USD")   # quote equivalenti al dollaro su Binance
 YAHOO_SCREENS = ("most_actives", "day_gainers", "small_cap_gainers", "aggressive_small_caps", "growth_technology_stocks")
@@ -193,7 +200,7 @@ class DynamicUniverseScreener:
     def snapshot(self) -> Dict[str, Any]:
         assets = self._data("alpaca_assets", {})
         tradable_eq = set(assets.get("equity") or [])
-        tradable_crypto = set(assets.get("crypto") or [])
+        tradable_crypto = set(assets.get("crypto") or []) or ALPACA_CRYPTO_FALLBACK
 
         stocks: Dict[str, str] = {}
         def add(symbols, source):
@@ -211,22 +218,12 @@ class DynamicUniverseScreener:
         for name in ("coinbase", "binance"):
             for base, usd in self._data(name, {}).items():
                 volumes[base] = max(volumes.get(base, 0.0), float(usd))
-        equities = tradable_eq | set(stocks)
-
-        def is_crypto_asset(base: str) -> bool:
-            if base in CRYPTO_EXCLUDED or base.startswith("USD") or base.endswith("USD") or not CRYPTO_BASE_RE.match(base):
-                return False   # stablecoin e valute fiat
-            # Azioni tokenizzate quotate dagli exchange crypto (es. NVDAB = Nvidia su Binance): non sono crypto
-            return not (base.endswith("B") and base[:-1] in equities and base not in tradable_crypto)
-
-        crypto = [{"symbol": f"{base}-USD", "base": base, "volume_usd": round(usd),
-                   "tradable": base in tradable_crypto if tradable_crypto else None}
-                  for base, usd in sorted(volumes.items(), key=lambda kv: -kv[1])
-                  if usd >= self.min_crypto_volume_usd and is_crypto_asset(base)]
-        # Le crypto negoziabili su Alpaca restano sempre nell'universo, anche se gli exchange non rispondono
-        listed = {c["base"] for c in crypto}
-        crypto += [{"symbol": f"{b}-USD", "base": b, "volume_usd": None, "tradable": True}
-                   for b in sorted(tradable_crypto - listed - CRYPTO_EXCLUDED)]
+        # Solo crypto negoziabili su Alpaca (stablecoin escluse), ordinate per volume 24h sugli exchange:
+        # restano nell'universo anche se gli exchange non rispondono o il volume è sotto soglia
+        bases = [b for b in tradable_crypto - CRYPTO_EXCLUDED if not b.startswith("USD") and CRYPTO_BASE_RE.match(b)]
+        crypto = [{"symbol": f"{b}-USD", "base": b, "volume_usd": round(volumes[b]) if b in volumes else None,
+                   "tradable": True}
+                  for b in sorted(bases, key=lambda b: (-volumes.get(b, 0.0), b))]
         return {
             "stocks": [{"symbol": s, "source": src} for s, src in stocks.items()],
             "crypto": crypto,
@@ -239,8 +236,7 @@ class DynamicUniverseScreener:
 
     def tickers(self, snap: Dict[str, Any], market_open: bool) -> List[Tuple[str, str, bool]]:
         """[(ticker, fonte, negoziabile)] in ordine di scansione: a mercato chiuso solo crypto (24/7)."""
-        crypto = [(c["symbol"], "Crypto (Alpaca)" if c["tradable"] else "Crypto (solo monitoraggio)",
-                   c["tradable"] is not False) for c in snap["crypto"]]
+        crypto = [(c["symbol"], "Crypto (Alpaca)", True) for c in snap["crypto"] if c["tradable"]]
         if not market_open:
             return crypto
         stocks = [(s["symbol"], s["source"], True) for s in snap["stocks"]]

@@ -2609,8 +2609,9 @@ def universe_chunk(market_open, log=print):
     chunk, k, n = screener.next_chunk(universe, UNIVERSE_CHUNK_SIZE)
     in_chunk = {t for t, _, _ in chunk}
     # La watchlist dell'utente viene scansionata a ogni giro, non solo quando arriva il suo blocco
+    # (solo se negoziabile su Alpaca: gli Scout lavorano esclusivamente su asset con ordini abilitati)
     for t in get_config()["watchlist"]:
-        if t not in in_chunk and (market_open or is_crypto(t)):
+        if t not in in_chunk and (market_open or is_crypto(t)) and is_tradable(t):
             chunk.append((t, "Watchlist", True))
             in_chunk.add(t)
     groups = {}
@@ -2620,10 +2621,9 @@ def universe_chunk(market_open, log=print):
             "chunk": k, "chunks": n, "cycles": screener.cycles, "scanned": len(chunk),
             "crypto_tradable": sum(1 for c in snap["crypto"] if c["tradable"]), "no_data": len(listed) - len(universe),
             "index": {t: i + 1 for i, (t, _, _) in enumerate(universe)}}
-    line = (f"🌐 [UNIVERSE SCREENER] Caricati {info['stocks']} Titoli USA e {info['crypto']} Pair Crypto "
-            f"({info['crypto_tradable']} negoziabili su Alpaca) | {QUANT_SWARM_SIZE} Scout operativi su "
-            f"{info['total']} Ticker totali{'' if market_open else ' (mercato USA chiuso: solo crypto 24/7)'}"
-            + (f" · {info['no_data']} esclusi per 6h (nessun dato su Yahoo)" if info["no_data"] else ""))
+    line = (f"🌐 [ALPACAN ACTIVE] Scansione limitata ai soli asset con esecuzione ordini abilitata · "
+            f"{info['stocks'] if market_open else 0} Titoli USA + {info['crypto_tradable']} Crypto · "
+            f"{QUANT_SWARM_SIZE} Scout su {info['total']} Ticker{'' if market_open else ' (mercato USA chiuso: solo crypto 24/7)'}")
     if k == 1 or _screener_ref["last_line"] != line:
         log(line)
         errors = [f"{name}: {v['error']}" for name, v in snap["sources"].items() if v.get("error")]
@@ -2712,15 +2712,11 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             if not uinfo:
                 agent_say(tag, f"{sym} → dati insufficienti", "muted")
         else:
-            not_tradable = tradable.get(sym, True) is False
-            monitoring = (not market_open and not is_crypto(sym)) or not_tradable
-            r["tradable"] = not not_tradable
-            if not_tradable and r["pitch"]:
-                r["pitch"] = False   # non negoziabile su Alpaca: solo intelligence di mercato
-                verdict = "anomalia rilevata · non negoziabile su Alpaca, solo monitoraggio"
-            elif not_tradable:
-                verdict = "non negoziabile su Alpaca, solo monitoraggio"
-            elif monitoring and r["pitch"]:
+            if tradable.get(sym, True) is False:
+                return None          # non negoziabile su Alpaca: fuori dalla pipeline, nessun log
+            monitoring = not market_open and not is_crypto(sym)
+            r["tradable"] = True
+            if monitoring and r["pitch"]:
                 r["pitch"] = False   # mercato chiuso: l'anomalia viene solo segnalata, nessuna scheda
                 verdict = "anomalia rilevata · mercato USA chiuso, nessuna scheda (solo monitoraggio)"
             elif monitoring:
