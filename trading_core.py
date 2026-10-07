@@ -1093,10 +1093,12 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
 
     Senza stato in memoria: il tempo di permanenza in posizione viene dalla data del primo acquisto
     ancora aperto negli ordini Alpaca (ledger["open"]), non da contatori di cicli.
-    Stati: STOP_LOSS, TAKE_PROFIT, TRAILING_STOP, BREAKEVEN_STOP, ALPHA_DECAY, TIME_STOP (Agente #6),
+    Stati: STOP_LOSS, SCALE_OUT (vendita parziale), TRAILING_STOP, BREAKEVEN_STOP, NEWS_SHOCK, OFI_REVERSAL,
+           ALPHA_DECAY, TIME_STOP (Agente #6),
            RIBASSISTA, STALLO -> vendita obbligatoria;
            IN_STALLO, IN_OSSERVAZIONE (segnale ribassista troppo presto o su dati fermi), OK, NO_DATA -> mantenute.
-    Take profit al target del Comitato Rischi: rischio/rendimento TARGET_RISK_REWARD rispetto allo stop.
+    Nessun take profit fisso: al target (TARGET_RISK_REWARD x stop) l'Agente #6 incassa una quota (SCALE_OUT)
+    e il resto corre con trailing ATR. sell_pct: quota da vendere (100 tranne lo scaling out).
     A mercato azionario chiuso le uscite tecniche delle azioni vengono rimandate: le barre non si aggiornano.
     """
     open_info = (ledger or {}).get("open", {})
@@ -1114,17 +1116,12 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
         held_txt = "da oltre 90 giorni" if held_min is None else f"da {held_min:.0f} min"
 
         stop = (stops or {}).get(key, cfg["stop_loss_pct"])
-        take_profit = abs(stop) * TARGET_RISK_REWARD
         trail = (trailing or {}).get(key)
         stale = not market_open and not pos.get("is_crypto")
         too_early = held_min is not None and held_min < TECH_EXIT_MIN_HOLD_MIN
         if pl <= stop:
             status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ stop loss {stop:.1f}%"
-        elif pl >= take_profit:
-            status, reason = "TAKE_PROFIT", f"PnL {pl:.2f}% ≥ target {take_profit:.1f}% (rischio/rendimento {TARGET_RISK_REWARD:.0f}:1)"
-        elif trail and trail.get("hit") and trail.get("action") in ("TRAILING_STOP", "BREAKEVEN_STOP"):
-            status, reason = trail["action"], trail["reason"]
-        elif trail and trail.get("hit") and trail.get("action") in ("ALPHA_DECAY", "TIME_STOP"):
+        elif trail and trail.get("hit"):
             status, reason = trail["action"], trail["reason"]
         elif not a:
             status, reason = "NO_DATA", "indicatori non disponibili"
@@ -1147,7 +1144,7 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
             else:
                 status, reason = "OK", f"ROC {a['ind']['roc']:.2f}%, in posizione {held_txt}"
         report.append({"pos": pos, "analysis": a, "score": score, "status": status, "reason": reason,
-                       "held_min": held_min})
+                       "held_min": held_min, "sell_pct": (trail or {}).get("sell_pct", 100) if status == "SCALE_OUT" else 100})
         log(f"🛡️ [Risk] {pos['symbol']}: {status} | score {score if score is not None else 'N/D'} | "
             f"PnL {pl:.2f}% | stop {stop:.1f}% | {reason}")
 
@@ -1530,6 +1527,124 @@ def _peak_since(yf_symbol, opened_at):
 
 
 _guardian = None
+GUARDIAN_INTERVAL_SEC = 20       # Agente #6: loop indipendente sulle posizioni aperte
+GUARDIAN_ATR_TTL_SEC = 3600      # ATR giornaliero: cambia una volta al giorno
+GUARDIAN_PEAK_TTL_SEC = 900      # picco dalle chiusure orarie di yfinance: riletto ogni 15 minuti
+GUARDIAN_REFRESH_SEC = 120       # 7 agenti sulle posizioni (Alpha Decay, News Shock, OFI) ricalcolati ogni 2 minuti
+GUARDIAN_SIGNAL_MAX_AGE_SEC = 900  # uscite anticipate solo su letture degli agenti più recenti di 15 minuti
+GUARDIAN_TIME_STOP_MIN = 60      # Time-Stop: spinta d'inerzia esaurita se dopo 60 minuti la posizione è piatta
+GUARDIAN_ENTRY_MATCH_PCT = 0.5   # prezzo medio cambiato oltre lo 0.5%: nuova posizione, stato del Guardian azzerato
+GUARDIAN_STATE_PATH = os.path.join(DATA_DIR, "guardian_positions.json")
+_guardian_cache = {"atr": {}, "peak": {}}
+_guardian_cache_lock = threading.Lock()
+
+
+def guardian_position_state(p, vix=None):
+    """Stato persistente della posizione per l'Agente #6: {"entry", "vix0", "scaled"} (creato al primo giro)."""
+    key, entry = normalize_symbol(p["symbol"]), p.get("avg_entry_price") or p["current_price"]
+    with _guardian_cache_lock:
+        data = read_json_file(GUARDIAN_STATE_PATH, {})
+        st = data.get(key)
+        if not st or abs(entry / (st.get("entry") or entry) - 1) * 100 > GUARDIAN_ENTRY_MATCH_PCT:
+            st = data[key] = {"entry": entry, "vix0": vix, "scaled": False}
+            write_json_file(GUARDIAN_STATE_PATH, data)
+        elif st.get("vix0") is None and vix is not None:
+            st["vix0"] = vix
+            write_json_file(GUARDIAN_STATE_PATH, data)
+        return dict(st)
+
+
+def guardian_mark_scaled(symbol):
+    """Scaling out eseguito: il resto della posizione è il runner (stop a breakeven, trailing sempre attivo)."""
+    key = normalize_symbol(symbol)
+    with _guardian_cache_lock:
+        data = read_json_file(GUARDIAN_STATE_PATH, {})
+        if key in data:
+            data[key]["scaled"] = True
+            write_json_file(GUARDIAN_STATE_PATH, data)
+
+
+def guardian_prune(live_keys):
+    """Rimuove lo stato delle posizioni chiuse."""
+    with _guardian_cache_lock:
+        data = read_json_file(GUARDIAN_STATE_PATH, {})
+        kept = {k: v for k, v in data.items() if k in live_keys}
+        if kept != data:
+            write_json_file(GUARDIAN_STATE_PATH, kept)
+
+
+def guardian_signals(q, vix, vix0):
+    """Letture degli Agenti #1, #2 e #4 per le uscite anticipate (vuote se la valutazione è troppo vecchia)."""
+    sig = {"vix": vix, "vix_at_entry": vix0}
+    if q and time.time() - q["evaluated_at"] <= GUARDIAN_SIGNAL_MAX_AGE_SEC:
+        sig.update(quant_score=q["agent_01_quant"]["score"], ofi=q["agent_02_micro"]["ofi"],
+                   micro_signal=q["agent_02_micro"]["signal"], news_sentiment=q["agent_04_macro"]["news_sentiment"],
+                   headlines=q["agent_04_macro"]["headlines"], stress_level=q["agent_04_macro"]["stress_level"])
+    return sig
+
+
+def guardian_atr(yf_symbol):
+    """ATR% giornaliero con cache di 1 ora (None se le barre non sono disponibili)."""
+    key = normalize_symbol(yf_symbol)
+    with _guardian_cache_lock:
+        cached = _guardian_cache["atr"].get(key)
+    if cached and time.time() - cached[0] < GUARDIAN_ATR_TTL_SEC:
+        return cached[1]
+    df = get_daily_bars(yf_symbol)
+    value = atr_pct(df) if df is not None else None
+    with _guardian_cache_lock:
+        _guardian_cache["atr"][key] = (time.time(), value)
+    return value
+
+
+def guardian_peak(yf_symbol, opened_at, price):
+    """Picco dall'apertura: chiusure orarie (cache 15 min) + massimo dei prezzi visti dal Guardian a ogni giro."""
+    key = normalize_symbol(yf_symbol)
+    opened_key = opened_at.isoformat() if opened_at else None
+    with _guardian_cache_lock:
+        c = _guardian_cache["peak"].get(key)
+        if not c or c["opened"] != opened_key:      # nuova posizione sullo stesso simbolo: picco azzerato
+            c = _guardian_cache["peak"][key] = {"opened": opened_key, "ts": 0.0, "max": 0.0}
+        stale = time.time() - c["ts"] >= GUARDIAN_PEAK_TTL_SEC
+    hist = _peak_since(yf_symbol, opened_at) if stale else None
+    with _guardian_cache_lock:
+        if stale:
+            c["ts"] = time.time()
+        c["max"] = max(c["max"], hist or 0.0, price or 0.0)
+        return c["max"]
+
+
+def guardian_evaluate(p, info, stop, atr, market_open, now=None):
+    """Agente #6 su una posizione: stop effettivo (breakeven / trailing ATR), scaling out e uscite anticipate."""
+    opened = info.get("opened_at")
+    if isinstance(opened, str):
+        opened = dt.datetime.fromisoformat(opened)
+    now = now or now_local()
+    price, entry = p["current_price"], p.get("avg_entry_price") or p["current_price"]
+    peak = max(guardian_peak(p["yf_symbol"], opened, price), price, entry)
+    q = quant_rationale(p["yf_symbol"], max_age_sec=3600)
+    vix = (latest_channels().get("macro") or {}).get("vix")
+    st = guardian_position_state(p, vix)
+    g = portfolio_guardian().evaluate_position(entry=entry, price=price, peak=peak, stop_pct=stop, atr_pct=atr,
+                                               is_crypto=p["is_crypto"],
+                                               held_min=(now - opened).total_seconds() / 60 if opened else None,
+                                               cio_score=q["agent_05_cio"]["score"] if q else None, market_open=market_open,
+                                               scaled_out=st["scaled"], signals=guardian_signals(q, vix, st.get("vix0")))
+    g["cio_score"] = q["agent_05_cio"]["score"] if q else None
+    g["stop_pct"] = stop
+    return g
+
+
+def guardian_watch(positions, open_info, cfg, market_open):
+    """Giro del loop indipendente dell'Agente #6: {chiave: valutazione} per ogni posizione aperta."""
+    out, now = {}, now_local()
+    for p in positions:
+        key = normalize_symbol(p["symbol"])
+        info = open_info.get(key, {})
+        atr = guardian_atr(p["yf_symbol"])
+        stop = info.get("stop_pct") or (dynamic_stop_pct(atr, p["is_crypto"]) if atr else cfg["stop_loss_pct"])
+        out[key] = guardian_evaluate(p, info, stop, atr, market_open, now=now)
+    return out
 
 
 def portfolio_guardian():
@@ -1537,30 +1652,31 @@ def portfolio_guardian():
     global _guardian
     if _guardian is None:
         from agents.agent_06_sentinel import PortfolioGuardianAgent
-        _guardian = PortfolioGuardianAgent(min_hold_min=TECH_EXIT_MIN_HOLD_MIN,
+        _guardian = PortfolioGuardianAgent(min_hold_min=TECH_EXIT_MIN_HOLD_MIN, time_stop_min=GUARDIAN_TIME_STOP_MIN,
+                                           target_r=TARGET_RISK_REWARD, news_shock_sentiment=SENTIMENT_VETO / 100,
                                            atr_mult_stock=ATR_MULT_STOCK, atr_mult_crypto=ATR_MULT_CRYPTO)
     return _guardian
 
 
 def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_open=True):
     """ATR e stop dinamico per ogni simbolo; per le posizioni aperte l'Agente #6 (Portfolio Guardian) calcola
-    trailing ATR, breakeven a +1.5R, Alpha Decay (score CIO < 45) e Time-Stop (senza stato locale).
+    trailing ATR, breakeven a +1.5R, scaling out al primo target, News Shock, inversione OFI, Alpha Decay e Time-Stop.
 
     - stop iniziale di una posizione: quello del CIO salvato nel client_order_id dell'acquisto, altrimenti da ATR;
     - picco: massimo dei prezzi dall'apertura (data letta dagli ordini Alpaca).
     Restituisce (vol, stops, guardian) dove guardian[chiave] contiene action/hit/reason/effective_stop_pct.
+    La stessa valutazione gira anche nel loop indipendente del Guardian (guardian_watch, ogni 20 secondi).
     """
     vol = {}
     for sym in symbols:
-        df = get_daily_bars(sym)
-        if df is None:
+        a = guardian_atr(sym)
+        if a is None:
             continue
-        a = atr_pct(df)
         vol[normalize_symbol(sym)] = {"atr_pct": a, "stop_pct": dynamic_stop_pct(a, is_crypto(sym))}
 
     open_info = (ledger or {}).get("open", {})
     held = {normalize_symbol(p["symbol"]) for p in positions}
-    guard, now = portfolio_guardian(), now_local()
+    now = now_local()
     stops, guardian, parts = {}, {}, []
     for p in positions:
         key = normalize_symbol(p["symbol"])
@@ -1568,19 +1684,12 @@ def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_ope
         info = open_info.get(key, {})
         stop = info.get("stop_pct") or (v["stop_pct"] if v else cfg["stop_loss_pct"])
         stops[key] = stop
-        price, entry = p["current_price"], p.get("avg_entry_price") or p["current_price"]
-        opened = info.get("opened_at")
-        peak = max([x for x in (_peak_since(p["yf_symbol"], opened), price, entry) if x] or [0.0])
-        q = quant_rationale(p["yf_symbol"], max_age_sec=3600)
-        g = guard.evaluate_position(entry=entry, price=price, peak=peak, stop_pct=stop,
-                                    atr_pct=v["atr_pct"] if v else None, is_crypto=p["is_crypto"],
-                                    held_min=(now - opened).total_seconds() / 60 if opened else None,
-                                    cio_score=q["agent_05_cio"]["score"] if q else None, market_open=market_open)
+        g = guardian_evaluate(p, info, stop, v["atr_pct"] if v else None, market_open, now=now)
         guardian[key] = g
         parts.append(f"{p['symbol']} " + (f"ATR {v['atr_pct']:.1f}% " if v else "ATR N/D ")
                      + f"stop {stop:.1f}%" + (" (CIO)" if info.get("stop_pct") else "")
                      + (f" → effettivo {g['effective_stop_pct']:+.2f}% [{g['stop_source']}]" if g["effective_stop_pct"] != stop else "")
-                     + (f" · CIO {q['agent_05_cio']['score']}" if q else "")
+                     + (f" · CIO {g['cio_score']}" if g["cio_score"] is not None else "")
                      + (f" · ⚠️ {g['action']}" if g["hit"] else ""))
     cands = [f"{v_sym} stop {v['stop_pct']:.1f}%" for v_sym, v in vol.items() if v_sym not in held]
     log(f"🧿 [Agente #6 Guardian] Posizioni: {'; '.join(parts) or '-'}" + (f" | Candidati: {', '.join(cands)}" if cands else ""))

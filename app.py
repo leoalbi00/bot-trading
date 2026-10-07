@@ -174,7 +174,7 @@ def journal_operation(status, pos=None):
     """Tipo di operazione per il registro: STOP LOSS / TAKE PROFIT dai trigger difensivi, altrimenti SELL."""
     if status == "STOP_LOSS":
         return "STOP LOSS"
-    if status == "TAKE_PROFIT":
+    if status in ("TAKE_PROFIT", "SCALE_OUT"):
         return "TAKE PROFIT"
     if status == "BREAKEVEN_STOP":
         return "STOP LOSS"
@@ -300,6 +300,7 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         with state_lock:
             bot_state["ledger_open"] = {k: {kk: (vv.isoformat() if hasattr(vv, "isoformat") else vv) for kk, vv in v.items()}
                                         for k, v in ledger["open"].items()}
+            bot_state["ledger_synced"] = True   # date di apertura note: il loop del Guardian può decidere le uscite
             bot_state["performance"] = perf
 
         # Difesa del portafoglio: stop ATR, trailing, trend ribassista, stallo (consentita anche con drawdown)
@@ -310,7 +311,7 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
             core.refresh_held_evaluations(held_yf, log=log_message)   # score CIO aggiornato per l'Alpha Decay
         vol, stops, trailing = (core.volatility_agent(held_yf, positions, cfg, log=log_message, ledger=ledger,
                                                       market_open=market_open) if positions else ({}, {}, {}))
-        # Stop effettivo dell'Agente #6 (breakeven / trailing): il radar lo controlla h24 ogni ~20 secondi
+        # Stop effettivo dell'Agente #6 (breakeven / trailing): poi lo aggiorna il loop del Guardian ogni 20 secondi
         with state_lock:
             for key, g in trailing.items():
                 bot_state["ledger_open"].setdefault(key, {})["effective_stop_pct"] = g.get("effective_stop_pct")
@@ -318,8 +319,8 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                                  market_open=market_open)
         sold = set()
         for r in risk["positions"]:
-            if r["status"] not in ("STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP", "BREAKEVEN_STOP", "ALPHA_DECAY",
-                                   "TIME_STOP", "RIBASSISTA", "STALLO"):
+            if r["status"] not in ("STOP_LOSS", "SCALE_OUT", "TRAILING_STOP", "BREAKEVEN_STOP", "NEWS_SHOCK",
+                                   "OFI_REVERSAL", "ALPHA_DECAY", "TIME_STOP", "RIBASSISTA", "STALLO"):
                 continue
             pos = r["pos"]
             key = core.normalize_symbol(pos["symbol"])
@@ -327,8 +328,11 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                 log_message(f"💼 [CIO] {pos['symbol']}: vendita ({r['status']}) rimandata, ordine già pendente.")
                 continue
             log_message(f"💼 [CIO] SELL difensivo {pos['symbol']} ({r['status']}): {r['reason']}")
-            if execute_sell(pos, r["status"].replace("_", " "), r["reason"], auto_trade, pending, market_open,
-                            operation=journal_operation(r["status"], pos)) or not auto_trade:
+            order = execute_sell(pos, r["status"].replace("_", " "), r["reason"], auto_trade, pending, market_open,
+                                 pct=r["sell_pct"], operation=journal_operation(r["status"], pos))
+            if order and r["status"] == "SCALE_OUT":
+                core.guardian_mark_scaled(pos["symbol"])     # il resto è il runner: resta in portafoglio
+            elif order or not auto_trade:
                 sold.add(key)
         core.save_state(state)
 
@@ -517,7 +521,7 @@ def radar_loop():
                 for p in positions:
                     info = stops.get(core.normalize_symbol(p["symbol"])) or {}
                     stop = info.get("stop_pct") or fallback
-                    # Agente #6: stop rialzato a breakeven o dal trailing ATR (calcolato nell'ultimo ciclo del CIO)
+                    # Agente #6: stop rialzato a breakeven o dal trailing ATR (aggiornato dal loop del Guardian)
                     if info.get("effective_stop_pct") is not None:
                         stop = max(stop, info["effective_stop_pct"])
                     if p["unrealized_plpc"] <= stop and core.normalize_symbol(p["symbol"]) not in pending:
@@ -528,6 +532,90 @@ def radar_loop():
         # Scansione continua: un paniere ogni RADAR_INTERVAL_SEC / numero di panieri (~20s)
         tick = core.RADAR_INTERVAL_SEC / len(core.DESK_BASKETS)
         time.sleep(max(5, tick - (time.time() - started)))
+
+GUARDIAN_EXITS = ("TRAILING_STOP", "BREAKEVEN_STOP", "SCALE_OUT", "NEWS_SHOCK", "OFI_REVERSAL", "ALPHA_DECAY", "TIME_STOP")
+_guardian_state = {"stops": {}, "advised": set(), "refresh": 0.0}
+
+def guardian_tick():
+    """Un giro dell'Agente #6: stop effettivo di ogni posizione e uscite eseguite subito, senza attendere il CIO."""
+    positions = get_open_positions()
+    live = {core.normalize_symbol(p["symbol"]) for p in positions}
+    _guardian_state["stops"] = {k: v for k, v in _guardian_state["stops"].items() if k in live}
+    _guardian_state["advised"] = {k for k in _guardian_state["advised"] if k[0] in live}
+    if not positions:
+        return
+    core.guardian_prune(live)       # solo con posizioni lette: una lista vuota può essere un errore di Alpaca
+    cfg = core.get_config()
+    market_open = core.is_market_open(log=lambda m: None)
+    held_yf = [p["yf_symbol"] for p in positions]
+    if time.time() - _guardian_state["refresh"] >= core.GUARDIAN_REFRESH_SEC:
+        _guardian_state["refresh"] = time.time()
+        core.refresh_held_evaluations(held_yf, log=log_message)     # Agenti #1 #2 #4 #5 freschi per le uscite anticipate
+    with state_lock:
+        open_info = {k: dict(v) for k, v in bot_state["ledger_open"].items()}
+    evals = core.guardian_watch(positions, open_info, cfg, market_open)
+    with state_lock:
+        for key, g in evals.items():
+            bot_state["ledger_open"].setdefault(key, {})["effective_stop_pct"] = g["effective_stop_pct"]
+    for p in positions:
+        key, g = core.normalize_symbol(p["symbol"]), evals[core.normalize_symbol(p["symbol"])]
+        if _guardian_state["stops"].get(key) != g["effective_stop_pct"]:
+            _guardian_state["stops"][key] = g["effective_stop_pct"]
+            if g["effective_stop_pct"] != g["stop_pct"]:
+                log_message(f"🧿 [Agente #6 Guardian] {p['symbol']} stop effettivo {g['effective_stop_pct']:+.2f}% "
+                            f"({g['stop_source']}) · PnL {g['pnl_pct']:+.2f}%")
+
+    hits = [(p, evals[core.normalize_symbol(p["symbol"])]) for p in positions
+            if evals[core.normalize_symbol(p["symbol"])]["hit"] and evals[core.normalize_symbol(p["symbol"])]["action"] in GUARDIAN_EXITS]
+    if not hits:
+        return
+    # Stesso lock del ciclo del CIO: mai due vendite della stessa posizione in parallelo
+    if not scan_lock.acquire(blocking=False):
+        log_message(f"🧿 [Agente #6 Guardian] Uscite rilevate ({', '.join(p['symbol'] for p, _ in hits)}): "
+                    "ciclo del CIO in corso, le esegue il CIO.")
+        return
+    try:
+        pending = core.get_pending_order_symbols(log=log_message)
+        if pending is None:
+            log_message("🧿 [Agente #6 Guardian] Stato ordini pendenti sconosciuto: uscite rimandate al prossimo giro.")
+            return
+        auto_trade = cfg["auto_execute_trades"]
+        for pos, g in hits:
+            key = core.normalize_symbol(pos["symbol"])
+            if key in pending:
+                continue
+            if not auto_trade:
+                if (key, g["action"]) in _guardian_state["advised"]:
+                    continue        # Advisor: il suggerimento si ripete una volta sola
+                _guardian_state["advised"].add((key, g["action"]))
+            log_message(f"🧿 [Agente #6 Guardian] SELL {pos['symbol']} ({g['action']}): {g['reason']}")
+            core.agent_say("Agente #6 Guardian", f"{pos['symbol']} → {g['action']}: {g['reason']}", "veto")
+            order = execute_sell(pos, g["action"].replace("_", " "), g["reason"], auto_trade, pending, market_open,
+                                 pct=g["sell_pct"], operation=journal_operation(g["action"], pos))
+            if order and g["action"] == "SCALE_OUT":
+                core.guardian_mark_scaled(pos["symbol"])     # runner: stop a breakeven, trailing sempre attivo
+            if order:
+                with _cache_lock:
+                    _cache.clear()
+    finally:
+        scan_lock.release()
+
+def guardian_loop():
+    """Agente #6 (Portfolio Guardian): loop indipendente ogni 20 secondi su tutte le posizioni aperte.
+
+    Trailing ATR, breakeven, scaling out, News Shock, inversione OFI, Alpha Decay e Time-Stop vengono eseguiti
+    appena scattano, senza attendere il CIO.
+    Parte solo dopo il primo ciclo del CIO (date di apertura e stop sincronizzati da Alpaca).
+    """
+    time.sleep(core.STARTUP_GRACE_SECONDS + 15)
+    while True:
+        started = time.time()
+        if bot_state["active"] and bot_state.get("ledger_synced"):
+            try:
+                guardian_tick()
+            except Exception as e:
+                log_message(f"🧿 [Agente #6 Guardian] Errore: {type(e).__name__}: {e}")
+        time.sleep(max(1, core.GUARDIAN_INTERVAL_SEC - (time.time() - started)))
 
 def chop_loop():
     """Agente #7 (CHOP Watchdog): auto-healing e audit dello sciame ogni 30 secondi."""
@@ -596,7 +684,9 @@ def start_background_threads():
     threading.Thread(target=keep_alive_loop, daemon=True).start()
     threading.Thread(target=radar_loop, daemon=True).start()
     threading.Thread(target=chop_loop, daemon=True).start()
-    log_message(f"🧵 Thread di trading, radar Esploratore e Keep-Alive avviati (PID {os.getpid()})")
+    threading.Thread(target=guardian_loop, daemon=True).start()
+    log_message(f"🧵 Thread di trading, radar Esploratore, Guardian ({core.GUARDIAN_INTERVAL_SEC}s) e Keep-Alive avviati "
+                f"(PID {os.getpid()})")
     cfg = core.get_config()
     mode = "Auto-Trading attivo" if cfg["auto_execute_trades"] else "Advisor (nessun ordine)"
     locked = core.env_overrides()
