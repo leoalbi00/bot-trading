@@ -13,3 +13,5 @@ trade_history.json
 boardroom_state.json
 *.json.tmp
 scout_registry.json
+executions.db
+quant_agents.log*

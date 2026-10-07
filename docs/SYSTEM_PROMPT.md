@@ -65,7 +65,8 @@ Pesi Dinamici in base al VIX:
 - VIX >= 20.0 (High Volatility): w = [0.20, 0.20, 0.35, 0.25]
 
 2.2 Condizione di Esecuzione e Veto:
-$$\text{Approved} = \text{Risk Approved} \land \text{Macro Approved} \land (S_{\text{CIO}} \ge 68.0 \lor S_{\text{CIO}} \le 32.0)$$
+$$\text{Approved} = \text{Risk Approved} \land \text{Macro Approved} \land (S_{\text{CIO}} \ge 60.0 \lor S_{\text{CIO}} \le 40.0)$$
+(soglie temporanee: erano 68.0 / 32.0. Un veto non azzera lo score: il CIO lo riporta come "VETO RISK" / "VETO MACRO".)
 
 2.3 Modello di Asset Swap (Capital Recycling):
 Un nuovo asset $A_{\text{new}}$ sostituisce l'asset meno performante in portafoglio $A_{\text{weak}}$ se:

@@ -153,10 +153,17 @@ class InstitutionalRiskAgent:
 
         risk_score = float(np.clip(risk_score, 0.0, 100.0))
         risk_approved = risk_score >= 50.0 and sizing_info["position_units"] > 0
+        if sizing_info["position_units"] <= 0:
+            reason = f"POSITION_SIZE_ZERO (ATR {atr:.6f})"
+        elif not risk_approved:
+            reason = f"RISK_SCORE_TOO_LOW ({risk_score:.0f} < 50: CVaR99 {cvar_99:.2%}, beta {beta:.2f})"
+        else:
+            reason = f"OK (risk score {risk_score:.0f}, CVaR99 {cvar_99:.2%})"
 
         return {
             "agent_id": self.agent_id,
             "risk_approved": risk_approved,
+            "reason": reason,
             "risk_score": round(risk_score, 2),
             "metrics": {
                 "atr": round(atr, 4),

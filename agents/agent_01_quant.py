@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 from scipy.stats import norm
 from typing import Dict, Any
 
@@ -41,6 +42,47 @@ class HyperQuantAgent:
         hurst = poly[0] * 2.0
         return float(np.clip(hurst, 0.0, 1.0))
 
+    def garch_volatility(self, series: pd.Series) -> float:
+        """
+        Volatilità condizionale GARCH(1,1) prevista per la prossima barra (in % per barra).
+        Parametri stimati per massima verosimiglianza; se l'ottimizzazione fallisce si usano
+        valori standard (alpha 0.08, beta 0.90) con varianza di lungo periodo pari a quella campionaria.
+        """
+        returns = series.pct_change().dropna().values * 100.0
+        if len(returns) < 30:
+            return float(np.std(returns)) if len(returns) > 1 else 0.0
+        returns = returns - returns.mean()
+        sample_var = float(returns.var())
+        if sample_var <= 0:
+            return 0.0
+
+        def variance_path(params):
+            omega, alpha, beta = params
+            var = np.empty(len(returns))
+            var[0] = sample_var
+            for t in range(1, len(returns)):
+                var[t] = omega + alpha * returns[t - 1] ** 2 + beta * var[t - 1]
+            return var
+
+        def neg_log_likelihood(params):
+            if params[1] + params[2] >= 0.999:
+                return 1e10
+            var = np.maximum(variance_path(params), 1e-12)
+            return 0.5 * float(np.sum(np.log(var) + returns ** 2 / var))
+
+        params = (sample_var * 0.02, 0.08, 0.90)
+        try:
+            fit = minimize(neg_log_likelihood, x0=params, method="L-BFGS-B",
+                           bounds=[(1e-8, None), (0.0, 0.5), (0.0, 0.999)])
+            if fit.success:
+                params = tuple(fit.x)
+        except Exception:
+            pass
+        omega, alpha, beta = params
+        last_var = variance_path(params)[-1]
+        next_var = omega + alpha * returns[-1] ** 2 + beta * last_var
+        return float(np.sqrt(max(next_var, 0.0)))
+
     def koopman_spectral_stability(self, series: pd.Series) -> float:
         """
         Approssimazione spettrale dell'Operatore di Koopman (Dynamic Mode Decomposition).
@@ -81,6 +123,7 @@ class HyperQuantAgent:
                 "agent_id": self.agent_id,
                 "quant_score": 50.0,
                 "status": "INSUFFICIENT_DATA",
+                "reason": f"servono almeno 30 barre con colonna 'close' (ricevute {len(df)})",
                 "trade_signal": "NEUTRAL"
             }
 
@@ -91,6 +134,7 @@ class HyperQuantAgent:
         hurst = self.calculate_hurst_exponent(close_prices)
         koopman_lambda = self.koopman_spectral_stability(close_prices)
         conformal_bounds = self.conformal_prediction_bounds(close_prices)
+        garch_vol = self.garch_volatility(close_prices)
 
         # 2. Logica di Punteggio Quantitativo (0 - 100)
         base_score = 50.0
@@ -131,6 +175,7 @@ class HyperQuantAgent:
                 "z_score": round(z_score, 4),
                 "hurst_exponent": round(hurst, 4),
                 "koopman_lambda": round(koopman_lambda, 4),
+                "garch_vol_pct": round(garch_vol, 4),
                 "conformal_stop_loss_pct": round(conformal_bounds["lower_bound_pct"], 4),
                 "conformal_target_pct": round(conformal_bounds["upper_bound_pct"], 4)
             }

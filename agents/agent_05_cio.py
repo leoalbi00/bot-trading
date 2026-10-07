@@ -12,8 +12,8 @@ class CIOStrategistAgent:
     """
     def __init__(
         self, 
-        buy_threshold: float = 68.0, 
-        sell_threshold: float = 32.0,
+        buy_threshold: float = 60.0,   # temporaneo (era 68.0): ricalibrazione in corso
+        sell_threshold: float = 40.0,  # temporaneo (era 32.0)
         min_conviction_multiplier: float = 0.5
     ):
         self.agent_id = "AGENT_05_CIO_STRATEGIST"
@@ -88,35 +88,15 @@ class CIOStrategistAgent:
         """
         Pipeline Esecutiva e di Sintesi Finale dell'Agente #5.
         """
-        # 1. Controllo Veto Hard (Risk Manager & Macro Agent)
-        risk_approved = agent_03_risk_res.get("risk_approved", False)
-        macro_approved = agent_04_macro_res.get("macro_approved", False)
-
-        if not risk_approved:
-            return {
-                "agent_id": self.agent_id,
-                "final_decision": "NO_TRADE",
-                "reason": f"VETO_TRIGGERED_BY_RISK_MANAGER: {agent_03_risk_res.get('reason', 'RISK_REJECTED')}",
-                "cio_ensemble_score": 0.0,
-                "execution_plan": None
-            }
-
-        if not macro_approved:
-            return {
-                "agent_id": self.agent_id,
-                "final_decision": "NO_TRADE",
-                "reason": f"VETO_TRIGGERED_BY_MACRO_AGENT: {agent_04_macro_res.get('reason', 'MACRO_BLACKOUT')}",
-                "cio_ensemble_score": 0.0,
-                "execution_plan": None
-            }
-
-        # 2. Estrazione Punteggi Singoli Agenti
+        # 1. Estrazione Punteggi Singoli Agenti
+        # Lo score d'insieme viene calcolato anche in caso di veto, così l'analisi degli altri
+        # agenti resta visibile nel report finale.
         score_quant = agent_01_quant_res.get("quant_score", 50.0)
         score_micro = agent_02_micro_res.get("microstructure_score", 50.0)
         score_risk = agent_03_risk_res.get("risk_score", 50.0)
         score_macro = agent_04_macro_res.get("macro_score", 50.0)
 
-        # 3. Determinazione Regime ed Ensemble Score
+        # 2. Determinazione Regime ed Ensemble Score
         is_high_vol = agent_03_risk_res.get("metrics", {}).get("cvar_99_tail_risk", 0.0) > 0.06
         weights = self.get_dynamic_weights(is_high_volatility=is_high_vol)
 
@@ -127,6 +107,29 @@ class CIOStrategistAgent:
             (score_macro * weights["macro"])
         )
         cio_score = float(np.clip(cio_score, 0.0, 100.0))
+        agent_scores = {
+            "quant": score_quant, "microstructure": score_micro,
+            "risk": score_risk, "macro": score_macro
+        }
+
+        # 3. Controllo Veto Hard (Risk Manager & Macro Agent)
+        vetoes = []
+        if not agent_03_risk_res.get("risk_approved", False):
+            vetoes.append(("VETO RISK", agent_03_risk_res.get("reason", "RISK_REJECTED")))
+        if not agent_04_macro_res.get("macro_approved", False):
+            vetoes.append(("VETO MACRO", agent_04_macro_res.get("reason", "MACRO_BLACKOUT")))
+
+        if vetoes:
+            return {
+                "agent_id": self.agent_id,
+                "final_decision": "NO_TRADE",
+                "veto": " + ".join(label for label, _ in vetoes),
+                "reason": " | ".join(f"{label}: {why}" for label, why in vetoes),
+                "cio_ensemble_score": round(cio_score, 2),
+                "agent_scores": agent_scores,
+                "weights_used": weights,
+                "execution_plan": None
+            }
 
         # 4. Determinazione Direzione e Convinzione del Trade
         if cio_score >= self.buy_threshold:
@@ -145,6 +148,7 @@ class CIOStrategistAgent:
                 "final_decision": "HOLD",
                 "reason": f"NEUTRAL_ENSEMBLE_SCORE ({round(cio_score, 2)})",
                 "cio_ensemble_score": round(cio_score, 2),
+                "agent_scores": agent_scores,
                 "execution_plan": None
             }
 
@@ -166,6 +170,7 @@ class CIOStrategistAgent:
             "reason": f"HIGH_CONVICTION_{decision}_SIGNAL (Ensemble Score: {round(cio_score, 2)})",
             "cio_ensemble_score": round(cio_score, 2),
             "conviction_factor": round(conviction_factor, 2),
+            "agent_scores": agent_scores,
             "weights_used": weights,
             "final_trade_parameters": {
                 "side": decision,

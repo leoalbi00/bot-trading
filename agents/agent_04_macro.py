@@ -152,6 +152,7 @@ class MacroSentimentAgent:
                 "agent_id": self.agent_id,
                 "macro_approved": False,
                 "macro_score": 0.0,
+                "stress_level": "EVENT_BLACKOUT",
                 "trade_signal": "EVENT_BLACKOUT_VETO",
                 "reason": f"BLACKOUT: {blackout_info['event_name']} in {blackout_info['minutes_to_event']}m"
             }
@@ -163,6 +164,7 @@ class MacroSentimentAgent:
                 "agent_id": self.agent_id,
                 "macro_approved": False,
                 "macro_score": 10.0,
+                "stress_level": stress_info["stress_level"],
                 "trade_signal": "CROSS_ASSET_PANIC_VETO",
                 "reason": f"EXTREME_STRESS ({stress_info['stress_level']})"
             }
@@ -204,6 +206,7 @@ class MacroSentimentAgent:
             "agent_id": self.agent_id,
             "macro_approved": True,
             "macro_score": round(macro_score, 2),
+            "stress_level": stress_info["stress_level"],
             "trade_signal": signal,
             "metrics": {
                 "cross_asset_stress": stress_info,

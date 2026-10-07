@@ -2502,6 +2502,14 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     scouts_ms = round((time.perf_counter() - t_sc) * 1000, 1)
     max_scout_ms = max((r["elapsed_ms"] for r in results), default=0)
 
+    # Stream verso i 5 agenti quantitativi (asyncio.Queue -> process_scout_stream), solo consultivo
+    try:
+        stream_scouts_to_agents(
+            [(scout_no.get(r["symbol"], 0), r["symbol"], f1h.get(r["symbol"])) for r in results],
+            macro, fng, held_keys=held_keys, log=log)
+    except Exception as e:
+        log(f"⚠️ [Agenti Quant] Stream degli Scout interrotto: {type(e).__name__}: {e}")
+
     # Canali aggregati: ultimo risultato di ogni ticker dei panieri ancora attivi
     # (un giro completo dei 6 panieri dura ~2 minuti: si tengono i risultati degli ultimi 6 minuti)
     now_ts = time.time()
@@ -2986,3 +2994,246 @@ def run_closed_market_pulse(log=print, force=False):
         log(f"🌙 [Pulse mercati chiusi] {len(moves)} ticker azionari/commodities monitorati, maggiori variazioni: {top}")
         agent_say("Pulse", f"Riepilogo orario: {len(moves)} ticker monitorati · {top}", "muted")
     return moves
+
+
+# ===========================================================================
+# PONTE SCIAME -> 5 AGENTI QUANTITATIVI (quant_core.py)
+#   Ogni Scout converte la propria scansione nel payload standard
+#   {"symbol", "df_ohlcv", "order_book", "macro_inputs", "account_balance"} e lo inserisce
+#   in una asyncio.Queue consumata da QuantitativeTradingCore.process_scout_stream().
+#   Il piano dell'Agente #5 è consultivo: gli ordini restano al CIO del desk (run_trading_cycle),
+#   che usa la valutazione dei 5 agenti come rationale delle operazioni.
+# ===========================================================================
+_quant_lock = threading.Lock()
+_quant_engine_ref = {"core": None}
+_balance_cache = {"ts": 0.0, "value": None}
+
+
+def quant_engine():
+    """Istanza unica dell'orchestratore a 5 agenti (import pigro: scipy solo quando serve)."""
+    with _quant_lock:
+        if _quant_engine_ref["core"] is None:
+            from quant_core import QuantitativeTradingCore
+            _quant_engine_ref["core"] = QuantitativeTradingCore(portfolio_max_slots=3, num_workers=4)
+        return _quant_engine_ref["core"]
+
+
+def account_balance_for_agents():
+    """Capitale del conto per il sizing dell'Agente #3 (cache 60s; riserva: capitale iniziale o 10.000)."""
+    if time.time() - _balance_cache["ts"] < 60 and _balance_cache["value"]:
+        return _balance_cache["value"]
+    value = None
+    if alpaca_client:
+        try:
+            value = float(alpaca_client.get_account().equity)
+        except Exception:
+            value = None
+    value = value or initial_capital() or 10000.0
+    _balance_cache.update(ts=time.time(), value=value)
+    return value
+
+
+def crypto_order_books(yf_symbols, depth=10):
+    """Snapshot L2 Alpaca delle crypto ({yf_symbol: {"bids": [[p, s]], "asks": [[p, s]]}}), una sola richiesta."""
+    crypto = [s for s in yf_symbols if is_crypto(s)]
+    if not crypto:
+        return {}
+    try:
+        from alpaca.data.historical import CryptoHistoricalDataClient
+        from alpaca.data.requests import CryptoLatestOrderbookRequest
+        client = CryptoHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET) if ALPACA_KEY and ALPACA_SECRET else CryptoHistoricalDataClient()
+        books = client.get_crypto_latest_orderbook(CryptoLatestOrderbookRequest(
+            symbol_or_symbols=[to_alpaca_symbol(s) for s in crypto]))
+    except Exception as e:
+        _warn_throttled("orderbook", f"⚠️ [Agenti Quant] Order book Alpaca non disponibile ({e}): OFI stimato dalle barre",
+                        print, every=3600)
+        return {}
+    out = {}
+    for s in crypto:
+        book = books.get(to_alpaca_symbol(s))
+        if book is not None:
+            out[s] = {"bids": [[float(q.price), float(q.size)] for q in book.bids[:depth]],
+                      "asks": [[float(q.price), float(q.size)] for q in book.asks[:depth]]}
+    return out
+
+
+def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, order_books=None):
+    """Invia l'output degli Scout ai 5 agenti tramite asyncio.Queue e restituisce il piano dell'Agente #5.
+
+    scout_frames: [(scout_id, yf_symbol, DataFrame 1h di yfinance), ...]
+    order_books: snapshot L2 già pronti (None = richiesta ad Alpaca per le crypto).
+    """
+    import asyncio
+    from quant_core import build_scout_payload, STREAM_END
+    scout_frames = [f for f in scout_frames if f[2] is not None]
+    if not scout_frames:
+        return []
+    engine = quant_engine()
+    macro_inputs = {"vix_level": (macro or {}).get("vix") or 16.5,
+                    "fear_greed_index": (fng or {}).get("value", 50.0),
+                    "news_sentiment": 0.0, "central_bank_speech": "", "upcoming_events": []}
+    books = crypto_order_books([sym for _, sym, _ in scout_frames]) if order_books is None else order_books
+    balance = account_balance_for_agents()
+
+    async def run():
+        queue = asyncio.Queue()
+
+        async def scouts():
+            for scout_id, sym, frame in scout_frames:
+                await queue.put(build_scout_payload(sym, frame, order_book=books.get(sym), macro_inputs=macro_inputs,
+                                                    account_balance=balance, scout_id=f"{scout_id:02d}"))
+            await queue.put(STREAM_END)
+
+        _, plan = await asyncio.gather(scouts(), engine.process_scout_stream(queue))
+        return plan
+
+    with _quant_lock:
+        # Gli slot dell'Agente #5 riflettono le posizioni reali su Alpaca
+        engine.active_portfolio = {k: engine.active_portfolio.get(k) or {"symbol": k, "side": "BUY", "cio_ensemble_score": 50.0,
+                                                                         "strength": 50.0, "details": {}}
+                                   for k in (normalize_symbol(h) for h in held_keys)}
+        plan = asyncio.run(run())
+    for _, sym, _ in scout_frames:
+        r = engine.rationale_for(sym, max_age_sec=300)
+        if r:
+            cio = r["agent_05_cio"]
+            agent_say("Agente #5 CIO", f"{sym} → ensemble {cio['score']}/100 → {cio['decision']} "
+                                       f"(Q {r['agent_01_quant']['score']} · M {r['agent_02_micro']['score']} · "
+                                       f"R {r['agent_03_risk']['score']} · Macro {r['agent_04_macro']['score']})",
+                      "veto" if str(cio["decision"]).startswith("VETO") else ("ok" if cio["decision"] in ("BUY", "SELL") else "info"))
+    if plan:
+        log("👑 [Agente #5] Piano consultivo: " + ", ".join(
+            f"{o['action']} {o['data']['symbol']} {o['data']['cio_result']['final_decision']} "
+            f"({o['data']['cio_result']['cio_ensemble_score']})" for o in plan))
+    return plan
+
+
+def quant_rationale(symbol, max_age_sec=1800):
+    """Punteggi dei 5 agenti sull'ultima valutazione del simbolo (None se non disponibile)."""
+    core = _quant_engine_ref["core"]
+    return core.rationale_for(symbol, max_age_sec=max_age_sec) if core else None
+
+
+# ===========================================================================
+# REGISTRO OPERAZIONI PERSISTENTE (executions.db)
+#   Ogni operazione inviata dal bot (BUY, SELL, ASSET SWAP, STOP LOSS, TAKE PROFIT, MANUAL SELL)
+#   viene registrata con il rationale dei 5 agenti e il flag executed_offline: True se nessuno
+#   aveva la dashboard aperta al momento dell'esecuzione.
+# ===========================================================================
+import sqlite3
+
+EXECUTIONS_DB_PATH = os.path.join(DATA_DIR, "executions.db")
+USER_OFFLINE_AFTER_SEC = 120   # la dashboard interroga /api/data ogni secondo: 2 minuti senza richieste = offline
+_presence = {"last_seen": 0.0}
+_db_lock = threading.Lock()
+
+
+def mark_user_seen():
+    _presence["last_seen"] = time.time()
+
+
+def user_offline():
+    return time.time() - _presence["last_seen"] > USER_OFFLINE_AFTER_SEC
+
+
+def _db():
+    os.makedirs(os.path.dirname(EXECUTIONS_DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(EXECUTIONS_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS executions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        side TEXT NOT NULL,
+        price REAL,
+        quantity REAL,
+        notional REAL,
+        realized_pnl REAL,
+        rationale TEXT,
+        executed_offline INTEGER NOT NULL DEFAULT 0,
+        order_id TEXT,
+        source TEXT,
+        note TEXT)""")
+    return conn
+
+
+def record_execution(symbol, operation, side, price=None, quantity=None, notional=None, realized_pnl=None,
+                     rationale=None, order_id=None, source="auto", note="", log=print):
+    """Registra un'operazione inviata (side BUY/SELL). Le operazioni manuali (dalla dashboard) non sono mai offline."""
+    offline = source != "manual" and user_offline()
+    if notional is None and price and quantity:
+        notional = price * quantity
+    row = (now_local().isoformat(timespec="seconds"), symbol, operation, side,
+           None if price is None else round(float(price), 6), None if quantity is None else round(float(quantity), 8),
+           None if notional is None else round(float(notional), 2),
+           None if realized_pnl is None else round(float(realized_pnl), 2),
+           json.dumps(rationale, default=str) if rationale else None, int(offline),
+           str(order_id) if order_id else None, source, note)
+    try:
+        with _db_lock, _db() as conn:
+            conn.execute("INSERT INTO executions (timestamp, symbol, operation, side, price, quantity, notional, realized_pnl, "
+                         "rationale, executed_offline, order_id, source, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+    except sqlite3.Error as e:
+        log(f"[!] Registro operazioni non aggiornato ({operation} {symbol}): {e}")
+        return False
+    return True
+
+
+def _row_dict(row):
+    d = dict(row)
+    d["executed_offline"] = bool(d["executed_offline"])
+    try:
+        d["rationale"] = json.loads(d["rationale"]) if d["rationale"] else None
+    except ValueError:
+        pass
+    return d
+
+
+def list_executions(offline_only=False, limit=200):
+    try:
+        with _db_lock, _db() as conn:
+            rows = conn.execute("SELECT * FROM executions" + (" WHERE executed_offline = 1" if offline_only else "")
+                                + " ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [_row_dict(r) for r in rows]
+
+
+def last_entry_execution(symbol):
+    """Ultimo acquisto registrato per il simbolo (con il rationale dei 5 agenti al momento dell'ingresso)."""
+    key = normalize_symbol(symbol)
+    try:
+        with _db_lock, _db() as conn:
+            rows = conn.execute("SELECT * FROM executions WHERE side = 'BUY' ORDER BY id DESC LIMIT 500").fetchall()
+    except sqlite3.Error:
+        return None
+    for r in rows:
+        if normalize_symbol(r["symbol"]) == key:
+            return _row_dict(r)
+    return None
+
+
+# ===========================================================================
+# CICLO DI TEST SIMULATO:  python trading_core.py
+#   11 Scout (paniere crypto esteso) con dati sintetici -> asyncio.Queue -> 5 agenti.
+#   Nessuna chiamata di rete e nessun ordine.
+# ===========================================================================
+if __name__ == "__main__":
+    from quant_core import dummy_ohlcv
+
+    def _simulated_frame(seed):
+        df = dummy_ohlcv(seed, bars=300)
+        return df.rename(columns=str.capitalize)   # stesso formato dei DataFrame yfinance dello sciame
+
+    frames = [(i + 1, sym, _simulated_frame(i)) for i, sym in enumerate(CRYPTO_EXTENDED)]
+    print(f"=== Ciclo simulato: {len(frames)} Scout -> asyncio.Queue -> 5 Agenti ===", flush=True)
+    _balance_cache.update(ts=time.time(), value=50000.0)
+    books = {"BTC-USD": {"bids": [[100.0, 4.0], [99.9, 3.0]], "asks": [[100.1, 1.0], [100.2, 1.5]]}}  # L2 sintetico
+    plan = stream_scouts_to_agents(frames, {"vix": 17.0}, {"value": 55}, log=lambda m: print(m, flush=True),
+                                   order_books=books)
+    engine = quant_engine()
+    evaluated = [s for _, s, _ in frames if engine.rationale_for(s)]
+    print(f"\nAgente #5: {len(evaluated)}/{len(frames)} opportunità valutate · piano: "
+          + (", ".join(f"{o['action']} {o['data']['symbol']}" for o in plan) or "nessuna apertura"), flush=True)
+    engine.shutdown()

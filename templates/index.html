@@ -55,6 +55,8 @@
                 <button @click="showSettings = true" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 inline-flex items-center gap-1.5">
                     <i data-lucide="settings-2" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">Impostazioni Bot</span>
                 </button>
+                <button @click="openHistory()" title="Operazioni eseguite dal bot mentre la dashboard era chiusa"
+                        class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 whitespace-nowrap">📜 <span class="hidden sm:inline">Storico Offline</span></button>
                 <button @click="liquidate()" class="h-7 px-2.5 rounded border border-rose-900/70 text-rose-300 hover:bg-rose-950/60 whitespace-nowrap">Vendi tutto</button>
                 <form method="post" action="/logout">
                     <button type="submit" title="Esci" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center">
@@ -323,7 +325,7 @@
                             <tr><td colspan="10" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
                         </template>
                         <template x-for="p in positions" :key="p.symbol">
-                            <tr class="hover:bg-slate-800/30">
+                            <tr class="hover:bg-slate-800/30 cursor-pointer" @click="openPosition(p)" title="Apri la scheda della posizione">
                                 <td class="px-4 py-2.5 text-slate-100" x-text="p.symbol"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-300" x-text="qty(p.qty)"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
@@ -444,6 +446,137 @@
         </div>
     </div>
 
+    <!-- ============ SCHEDA POSIZIONE (click su una riga) ============ -->
+    <div x-cloak x-show="showPosition" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
+         @keydown.escape.window="showPosition = false">
+        <div class="absolute inset-0 bg-black/60" @click="showPosition = false"></div>
+        <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin border border-slate-800 rounded-lg bg-[#0d1220] shadow-xl">
+            <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between sticky top-0 bg-[#0d1220]">
+                <h2 class="text-sm font-semibold text-slate-100" x-text="'Posizione ' + (posDetail?.position?.symbol || posSymbol)"></h2>
+                <button @click="showPosition = false" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
+            </div>
+            <div class="p-5 text-xs space-y-5">
+                <div x-show="posLoading" class="text-slate-500">Caricamento…</div>
+                <div x-show="posError" class="text-rose-400" x-text="posError"></div>
+                <template x-if="posDetail && !posLoading">
+                    <div class="space-y-5">
+                        <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 num">
+                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Apertura</div>
+                                 <div class="text-slate-200" x-text="dateTime(posDetail.opened_at)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Prezzo di ingresso</div>
+                                 <div class="text-slate-200" x-text="price(posDetail.position.avg_entry_price)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Prezzo attuale</div>
+                                 <div class="text-slate-200" x-text="price(posDetail.position.current_price)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">PnL %</div>
+                                 <div :class="tone(posDetail.position.unrealized_plpc)" x-text="pct(posDetail.position.unrealized_plpc)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">PnL</div>
+                                 <div :class="tone(posDetail.position.unrealized_pl)" x-text="usd(posDetail.position.unrealized_pl, true)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Quantità · Valore</div>
+                                 <div class="text-slate-200" x-text="qty(posDetail.position.qty) + ' · ' + usd(posDetail.position.market_value)"></div></div>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 num">
+                            <div class="border border-slate-800 rounded p-3">
+                                <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Stop Loss</div>
+                                <div class="text-rose-300" x-text="price(posDetail.stop_loss.price) + ' (' + posDetail.stop_loss.pct + '%)'"></div>
+                                <div class="text-[11px] text-slate-500 font-sans" x-text="posDetail.stop_loss.source"></div>
+                            </div>
+                            <div class="border border-slate-800 rounded p-3">
+                                <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Take Profit</div>
+                                <div class="text-emerald-300" x-text="posDetail.take_profit.price ? price(posDetail.take_profit.price) + (posDetail.take_profit.pct != null ? ' (+' + posDetail.take_profit.pct + '%)' : '') : '—'"></div>
+                                <div class="text-[11px] text-slate-500 font-sans">target del Comitato Rischi / Agente #3</div>
+                            </div>
+                        </div>
+
+                        <div>
+                            <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-2">Motivazione d'ingresso
+                                <span class="normal-case tracking-normal text-slate-600" x-show="posDetail.rationale_source" x-text="'· ' + posDetail.rationale_source"></span></div>
+                            <template x-if="!posDetail.rationale">
+                                <div class="text-slate-500">Nessun rationale registrato per questa posizione (aperta prima del registro operazioni).</div>
+                            </template>
+                            <template x-if="posDetail.rationale">
+                                <div class="space-y-2">
+                                    <template x-if="posDetail.rationale.agents">
+                                        <table class="w-full num">
+                                            <tbody class="divide-y divide-slate-800/70">
+                                                <template x-for="row in agentRows(posDetail.rationale.agents)" :key="row.name">
+                                                    <tr><td class="py-1.5 pr-3 text-slate-400 font-sans" x-text="row.name"></td>
+                                                        <td class="py-1.5 pr-3 text-right text-slate-100" x-text="row.score"></td>
+                                                        <td class="py-1.5 text-slate-400" x-text="row.detail"></td></tr>
+                                                </template>
+                                            </tbody>
+                                        </table>
+                                    </template>
+                                    <div x-show="posDetail.rationale.desk_cio" class="text-slate-400">
+                                        <span class="text-amber-300">CIO del desk</span>
+                                        <span x-text="posDetail.rationale.desk_cio ? ('(' + posDetail.rationale.desk_cio.source + ', convinzione ' + posDetail.rationale.desk_cio.conviction + ', allocazione ' + posDetail.rationale.desk_cio.allocation_pct + '%): ' + posDetail.rationale.desk_cio.reason) : ''"></span>
+                                    </div>
+                                    <div x-show="posDetail.rationale.risk_package?.reason" class="text-slate-500" x-text="'Comitato Rischi: ' + (posDetail.rationale.risk_package?.reason || '')"></div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+            <div class="px-5 py-3 border-t border-slate-800 flex items-center justify-between gap-3 sticky bottom-0 bg-[#0d1220]">
+                <span class="text-[11px] num" :class="posNoticeError ? 'text-rose-400' : 'text-emerald-400'" x-text="posNotice"></span>
+                <div class="flex gap-2">
+                    <button @click="showPosition = false" class="h-8 px-3 rounded border border-slate-700 hover:bg-slate-800 text-xs">Chiudi</button>
+                    <button @click="sellNow()" :disabled="selling || !posDetail" class="h-8 px-3 rounded bg-rose-600 hover:bg-rose-500 text-white text-xs font-medium disabled:opacity-50">🔴 VENDI SUBITO</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============ STORICO OFFLINE ============ -->
+    <div x-cloak x-show="showHistory" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
+         @keydown.escape.window="showHistory = false">
+        <div class="absolute inset-0 bg-black/60" @click="showHistory = false"></div>
+        <div class="relative w-full max-w-5xl max-h-[85vh] overflow-y-auto scroll-thin border border-slate-800 rounded-lg bg-[#0d1220] shadow-xl">
+            <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between gap-3 sticky top-0 bg-[#0d1220]">
+                <h2 class="text-sm font-semibold text-slate-100">📜 Storico Offline</h2>
+                <div class="flex items-center gap-3 text-xs">
+                    <label class="flex items-center gap-1.5 text-slate-400">
+                        <input type="checkbox" x-model="historyOffline" @change="loadHistory()" class="h-3.5 w-3.5 accent-emerald-500"> solo operazioni offline
+                    </label>
+                    <button @click="showHistory = false" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
+                </div>
+            </div>
+            <div class="p-5 text-xs">
+                <div class="mb-3 text-slate-500 num" x-text="historySummary()"></div>
+                <div class="overflow-x-auto scroll-thin">
+                    <table class="w-full">
+                        <thead>
+                            <tr class="border-b border-slate-800 text-slate-500 text-left">
+                                <th class="font-medium py-2 pr-3">Data</th><th class="font-medium py-2 pr-3">Simbolo</th>
+                                <th class="font-medium py-2 pr-3">Operazione</th><th class="font-medium py-2 pr-3 text-right">Prezzo</th>
+                                <th class="font-medium py-2 pr-3 text-right">Quantità</th><th class="font-medium py-2 pr-3 text-right">PnL realizzato</th>
+                                <th class="font-medium py-2">Rationale</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800/70 num">
+                            <template x-if="!historyRows.length">
+                                <tr><td colspan="7" class="py-4 text-slate-500 font-sans" x-text="historyLoading ? 'Caricamento…' : 'Nessuna operazione registrata.'"></td></tr>
+                            </template>
+                            <template x-for="h in historyRows" :key="h.id">
+                                <tr class="align-top">
+                                    <td class="py-2 pr-3 text-slate-400 whitespace-nowrap" x-text="dateTime(h.timestamp)"></td>
+                                    <td class="py-2 pr-3 text-slate-100" x-text="h.symbol"></td>
+                                    <td class="py-2 pr-3 whitespace-nowrap" :class="h.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'"
+                                        x-text="h.operation + (h.executed_offline ? '' : ' · online')"></td>
+                                    <td class="py-2 pr-3 text-right text-slate-300" x-text="price(h.price)"></td>
+                                    <td class="py-2 pr-3 text-right text-slate-300" x-text="h.quantity != null ? qty(h.quantity) : (h.notional != null ? usd(h.notional) : '—')"></td>
+                                    <td class="py-2 pr-3 text-right" :class="tone(h.realized_pnl)" x-text="h.realized_pnl != null ? usd(h.realized_pnl, true) : '—'"></td>
+                                    <td class="py-2 text-slate-400 font-sans" x-text="rationaleText(h)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         // Token degli endpoint di controllo, inserito dal server dopo il login
         const API_TOKEN = {{ api_token|tojson }};
@@ -455,6 +588,8 @@
                 radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
                 settings: { watchlist: [] }, envLocked: {},
                 showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
+                showPosition: false, posSymbol: '', posDetail: null, posLoading: false, posError: '', posNotice: '', posNoticeError: false, selling: false,
+                showHistory: false, historyRows: [], historyOffline: true, historyLoading: false,
                 localLogs: [], clearedId: 0, clearedTs: 0,
                 logs: [], lastLogId: 0, dialogue: [], lastDialogueId: 0, fetching: false, streamPinned: true,
                 numberFields: [
@@ -632,7 +767,7 @@
                     if (agent.startsWith('Scout')) return 'text-slate-400';
                     return { 'Chief of Staff': 'text-sky-400', 'Technical & Liquidity': 'text-violet-400',
                              'Sentiment & Compliance': 'text-violet-400', 'Risk & ATR': 'text-violet-400',
-                             'CIO': 'text-amber-300', 'Execution Desk': 'text-emerald-400' }[agent] || 'text-slate-300';
+                             'CIO': 'text-amber-300', 'Agente #5 CIO': 'text-amber-300', 'Execution Desk': 'text-emerald-400' }[agent] || 'text-slate-300';
                 },
                 levelColor(level) {
                     return { alert: 'text-amber-300', veto: 'text-rose-400', ok: 'text-emerald-400', muted: 'text-slate-600' }[level] || 'text-slate-300';
@@ -689,6 +824,87 @@
                 async toggleBot() {
                     const { res, data } = await this.api('/api/toggle');
                     if (res.ok) { this.bot.active = Boolean(data.active); this.addLog(data.active ? 'Bot riattivato' : 'Bot in pausa'); }
+                },
+                // ---------- scheda posizione ----------
+                price(v) {
+                    if (v === null || v === undefined || isNaN(v)) return '—';
+                    const n = Number(v);
+                    return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: Math.abs(n) < 10 ? 6 : 2 });
+                },
+                dateTime(v) {
+                    if (!v) return '—';
+                    const d = new Date(v);
+                    return isNaN(d) ? String(v) : d.toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'medium' });
+                },
+                agentRows(a) {
+                    const f = (v, d = 4) => (v === null || v === undefined) ? 'N/D' : Number(v).toFixed(d);
+                    const q = a.agent_01_quant || {}, m = a.agent_02_micro || {}, r = a.agent_03_risk || {}, mc = a.agent_04_macro || {}, c = a.agent_05_cio || {};
+                    const qm = q.metrics || {};
+                    return [
+                        { name: '#1 Quant', score: q.score ?? '—', detail: `Hurst ${f(qm.hurst_exponent)} · GARCH ${f(qm.garch_vol_pct)}% · Z ${f(qm.z_score, 2)} · ${q.signal || ''}` },
+                        { name: '#2 Micro', score: m.score ?? '—', detail: `VPIN ${f(m.vpin)} · OFI ${f(m.ofi)} · ${m.signal || ''}` },
+                        { name: '#3 Risk', score: r.score ?? '—', detail: `${r.approved ? 'Approvato' : 'Respinto'} · ${r.reason || ''}` },
+                        { name: '#4 Macro', score: mc.score ?? '—', detail: `Stress ${mc.stress_level || 'N/D'} · ${mc.approved ? 'Approvato' : 'Respinto'}` },
+                        { name: '#5 CIO', score: c.score ?? '—', detail: `${c.decision || ''} · ${c.reason || ''}` },
+                    ];
+                },
+                async openPosition(p) {
+                    this.posSymbol = p.symbol; this.posDetail = null; this.posError = ''; this.posNotice = '';
+                    this.showPosition = true; this.posLoading = true;
+                    try {
+                        const res = await fetch('/api/positions/' + encodeURIComponent(p.symbol));
+                        if (res.status === 401) { window.location.href = '/login'; return; }
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok) { this.posError = data.message || ('Errore ' + res.status); return; }
+                        this.posDetail = data;
+                    } catch (e) {
+                        this.posError = 'Errore di rete: ' + e.message;
+                    } finally {
+                        this.posLoading = false;
+                    }
+                },
+                async sellNow() {
+                    const sym = this.posDetail?.position?.symbol || this.posSymbol;
+                    if (!sym || !confirm(`Vendere SUBITO l'intera posizione ${sym} a mercato?`)) return;
+                    this.selling = true;
+                    try {
+                        const { res, data } = await this.api('/api/positions/' + encodeURIComponent(sym) + '/close');
+                        this.posNotice = data.message || (res.ok ? 'Vendita inviata' : 'Errore'); this.posNoticeError = !res.ok;
+                        this.addLog(this.posNotice, !res.ok);
+                        if (res.ok) { this.fetchStatus(); setTimeout(() => { this.showPosition = false; }, 1200); }
+                    } finally {
+                        this.selling = false;
+                    }
+                },
+
+                // ---------- storico offline ----------
+                openHistory() { this.showHistory = true; this.loadHistory(); },
+                async loadHistory() {
+                    this.historyLoading = true;
+                    try {
+                        const res = await fetch('/api/history?offline=' + (this.historyOffline ? '1' : '0'));
+                        if (res.status === 401) { window.location.href = '/login'; return; }
+                        const data = await res.json().catch(() => ({}));
+                        this.historyRows = Array.isArray(data.executions) ? data.executions : [];
+                    } catch (e) {
+                        this.historyRows = [];
+                    } finally {
+                        this.historyLoading = false;
+                    }
+                },
+                historySummary() {
+                    const rows = this.historyRows;
+                    const pnl = rows.reduce((s, h) => s + (Number(h.realized_pnl) || 0), 0);
+                    return `${rows.length} operazioni${this.historyOffline ? ' eseguite in tua assenza' : ''} · PnL realizzato ${this.usd(pnl, true)}`;
+                },
+                rationaleText(h) {
+                    const r = h.rationale || {};
+                    const a = r.agents || r.agents_at_exit;
+                    const parts = [];
+                    if (a) parts.push(`Q ${a.agent_01_quant?.score ?? '—'} · M ${a.agent_02_micro?.score ?? '—'} · R ${a.agent_03_risk?.score ?? '—'} · Macro ${a.agent_04_macro?.score ?? '—'} · CIO ${a.agent_05_cio?.score ?? '—'}`);
+                    if (r.desk_cio) parts.push(`convinzione ${r.desk_cio.conviction}: ${r.desk_cio.reason || ''}`);
+                    if (r.exit_reason) parts.push(r.exit_reason);
+                    return parts.join(' — ') || h.note || '—';
                 },
                 async liquidate() {
                     if (!confirm('Chiudere TUTTE le posizioni aperte?')) return;

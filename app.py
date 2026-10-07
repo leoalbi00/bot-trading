@@ -170,7 +170,23 @@ def should_abort():
         return True
     return False
 
-def execute_sell(pos, label, reason, auto_trade, pending, market_open, pct=100):
+def journal_operation(status, pos=None):
+    """Tipo di operazione per il registro: STOP LOSS / TAKE PROFIT dai trigger difensivi, altrimenti SELL."""
+    if status == "STOP_LOSS":
+        return "STOP LOSS"
+    if status == "TRAILING_STOP":
+        return "TAKE PROFIT" if pos and pos["unrealized_pl"] > 0 else "STOP LOSS"
+    return "SELL"
+
+def record_sell(pos, operation, order, pct=100, reason="", source="auto"):
+    """Registra una vendita inviata: quantità, prezzo corrente e PnL realizzato stimato sul prezzo medio."""
+    qty = pos["qty"] * min(pct, 100) / 100
+    pnl = (pos["current_price"] - pos["avg_entry_price"]) * qty if pos.get("avg_entry_price") else None
+    core.record_execution(pos["yf_symbol"], operation, "SELL", price=pos["current_price"], quantity=qty, realized_pnl=pnl,
+                          rationale={"exit_reason": reason, "agents_at_exit": core.quant_rationale(pos["yf_symbol"])},
+                          order_id=getattr(order, "id", None), source=source, note=reason, log=log_message)
+
+def execute_sell(pos, label, reason, auto_trade, pending, market_open, pct=100, operation="SELL"):
     """Vendita totale o parziale di una posizione (o segnalazione in modalità Advisor). Restituisce l'ordine o None."""
     sym, qty = pos["symbol"], pos["qty"]
     part = "" if pct >= 100 else f" ({pct:.0f}%)"
@@ -185,12 +201,14 @@ def execute_sell(pos, label, reason, auto_trade, pending, market_open, pct=100):
         note = "" if market_open or pos["is_crypto"] else " (mercato chiuso: eseguito all'apertura)"
         log_message(f"🚨 [Execution Desk] VENDITA{part} ({label}) INVIATA: {sym} (ID: {order.id}){note}")
         core.agent_say("Execution Desk", f"SELL{part} {sym} ({label}) inviato ad Alpaca", "veto")
+        record_sell(pos, operation, order, pct=pct, reason=f"{label}: {reason}")
         return order
     except Exception as e:
         log_message(f"Errore Vendita {sym}: {e}")
         return None
 
-def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=None, allocation_pct=None, conviction=None):
+def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=None, allocation_pct=None, conviction=None,
+                operation="BUY", rationale=None, price=None):
     """Acquisto a importo (notional) con stop ATR, allocazione e convinzione salvati nell'ordine."""
     if not auto_trade:
         log_message(f"🧭 [Advisor] Suggerito {label} di ${amount:,.2f} di {sym}: ordine non inviato.")
@@ -202,17 +220,21 @@ def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=Non
         pending.add(core.normalize_symbol(sym))
         log_message(f"✅ [Execution Desk] {label} INVIATO: ${amount:,.2f} di {sym} (stop {stop_pct}%, ID: {order.id})")
         core.agent_say("Execution Desk", f"BUY {sym} ${amount:,.2f} inviato ad Alpaca (stop {stop_pct}%)", "ok")
+        core.record_execution(sym, operation, "BUY", price=price, quantity=amount / price if price else None, notional=amount,
+                              rationale=rationale, order_id=order.id, note=label, log=log_message)
         return order
     except Exception as e:
         log_message(f"Errore Ordine Acquisto {sym}: {e}")
         return None
 
-def rotate_capital(pos, sell_pct, target, amount, cfg, auto_trade, pending, stop_pct=None, allocation_pct=None, conviction=None):
+def rotate_capital(pos, sell_pct, target, amount, cfg, auto_trade, pending, stop_pct=None, allocation_pct=None, conviction=None,
+                   rationale=None, price=None):
     """Rotazione asimmetrica: vende il sell_pct% di pos e reinveste su target entro il limite di esposizione."""
     if not auto_trade:
         log_message(f"🧭 [Advisor] Rotazione suggerita: vendi {sell_pct:.0f}% di {pos['symbol']} → ${amount:,.2f} di {target}.")
         return
-    order = execute_sell(pos, "ROTAZIONE", f"Capitale riallocato su {target}", auto_trade, pending, True, pct=sell_pct)
+    order = execute_sell(pos, "ROTAZIONE", f"Capitale riallocato su {target}", auto_trade, pending, True, pct=sell_pct,
+                         operation="ASSET SWAP")
     if not order:
         return
     filled = core.wait_for_fill(order.id, timeout=30, log=log_message)
@@ -226,7 +248,8 @@ def rotate_capital(pos, sell_pct, target, amount, cfg, auto_trade, pending, stop
         log_message(f"🔄 Nessun reinvestimento in {target}: fondi entro il limite di esposizione ${funds:,.2f}.")
         return
     execute_buy(target, final_amount, auto_trade, pending, label=f"ACQUISTO DA ROTAZIONE {allocation_pct}%",
-                stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction)
+                stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction,
+                operation="ASSET SWAP", rationale=rationale, price=price)
 
 def describe_decision(d):
     if d["action"] == "ROTATE":
@@ -291,7 +314,8 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                 log_message(f"💼 [CIO] {pos['symbol']}: vendita ({r['status']}) rimandata, ordine già pendente.")
                 continue
             log_message(f"💼 [CIO] SELL difensivo {pos['symbol']} ({r['status']}): {r['reason']}")
-            if execute_sell(pos, r["status"].replace("_", " "), r["reason"], auto_trade, pending, market_open) or not auto_trade:
+            if execute_sell(pos, r["status"].replace("_", " "), r["reason"], auto_trade, pending, market_open,
+                            operation=journal_operation(r["status"], pos)) or not auto_trade:
                 sold.add(key)
         core.save_state(state)
 
@@ -339,13 +363,24 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         # Tier 5: Execution Desk
         suspended = boot and final["action"] in ("BUY", "ROTATE")
         executed = False
+        entry_rationale, entry_price = None, None
+        if final["action"] in ("BUY", "ROTATE"):
+            pitch = next((p for p in inbox if core.normalize_symbol(p["symbol"]) == core.normalize_symbol(final["buy_symbol"])), {})
+            package = pitch.get("package") or {}
+            entry_price = package.get("entry_price")
+            entry_rationale = {
+                "agents": core.quant_rationale(final["buy_symbol"]),
+                "desk_cio": {"source": source, "conviction": final.get("conviction_score"),
+                             "allocation_pct": final.get("allocation_pct"), "reason": final["reason"] or decision["reason"]},
+                "risk_package": package,
+            }
         if suspended:
             log_message(f"🌅 [Avvio] {describe_decision(final)} non eseguito: acquisti sospesi nel ciclo di avvio.")
         elif orders_allowed and final["action"] == "BUY":
             executed = bool(execute_buy(final["buy_symbol"], final["buy_amount"], auto_trade, pending,
                                         label=f"ACQUISTO CIO {final['allocation_pct']}%",
                                         stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
-                                        conviction=final["conviction_score"]))
+                                        conviction=final["conviction_score"], rationale=entry_rationale, price=entry_price))
         elif orders_allowed and final["action"] in ("ROTATE", "SELL"):
             pos = next(p for p in positions if core.normalize_symbol(p["yf_symbol"]) == core.normalize_symbol(final["sell_symbol"]))
             if final["action"] == "SELL":
@@ -353,7 +388,7 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
             else:
                 rotate_capital(pos, final["sell_pct"], final["buy_symbol"], final["buy_amount"], cfg, auto_trade, pending,
                                stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
-                               conviction=final["conviction_score"])
+                               conviction=final["conviction_score"], rationale=entry_rationale, price=entry_price)
                 executed = auto_trade
         if inbox:
             core.record_cio_outcome(final.get("buy_symbol") or None, executed, describe_decision(final))
@@ -598,6 +633,8 @@ def positions_with_allocation():
 @app.route("/api/data")
 @require_login
 def api_data():
+    if is_logged_in():
+        core.mark_user_seen()   # dashboard aperta: le operazioni eseguite ora non sono "offline"
     # Risposta incrementale: il client indica l'ultimo id di log e di dialogo già ricevuti
     since_log = request.args.get("since_log", default=0, type=int)
     since_dialogue = request.args.get("since_dialogue", default=0, type=int)
@@ -627,6 +664,85 @@ def api_data():
             "ta": "Indicatori Tecnici RSI(14) e SMA"
         }
     })
+
+def _cancel_open_orders(alpaca_symbol):
+    """Annulla gli ordini aperti di un solo simbolo (altrimenti le quote restano bloccate)."""
+    from alpaca.trading.enums import QueryOrderStatus
+    from alpaca.trading.requests import GetOrdersRequest
+    key = core.normalize_symbol(alpaca_symbol)
+    for o in alpaca_client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
+        if core.normalize_symbol(o.symbol) == key:
+            alpaca_client.cancel_order_by_id(o.id)
+
+def _find_position(symbol):
+    key = core.normalize_symbol(symbol)
+    return next((p for p in get_open_positions() if core.normalize_symbol(p["symbol"]) == key), None)
+
+@app.route("/api/positions/<symbol>")
+@require_login
+def api_position_detail(symbol):
+    """Scheda di una posizione aperta: apertura, prezzi, PnL, rationale dei 5 agenti, stop e take profit."""
+    pos = _find_position(symbol)
+    if not pos:
+        return jsonify({"status": "error", "message": f"Nessuna posizione aperta su {symbol}"}), 404
+    info = bot_state.get("ledger_open", {}).get(core.normalize_symbol(pos["symbol"]), {})
+    entry = core.last_entry_execution(pos["yf_symbol"])
+    rationale = (entry or {}).get("rationale") or {}
+    rationale_source = "al momento dell'acquisto" if rationale.get("agents") else None
+    if not rationale.get("agents"):
+        live = core.quant_rationale(pos["yf_symbol"], max_age_sec=None)
+        if live:
+            rationale = {**rationale, "agents": live}
+            rationale_source = "ultima valutazione disponibile (acquisto non registrato nel journal)"
+    avg = pos["avg_entry_price"]
+    stop_pct = info.get("stop_pct") or core.get_config()["stop_loss_pct"]
+    package = rationale.get("risk_package") or {}
+    agents = rationale.get("agents") or {}
+    take_profit = package.get("target_price") or (agents.get("agent_03_risk") or {}).get("take_profit_price")
+    return jsonify({
+        "position": pos,
+        "opened_at": info.get("opened_at") or (entry or {}).get("timestamp"),
+        "allocation_pct": info.get("allocation_pct"), "conviction": info.get("conviction"),
+        "stop_loss": {"pct": stop_pct, "price": round(avg * (1 + stop_pct / 100), 6) if avg else None,
+                      "source": "stop ATR del CIO" if info.get("stop_pct") else "stop di riserva"},
+        "take_profit": {"price": take_profit,
+                        "pct": round((take_profit / avg - 1) * 100, 2) if take_profit and avg else None},
+        "rationale": rationale or None, "rationale_source": rationale_source,
+        "entry_execution": entry,
+    })
+
+@app.route("/api/positions/<symbol>/close", methods=["POST"])
+@require_token
+def api_position_close(symbol):
+    """🔴 VENDI SUBITO: chiusura manuale immediata di una singola posizione."""
+    if not alpaca_client:
+        return jsonify({"status": "error", "message": "Credenziali Alpaca non configurate."}), 503
+    pos = _find_position(symbol)
+    if not pos:
+        return jsonify({"status": "error", "message": f"Nessuna posizione aperta su {symbol}"}), 404
+    try:
+        _cancel_open_orders(pos["symbol"])
+    except Exception as e:
+        log_message(f"Errore annullamento ordini aperti di {pos['symbol']}: {e}")
+    try:
+        order = core.close_position(pos["symbol"])
+    except Exception as e:
+        log_message(f"Errore vendita manuale {pos['symbol']}: {e}")
+        return jsonify({"status": "error", "message": f"Vendita di {pos['symbol']} non riuscita: {e}"}), 502
+    log_message(f"🔴 VENDI SUBITO dalla dashboard: {pos['qty']} x {pos['symbol']} (ID: {getattr(order, 'id', '?')})")
+    core.agent_say("Execution Desk", f"SELL 100% {pos['symbol']} (manuale, dashboard) inviato ad Alpaca", "veto")
+    record_sell(pos, "MANUAL SELL", order, reason="Vendi subito (dashboard)", source="manual")
+    with _cache_lock:
+        _cache.clear()
+    return jsonify({"status": "success", "message": f"Vendita di {pos['symbol']} inviata."})
+
+@app.route("/api/history")
+@require_login
+def api_history():
+    """Registro operazioni; ?offline=1 solo quelle eseguite mentre la dashboard era chiusa."""
+    offline = request.args.get("offline", "0") in ("1", "true")
+    limit = max(1, min(request.args.get("limit", default=200, type=int), 1000))
+    return jsonify({"executions": core.list_executions(offline_only=offline, limit=limit)})
 
 @app.route("/api/settings", methods=["GET"])
 @require_login
@@ -692,8 +808,9 @@ def api_liquidate():
         sym = pos["symbol"]
         qty = pos["qty"]
         try:
-            core.close_position(sym)
+            order = core.close_position(sym)
             log_message(f"🚨 LIQUIDAZIONE MANUALE: Vendita {qty} x {sym}")
+            record_sell(pos, "MANUAL SELL", order, reason="Liquidazione manuale (Vendi tutto)", source="manual")
             count += 1
         except Exception as e:
             log_message(f"Errore vendita manuale {sym}: {e}")

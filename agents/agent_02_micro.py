@@ -142,17 +142,36 @@ class MicrostructureAgent:
         speed = float(((buy_pressures - 0.5) * 2.0 * vol_weights).sum())
         return float(np.clip(speed, -1.0, 1.0))
 
+    def calculate_order_flow_imbalance(self, df: pd.DataFrame, order_book: Optional[Dict[str, Any]] = None,
+                                       depth: int = 10) -> Dict[str, Any]:
+        """
+        Order Flow Imbalance (OFI) tra -1.0 (pressione in vendita) e +1.0 (pressione in acquisto).
+        Con uno snapshot L2 ({"bids": [[prezzo, size], ...], "asks": [...]}) usa le size dei primi
+        `depth` livelli; altrimenti ricade sulla velocità di svuotamento della coda stimata dalle barre.
+        """
+        bids = (order_book or {}).get("bids") or []
+        asks = (order_book or {}).get("asks") or []
+        try:
+            bid_size = sum(float(level[1]) for level in bids[:depth])
+            ask_size = sum(float(level[1]) for level in asks[:depth])
+        except (TypeError, ValueError, IndexError):
+            bid_size = ask_size = 0.0
+        if bid_size + ask_size > 0:
+            return {"ofi": float((bid_size - ask_size) / (bid_size + ask_size)), "source": "L2_BOOK"}
+        return {"ofi": self.calculate_queue_depletion_speed(df), "source": "OHLCV_PROXY"}
+
     def analyze(self, df: pd.DataFrame, order_book: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Pipeline Esecutiva completa dell'Agente #2.
-        order_book: snapshot L2 opzionale, accettato per compatibilità con l'orchestratore
-        (le metriche attuali sono derivate dalle sole barre OHLCV).
+        order_book: snapshot L2 opzionale ({"bids": [[prezzo, size], ...], "asks": [...]}), usato per l'OFI;
+        lo score resta derivato dalle barre OHLCV.
         """
         if df.empty or not {'close', 'open', 'high', 'low', 'volume'}.issubset(df.columns) or len(df) < 20:
             return {
                 "agent_id": self.agent_id,
                 "microstructure_score": 50.0,
                 "status": "INSUFFICIENT_DATA",
+                "reason": f"servono almeno 20 barre OHLCV complete (ricevute {len(df)})",
                 "trade_signal": "NEUTRAL"
             }
 
@@ -163,6 +182,7 @@ class MicrostructureAgent:
         iceberg_info = self.detect_iceberg_orders(df)
         has_liquidity_void = self.detect_liquidity_void(df)
         queue_speed = self.calculate_queue_depletion_speed(df)
+        ofi_info = self.calculate_order_flow_imbalance(df, order_book)
 
         base_score = 50.0
 
@@ -206,6 +226,8 @@ class MicrostructureAgent:
                 "rvol": round(rvol, 2),
                 "vpin_toxicity": round(vpin, 4),
                 "queue_depletion_speed": round(queue_speed, 4),
+                "order_flow_imbalance": round(ofi_info["ofi"], 4),
+                "ofi_source": ofi_info["source"],
                 "kyles_lambda": round(kyles_lambda, 6),
                 "iceberg_order": iceberg_info,
                 "liquidity_void_detected": has_liquidity_void
