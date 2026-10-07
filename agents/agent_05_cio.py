@@ -12,8 +12,8 @@ class CIOStrategistAgent:
     """
     def __init__(
         self, 
-        buy_threshold: float = 60.0,   # temporaneo (era 68.0): ricalibrazione in corso
-        sell_threshold: float = 40.0,  # temporaneo (era 32.0)
+        buy_threshold: float = 60.0,   # BUY se ensemble >= 60 (ricalibrato, era 68.0)
+        sell_threshold: float = 40.0,  # SHORT/SELL se ensemble <= 40 (era 32.0)
         min_conviction_multiplier: float = 0.5
     ):
         self.agent_id = "AGENT_05_CIO_STRATEGIST"
@@ -83,7 +83,8 @@ class CIOStrategistAgent:
         agent_01_quant_res: Dict[str, Any],
         agent_02_micro_res: Dict[str, Any],
         agent_03_risk_res: Dict[str, Any],
-        agent_04_macro_res: Dict[str, Any]
+        agent_04_macro_res: Dict[str, Any],
+        agent_06_guardian_res: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Pipeline Esecutiva e di Sintesi Finale dell'Agente #5.
@@ -118,6 +119,8 @@ class CIOStrategistAgent:
             vetoes.append(("VETO RISK", agent_03_risk_res.get("reason", "RISK_REJECTED")))
         if not agent_04_macro_res.get("macro_approved", False):
             vetoes.append(("VETO MACRO", agent_04_macro_res.get("reason", "MACRO_BLACKOUT")))
+        if agent_06_guardian_res is not None and not agent_06_guardian_res.get("guardian_approved", True):
+            vetoes.append(("VETO GUARDIAN", agent_06_guardian_res.get("reason", "PORTFOLIO_LIMIT")))
 
         if vetoes:
             return {

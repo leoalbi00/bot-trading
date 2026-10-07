@@ -57,7 +57,8 @@
                 </button>
                 <button @click="openHistory()" title="Operazioni eseguite dal bot mentre la dashboard era chiusa"
                         class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 whitespace-nowrap">📜 <span class="hidden sm:inline">Storico Offline</span></button>
-                <button @click="liquidate()" class="h-7 px-2.5 rounded border border-rose-900/70 text-rose-300 hover:bg-rose-950/60 whitespace-nowrap">Vendi tutto</button>
+                <button @click="liquidate()" title="Annulla gli ordini, chiude tutte le posizioni e mette il bot in pausa"
+                        class="h-7 px-2.5 rounded bg-rose-700 hover:bg-rose-600 text-white font-medium whitespace-nowrap">🚨 <span class="hidden sm:inline">PANIC - CHIUDI TUTTO</span></button>
                 <form method="post" action="/logout">
                     <button type="submit" title="Esci" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center">
                         <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
@@ -766,7 +767,7 @@
                 agentColor(agent) {
                     if (agent.startsWith('Scout')) return 'text-slate-400';
                     return { 'Chief of Staff': 'text-sky-400', 'Technical & Liquidity': 'text-violet-400',
-                             'Sentiment & Compliance': 'text-violet-400', 'Risk & ATR': 'text-violet-400', 'Quant Ensemble': 'text-violet-400',
+                             'Sentiment & Compliance': 'text-violet-400', 'Risk & ATR': 'text-violet-400', 'Quant Ensemble': 'text-violet-400', 'Pipeline': 'text-cyan-400', 'CHOP': 'text-yellow-300',
                              'CIO': 'text-amber-300', 'Agente #5 CIO': 'text-amber-300', 'Execution Desk': 'text-emerald-400' }[agent] || 'text-slate-300';
                 },
                 levelColor(level) {
@@ -840,12 +841,18 @@
                     const f = (v, d = 4) => (v === null || v === undefined) ? 'N/D' : Number(v).toFixed(d);
                     const q = a.agent_01_quant || {}, m = a.agent_02_micro || {}, r = a.agent_03_risk || {}, mc = a.agent_04_macro || {}, c = a.agent_05_cio || {};
                     const qm = q.metrics || {};
+                    const g = a.agent_06_guardian || {}, ch = a.agent_07_chop || {};
+                    const lat = ch.latency_ms || {};
+                    const chopTxt = ((ch.scouts || []).join(' · ') || 'nessuno Scout attivato')
+                        + (lat.stage1 != null ? ` · latenze S1 ${lat.stage1}ms / S2 ${lat.stage2}ms / S3 ${lat.stage3}ms` : '');
                     return [
                         { name: '#1 Quant', score: q.score ?? '—', detail: `Hurst ${f(qm.hurst_exponent)} · GARCH ${f(qm.garch_vol_pct)}% · Z ${f(qm.z_score, 2)} · ${q.signal || ''}` },
                         { name: '#2 Micro', score: m.score ?? '—', detail: `VPIN ${f(m.vpin)} · OFI ${f(m.ofi)} · ${m.signal || ''}` },
                         { name: '#3 Risk', score: r.score ?? '—', detail: `${r.approved ? 'Approvato' : 'Respinto'} · ${r.reason || ''}` },
                         { name: '#4 Macro', score: mc.score ?? '—', detail: `Stress ${mc.stress_level || 'N/D'} · ${mc.approved ? 'Approvato' : 'Respinto'}` },
                         { name: '#5 CIO', score: c.score ?? '—', detail: `${c.decision || ''} · ${c.reason || ''}` },
+                        { name: '#6 Guardian', score: g.approved == null ? '—' : (g.approved ? 'OK' : 'VETO'), detail: g.reason || '' },
+                        { name: '#7 CHOP', score: (ch.scouts || []).length + ' scout', detail: chopTxt },
                     ];
                 },
                 async openPosition(p) {
@@ -901,13 +908,15 @@
                     const r = h.rationale || {};
                     const a = r.agents || r.agents_at_exit;
                     const parts = [];
-                    if (a) parts.push(`Q ${a.agent_01_quant?.score ?? '—'} · M ${a.agent_02_micro?.score ?? '—'} · R ${a.agent_03_risk?.score ?? '—'} · Macro ${a.agent_04_macro?.score ?? '—'} · CIO ${a.agent_05_cio?.score ?? '—'}`);
+                    if (a) parts.push(`Q ${a.agent_01_quant?.score ?? '—'} · M ${a.agent_02_micro?.score ?? '—'} · R ${a.agent_03_risk?.score ?? '—'} · Macro ${a.agent_04_macro?.score ?? '—'} · CIO ${a.agent_05_cio?.score ?? '—'}`
+                        + (a.agent_06_guardian?.approved != null ? ` · Guardian ${a.agent_06_guardian.approved ? 'OK' : 'VETO'}` : '')
+                        + (a.agent_07_chop?.scouts?.length ? ` · ${a.agent_07_chop.scouts.length} scout` : ''));
                     if (r.desk_cio) parts.push(`convinzione ${r.desk_cio.conviction}: ${r.desk_cio.reason || ''}`);
                     if (r.exit_reason) parts.push(r.exit_reason);
                     return parts.join(' — ') || h.note || '—';
                 },
                 async liquidate() {
-                    if (!confirm('Chiudere TUTTE le posizioni aperte?')) return;
+                    if (!confirm('🚨 PANIC: annullare gli ordini, chiudere TUTTE le posizioni a mercato e mettere il bot in pausa?')) return;
                     const { res, data } = await this.api('/api/liquidate');
                     this.addLog(data.message || 'Liquidazione inviata', !res.ok);
                     this.fetchStatus();

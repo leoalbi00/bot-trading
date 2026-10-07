@@ -15,6 +15,7 @@ import threading
 import time
 
 import dotenv
+import pandas as pd
 import ta
 import yfinance as yf
 from alpaca.trading.client import TradingClient
@@ -743,7 +744,7 @@ def _finnhub_headlines(yf_symbol, limit):
 
 def completed_bars(df, bar=dt.timedelta(hours=1)):
     """Solo le candele chiuse: l'ultima di yfinance è ancora in formazione e fa oscillare gli indicatori."""
-    if df is None or not len(df):
+    if df is None or not len(df) or not isinstance(df.index, pd.DatetimeIndex):
         return df
     last = df.index[-1]
     now = dt.datetime.now(last.tzinfo) if getattr(last, "tzinfo", None) else dt.datetime.now()
@@ -1080,7 +1081,8 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
 
     Senza stato in memoria: il tempo di permanenza in posizione viene dalla data del primo acquisto
     ancora aperto negli ordini Alpaca (ledger["open"]), non da contatori di cicli.
-    Stati: STOP_LOSS, TAKE_PROFIT, TRAILING_STOP, RIBASSISTA, STALLO -> vendita obbligatoria;
+    Stati: STOP_LOSS, TAKE_PROFIT, TRAILING_STOP, BREAKEVEN_STOP, ALPHA_DECAY, TIME_STOP (Agente #6),
+           RIBASSISTA, STALLO -> vendita obbligatoria;
            IN_STALLO, IN_OSSERVAZIONE (segnale ribassista troppo presto o su dati fermi), OK, NO_DATA -> mantenute.
     Take profit al target del Comitato Rischi: rischio/rendimento TARGET_RISK_REWARD rispetto allo stop.
     A mercato azionario chiuso le uscite tecniche delle azioni vengono rimandate: le barre non si aggiornano.
@@ -1108,8 +1110,10 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
             status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ stop loss {stop:.1f}%"
         elif pl >= take_profit:
             status, reason = "TAKE_PROFIT", f"PnL {pl:.2f}% ≥ target {take_profit:.1f}% (rischio/rendimento {TARGET_RISK_REWARD:.0f}:1)"
-        elif trail and trail.get("hit"):
-            status, reason = "TRAILING_STOP", trail["reason"]
+        elif trail and trail.get("hit") and trail.get("action") in ("TRAILING_STOP", "BREAKEVEN_STOP"):
+            status, reason = trail["action"], trail["reason"]
+        elif trail and trail.get("hit") and trail.get("action") in ("ALPHA_DECAY", "TIME_STOP"):
+            status, reason = trail["action"], trail["reason"]
         elif not a:
             status, reason = "NO_DATA", "indicatori non disponibili"
         else:
@@ -1513,12 +1517,26 @@ def _peak_since(yf_symbol, opened_at):
         return None
 
 
-def volatility_agent(symbols, positions, cfg, log=print, ledger=None):
-    """ATR, stop dinamico per ogni simbolo e trailing stop per le posizioni aperte (senza stato locale).
+_guardian = None
 
-    - stop di una posizione: quello del CIO salvato nel client_order_id dell'acquisto, altrimenti da ATR;
-    - picco per il trailing: massimo dei prezzi dall'apertura (data letta dagli ordini Alpaca).
-    Restituisce (vol, stops, trailing).
+
+def portfolio_guardian():
+    """Agente #6 (Portfolio Guardian) con gli stessi moltiplicatori ATR del desk."""
+    global _guardian
+    if _guardian is None:
+        from agents.agent_06_sentinel import PortfolioGuardianAgent
+        _guardian = PortfolioGuardianAgent(min_hold_min=TECH_EXIT_MIN_HOLD_MIN,
+                                           atr_mult_stock=ATR_MULT_STOCK, atr_mult_crypto=ATR_MULT_CRYPTO)
+    return _guardian
+
+
+def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_open=True):
+    """ATR e stop dinamico per ogni simbolo; per le posizioni aperte l'Agente #6 (Portfolio Guardian) calcola
+    trailing ATR, breakeven a +1.5R, Alpha Decay (score CIO < 45) e Time-Stop (senza stato locale).
+
+    - stop iniziale di una posizione: quello del CIO salvato nel client_order_id dell'acquisto, altrimenti da ATR;
+    - picco: massimo dei prezzi dall'apertura (data letta dagli ordini Alpaca).
+    Restituisce (vol, stops, guardian) dove guardian[chiave] contiene action/hit/reason/effective_stop_pct.
     """
     vol = {}
     for sym in symbols:
@@ -1530,7 +1548,8 @@ def volatility_agent(symbols, positions, cfg, log=print, ledger=None):
 
     open_info = (ledger or {}).get("open", {})
     held = {normalize_symbol(p["symbol"]) for p in positions}
-    stops, trailing, parts = {}, {}, []
+    guard, now = portfolio_guardian(), now_local()
+    stops, guardian, parts = {}, {}, []
     for p in positions:
         key = normalize_symbol(p["symbol"])
         v = vol.get(normalize_symbol(p["yf_symbol"]))
@@ -1538,24 +1557,22 @@ def volatility_agent(symbols, positions, cfg, log=print, ledger=None):
         stop = info.get("stop_pct") or (v["stop_pct"] if v else cfg["stop_loss_pct"])
         stops[key] = stop
         price, entry = p["current_price"], p.get("avg_entry_price") or p["current_price"]
-        peak = max([x for x in (_peak_since(p["yf_symbol"], info.get("opened_at")), price, entry) if x] or [0.0])
-        if v:
-            trail_pct = (ATR_MULT_CRYPTO if p["is_crypto"] else ATR_MULT_STOCK) * v["atr_pct"]
-            active = peak >= entry * (1 + trail_pct / 100)
-            trigger = peak * (1 - trail_pct / 100)
-            hit = active and price <= trigger
-            trailing[key] = {
-                "active": active, "hit": hit, "trigger": trigger,
-                "reason": f"prezzo ${price:.2f} sotto il trailing stop ${trigger:.2f} (picco ${peak:.2f} - {trail_pct:.1f}%)",
-            }
-            parts.append(f"{p['symbol']} ATR {v['atr_pct']:.1f}% stop {stop:.1f}%"
-                         + (" (CIO)" if info.get("stop_pct") else "")
-                         + (f" trailing ${trigger:.2f}" if active else ""))
-        else:
-            parts.append(f"{p['symbol']} stop {stop:.1f}% (ATR N/D)")
+        opened = info.get("opened_at")
+        peak = max([x for x in (_peak_since(p["yf_symbol"], opened), price, entry) if x] or [0.0])
+        q = quant_rationale(p["yf_symbol"], max_age_sec=3600)
+        g = guard.evaluate_position(entry=entry, price=price, peak=peak, stop_pct=stop,
+                                    atr_pct=v["atr_pct"] if v else None, is_crypto=p["is_crypto"],
+                                    held_min=(now - opened).total_seconds() / 60 if opened else None,
+                                    cio_score=q["agent_05_cio"]["score"] if q else None, market_open=market_open)
+        guardian[key] = g
+        parts.append(f"{p['symbol']} " + (f"ATR {v['atr_pct']:.1f}% " if v else "ATR N/D ")
+                     + f"stop {stop:.1f}%" + (" (CIO)" if info.get("stop_pct") else "")
+                     + (f" → effettivo {g['effective_stop_pct']:+.2f}% [{g['stop_source']}]" if g["effective_stop_pct"] != stop else "")
+                     + (f" · CIO {q['agent_05_cio']['score']}" if q else "")
+                     + (f" · ⚠️ {g['action']}" if g["hit"] else ""))
     cands = [f"{v_sym} stop {v['stop_pct']:.1f}%" for v_sym, v in vol.items() if v_sym not in held]
-    log(f"📏 [Volatilità] Posizioni: {'; '.join(parts) or '-'}" + (f" | Candidati: {', '.join(cands)}" if cands else ""))
-    return vol, stops, trailing
+    log(f"🧿 [Agente #6 Guardian] Posizioni: {'; '.join(parts) or '-'}" + (f" | Candidati: {', '.join(cands)}" if cands else ""))
+    return vol, stops, guardian
 
 
 # ---------------- Agente 4: Macro Regime Analyst ----------------
@@ -2385,8 +2402,12 @@ def gate_risk_atr(p, ctx):
             "detail": detail, "stop_pct": stop}
 
 
+PIPELINE_ORIGIN = "Pipeline Quant"
+PIPELINE_BUY_SCORE = 60.0
+
+
 def gate_quant_ensemble(p):
-    """Ensemble dei 5 agenti quantitativi (quant_core): veto se Risk/Macro bocciano o se l'Agente #5 dà SELL.
+    """Ensemble dei 7 agenti (quant_core): veto se Risk/Macro/Guardian bocciano o se l'Agente #5 dà SELL.
 
     Senza una valutazione recente (es. agenti non disponibili) non blocca: il veto è dei gate classici.
     """
@@ -2453,9 +2474,12 @@ def risk_committee(pitch, ctx, fng):
         if st["trades"] >= AUDIT_MIN_TRADES and st["win_rate"] < AUDIT_LOW_WINRATE:
             score = max(0, score - AUDIT_PENALTY)
             audit_note += f" → score -{AUDIT_PENALTY}"
-    gates.append(gate_quant_ensemble(pitch))
+    quant_gate = gate_quant_ensemble(pitch)
+    gates.append(quant_gate)
     vetoes = [f"{g['agent']}: {g['reason']}" for g in gates if g["veto"]]
-    if score <= SCORE_BUY:
+    # Le schede nate dallo Stage 3 hanno già superato la soglia dell'Agente #5 (ensemble >= 60)
+    from_pipeline = pitch.get("origin") == PIPELINE_ORIGIN and (quant_gate.get("ensemble_score") or 0) >= PIPELINE_BUY_SCORE
+    if score <= SCORE_BUY and not from_pipeline:
         vetoes.append(f"Auditor: score {score} non superiore a {SCORE_BUY} ({audit_note})")
     stop = next(g["stop_pct"] for g in gates if g["agent"] == "Risk & ATR")
     package = None
@@ -2486,7 +2510,8 @@ def swarm_baskets(market_open=True, include=None):
     return baskets
 
 
-def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotate=False):
+def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotate=False, exposure_usd=None,
+                    positions_count=None):
     """Tier 1 -> 2 -> 3: scansione parallela, schede all'Orchestrator, revisione immediata.
 
     rotate=True: un solo paniere per chiamata, a rotazione (scansione continua, feed sempre attivo);
@@ -2564,11 +2589,23 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     scouts_ms = round((time.perf_counter() - t_sc) * 1000, 1)
     max_scout_ms = max((r["elapsed_ms"] for r in results), default=0)
 
-    # Stream verso i 5 agenti quantitativi (asyncio.Queue -> process_scout_stream), solo consultivo
+    # Sciame di 100 Scout + pipeline a 3 Stage (7 agenti). Le schede dello sciame classico e le posizioni
+    # aperte arrivano sempre allo Stage 3; i BUY approvati dallo Stage 3 diventano nuove schede.
     try:
         stream_scouts_to_agents(
             [(scout_no.get(r["symbol"], 0), r["symbol"], f1h.get(r["symbol"])) for r in results],
-            macro, fng, held_keys=held_keys, log=log)
+            macro, fng, held_keys=held_keys, log=log, pending=pending, exposure_usd=exposure_usd,
+            positions_count=positions_count,
+            force=[r["symbol"] for r in results if r["pitch"] or normalize_symbol(r["symbol"]) in held_keys])
+        for r in results:
+            if r["pitch"] or not (market_open or is_crypto(r["symbol"])):
+                continue
+            q = quant_rationale(r["symbol"], max_age_sec=120)
+            if q and q["agent_05_cio"]["decision"] == "BUY" and (q["agent_06_guardian"] or {}).get("approved"):
+                r.update(pitch=True, origin=PIPELINE_ORIGIN,
+                         anomalies=r["anomalies"] + [f"Pipeline Quant: ensemble {q['agent_05_cio']['score']}/100"])
+                agent_say("Pipeline", f"{r['symbol']} → BUY dallo Stage 3 (ensemble {q['agent_05_cio']['score']}): "
+                                      "scheda al Comitato Rischi", "alert")
     except Exception as e:
         log(f"⚠️ [Agenti Quant] Stream degli Scout interrotto: {type(e).__name__}: {e}")
 
@@ -3076,13 +3113,39 @@ _quant_engine_ref = {"core": None}
 _balance_cache = {"ts": 0.0, "value": None}
 
 
+QUANT_SWARM_SIZE = 100
+NEWS_CACHE_SEC = 900
+_news_cache = {}
+
+
 def quant_engine():
-    """Istanza unica dell'orchestratore a 5 agenti (import pigro: scipy solo quando serve)."""
+    """Istanza unica dell'orchestratore (100 Scout, 7 agenti, CHOP); import pigro: scipy solo quando serve."""
     with _quant_lock:
         if _quant_engine_ref["core"] is None:
             from quant_core import QuantitativeTradingCore
-            _quant_engine_ref["core"] = QuantitativeTradingCore(portfolio_max_slots=3, num_workers=4)
+            _quant_engine_ref["core"] = QuantitativeTradingCore(portfolio_max_slots=3, num_workers=4,
+                                                                swarm_size=QUANT_SWARM_SIZE, news_provider=news_for_agents)
         return _quant_engine_ref["core"]
+
+
+def news_for_agents(yf_symbol):
+    """Stage 2 · ricerca notizie per l'Agente #4: titoli (yfinance/Finnhub), sentiment -1..+1 e trimestrali.
+
+    Cache di 15 minuti per ticker: lo Stage 2 resta nell'ordine dei millisecondi dopo la prima ricerca.
+    """
+    cached = _news_cache.get(yf_symbol)
+    if cached and time.time() - cached[0] < NEWS_CACHE_SEC:
+        return {**cached[1], "source": "cache"}
+    news = get_recent_news(yf_symbol)
+    score, hits = sentiment_score(news)
+    events = []
+    earnings = earnings_within(yf_symbol)
+    if earnings:
+        events.append({"timestamp": f"{earnings}T13:30:00", "event_name": f"Trimestrale {yf_symbol}"})
+    headlines = 0 if news.startswith("Nessuna notizia") else news.count(" | ") + 1
+    out = {"sentiment": score / 100.0, "headlines": headlines, "keywords": hits, "events": events, "source": "web"}
+    _news_cache[yf_symbol] = (time.time(), out)
+    return out
 
 
 def account_balance_for_agents():
@@ -3124,15 +3187,17 @@ def crypto_order_books(yf_symbols, depth=10):
     return out
 
 
-def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, order_books=None):
-    """Invia l'output degli Scout ai 5 agenti tramite asyncio.Queue e restituisce il piano dell'Agente #5.
+def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, order_books=None, force=(),
+                            pending=(), exposure_usd=None, positions_count=None):
+    """Sciame di 100 Scout -> asyncio.Queue -> pipeline a 3 Stage (7 agenti). Restituisce il piano dell'Agente #5.
 
-    scout_frames: [(scout_id, yf_symbol, DataFrame 1h di yfinance), ...]
+    scout_frames: [(scout_id, yf_symbol, DataFrame 1h di yfinance), ...] (si usano solo le candele chiuse)
+    force: simboli da portare comunque fino allo Stage 3 (posizioni aperte e schede proposte dallo sciame classico)
     order_books: snapshot L2 già pronti (None = richiesta ad Alpaca per le crypto).
     """
     import asyncio
-    from quant_core import build_scout_payload, STREAM_END
-    scout_frames = [f for f in scout_frames if f[2] is not None]
+    from quant_core import build_scout_payload
+    scout_frames = [(sid, sym, completed_bars(f)) for sid, sym, f in scout_frames if f is not None and len(f)]
     if not scout_frames:
         return []
     engine = quant_engine()
@@ -3141,27 +3206,31 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
                     "news_sentiment": 0.0, "central_bank_speech": "", "upcoming_events": []}
     books = crypto_order_books([sym for _, sym, _ in scout_frames]) if order_books is None else order_books
     balance = account_balance_for_agents()
-
-    async def run():
-        queue = asyncio.Queue()
-
-        async def scouts():
-            for scout_id, sym, frame in scout_frames:
-                await queue.put(build_scout_payload(sym, frame, order_book=books.get(sym), macro_inputs=macro_inputs,
-                                                    account_balance=balance, scout_id=f"{scout_id:02d}"))
-            await queue.put(STREAM_END)
-
-        _, plan = await asyncio.gather(scouts(), engine.process_scout_stream(queue))
-        return plan
+    forced = {normalize_symbol(f) for f in force}
+    payloads = [build_scout_payload(sym, frame, order_book=books.get(sym), macro_inputs=macro_inputs,
+                                    account_balance=balance, scout_id=f"{scout_id:02d}",
+                                    force_full=normalize_symbol(sym) in forced)
+                for scout_id, sym, frame in scout_frames]
+    held = {normalize_symbol(h) for h in held_keys}
+    exposure_pct = (exposure_usd / balance * 100) if exposure_usd is not None and balance else 0.0
 
     with _quant_lock:
-        # Gli slot dell'Agente #5 riflettono le posizioni reali su Alpaca
+        # Agente #6 e slot dell'Agente #5 riflettono le posizioni reali su Alpaca
+        engine.portfolio_context = {"held": held, "pending": {normalize_symbol(x) for x in pending},
+                                    "exposure_pct": exposure_pct, "positions": positions_count if positions_count is not None else len(held),
+                                    "max_exposure_pct": get_config()["max_exposure_pct"]}
         engine.active_portfolio = {k: engine.active_portfolio.get(k) or {"symbol": k, "side": "BUY", "cio_ensemble_score": 50.0,
                                                                          "strength": 50.0, "details": {}}
-                                   for k in (normalize_symbol(h) for h in held_keys)}
-        plan = asyncio.run(run())
+                                   for k in held}
+        before = dict(engine.watchdog.stage_counts)
+        plan = asyncio.run(engine.run_swarm_cycle(payloads))
+        after = dict(engine.watchdog.stage_counts)
+    got = {k: after[k] - before.get(k, 0) for k in after}
+    agent_say("Pipeline", f"{len(payloads)} ticker · {engine.swarm.active_last_cycle} Scout al lavoro → Stage 1 passano "
+                          f"{got['stage1_pass']}/{got['received']} → Stage 2 passano {got['stage2_pass']} → "
+                          f"Stage 3 valutati {got['stage3_done']}", "muted" if not got["stage3_done"] else "info")
     for _, sym, _ in scout_frames:
-        r = engine.rationale_for(sym, max_age_sec=300)
+        r = engine.rationale_for(sym, max_age_sec=120)
         if r:
             cio = r["agent_05_cio"]
             agent_say("Agente #5 CIO", f"{sym} → ensemble {cio['score']}/100 → {cio['decision']} "
@@ -3169,10 +3238,29 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
                                        f"R {r['agent_03_risk']['score']} · Macro {r['agent_04_macro']['score']})",
                       "veto" if str(cio["decision"]).startswith("VETO") else ("ok" if cio["decision"] in ("BUY", "SELL") else "info"))
     if plan:
-        log("👑 [Agente #5] Piano consultivo: " + ", ".join(
+        log("👑 [Agente #5] Stage 3 approvati: " + ", ".join(
             f"{o['action']} {o['data']['symbol']} {o['data']['cio_result']['final_decision']} "
             f"({o['data']['cio_result']['cio_ensemble_score']})" for o in plan))
     return plan
+
+
+def refresh_held_evaluations(held_yf, log=print):
+    """Valuta subito con i 7 agenti le posizioni aperte (per l'Alpha Decay dell'Agente #6), senza filtri di Stage."""
+    held_yf = list(dict.fromkeys(held_yf))
+    if not held_yf:
+        return
+    frames = _download(held_yf, "3mo", "1h")
+    try:
+        stream_scouts_to_agents([(0, s, frames.get(s)) for s in held_yf], latest_channels().get("macro") or {},
+                                crypto_fear_greed(), held_keys=held_yf, log=log, force=held_yf)
+    except Exception as e:
+        log(f"⚠️ [Agente #6] Valutazione delle posizioni aperte non riuscita: {type(e).__name__}: {e}")
+
+
+def chop_audit(log=print, force=False):
+    """Agente #7: auto-healing e riga di audit dello sciame (al massimo ogni 30 secondi)."""
+    engine = quant_engine()
+    return engine.watchdog.maybe_audit(log, swarm=engine.swarm, engine=engine, force=force)
 
 
 def quant_rationale(symbol, max_age_sec=1800):
@@ -3283,24 +3371,52 @@ def last_entry_execution(symbol):
 
 # ===========================================================================
 # CICLO DI TEST SIMULATO:  python trading_core.py
-#   11 Scout (paniere crypto esteso) con dati sintetici -> asyncio.Queue -> 5 agenti.
+#   Sciame di 100 Scout su 17 ticker (11 crypto + 6 azioni) con dati sintetici
+#   -> asyncio.Queue -> Stage 1-3 (7 agenti) -> audit del CHOP Watchdog.
 #   Nessuna chiamata di rete e nessun ordine.
 # ===========================================================================
 if __name__ == "__main__":
-    from quant_core import dummy_ohlcv
+    import numpy as np
 
-    def _simulated_frame(seed):
-        df = dummy_ohlcv(seed, bars=300)
-        return df.rename(columns=str.capitalize)   # stesso formato dei DataFrame yfinance dello sciame
+    SIM_STOCKS = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "META"]
 
-    frames = [(i + 1, sym, _simulated_frame(i)) for i, sym in enumerate(CRYPTO_EXTENDED)]
-    print(f"=== Ciclo simulato: {len(frames)} Scout -> asyncio.Queue -> 5 Agenti ===", flush=True)
+    def _simulated_frame(seed, kind=None, bars=400):
+        """Barre 1h sintetiche (formato yfinance) con eventuale anomalia iniettata nell'ultima candela."""
+        rng = np.random.default_rng(seed)
+        close = 100 * np.exp(np.cumsum(rng.normal(0, 0.006, bars)))
+        volume = rng.integers(800, 1200, bars).astype(float)
+        if kind == "breakout":
+            close[-1] = close[-21:-1].max() * 1.025
+            volume[-1] *= 3.5
+        elif kind == "trend":
+            close = 100 * np.exp(np.cumsum(rng.normal(0.0025, 0.004, bars)))
+            close[-1] = close[-2] * 1.012
+            volume[-1] *= 2.4
+        elif kind == "selloff":
+            close[-1] = close[-2] * 0.95
+            volume[-1] *= 6
+        open_ = np.concatenate(([close[0]], close[:-1]))
+        high = np.maximum(open_, close) * (1 + rng.random(bars) * 0.002)
+        low = np.minimum(open_, close) * (1 - rng.random(bars) * 0.002)
+        index = pd.date_range(end=pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=1), periods=bars, freq="h")
+        return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume}, index=index)
+
+    tickers = CRYPTO_EXTENDED + SIM_STOCKS
+    anomalies = {"SOL-USD": "breakout", "LINK-USD": "trend", "NVDA": "trend", "DOGE-USD": "selloff", "AMD": "breakout"}
+    frames = [(i + 1, sym, _simulated_frame(i, anomalies.get(sym))) for i, sym in enumerate(tickers)]
+    books = {"BTC-USD": {"bids": [[100.0, 9.0], [99.9, 8.0], [99.8, 7.5]], "asks": [[100.1, 1.0], [100.2, 1.5], [100.3, 1.2]]},
+             "ETH-USD": {"bids": [[100.0, 1.0], [99.9, 1.2], [99.8, 0.9]], "asks": [[100.1, 1.1], [100.2, 30.0], [100.3, 1.0]]}}
+    print(f"=== Ciclo simulato: {QUANT_SWARM_SIZE} Scout su {len(frames)} ticker -> asyncio.Queue -> 3 Stage · 7 Agenti ===",
+          flush=True)
     _balance_cache.update(ts=time.time(), value=50000.0)
-    books = {"BTC-USD": {"bids": [[100.0, 4.0], [99.9, 3.0]], "asks": [[100.1, 1.0], [100.2, 1.5]]}}  # L2 sintetico
+    _news_cache.update({sym: (time.time(), {"sentiment": 0.2, "headlines": 3, "keywords": 2, "events": [], "source": "sim"})
+                        for _, sym, _ in frames})
     plan = stream_scouts_to_agents(frames, {"vix": 17.0}, {"value": 55}, log=lambda m: print(m, flush=True),
-                                   order_books=books)
+                                   order_books=books, held_keys=["BTC-USD"], force=["BTC-USD"],
+                                   exposure_usd=10000.0, positions_count=1)
     engine = quant_engine()
     evaluated = [s for _, s, _ in frames if engine.rationale_for(s)]
-    print(f"\nAgente #5: {len(evaluated)}/{len(frames)} opportunità valutate · piano: "
+    print(f"\nAgente #5: {len(evaluated)}/{len(frames)} arrivati allo Stage 3 ({', '.join(evaluated) or '-'}) · piano: "
           + (", ".join(f"{o['action']} {o['data']['symbol']}" for o in plan) or "nessuna apertura"), flush=True)
+    chop_audit(log=lambda m: print(m, flush=True), force=True)
     engine.shutdown()

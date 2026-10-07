@@ -115,6 +115,24 @@ class HyperQuantAgent:
         q_upper = float(np.quantile(returns, 1 - (alpha / 2)))
         return {"lower_bound_pct": q_lower, "upper_bound_pct": q_upper}
 
+    def fast_screen(self, close: pd.Series, window: int = 120) -> Dict[str, Any]:
+        """
+        STAGE 1 (Fast-Quant): solo Hurst, Z-Score e Volatility Spike sulle ultime `window` chiusure.
+        Pensato per stare sotto i 5 ms: niente GARCH, Koopman o quantili.
+        interesting = il prezzo si sta comportando in modo non casuale (eccesso statistico,
+        shock di volatilità o regime chiaramente trending / mean-reverting).
+        """
+        tail = close.iloc[-window:].astype(float)
+        if len(tail) < 30:
+            return {"hurst": 0.5, "z_score": 0.0, "vol_spike": 0.0, "interesting": False}
+        z = self.calculate_z_score(tail)
+        h = self.calculate_hurst_exponent(tail)
+        rets = np.diff(tail.values) / tail.values[:-1]
+        sigma = float(np.std(rets[-51:-1])) or 1e-12
+        spike = float(abs(rets[-1]) / sigma)
+        interesting = abs(z) >= 1.5 or spike >= 2.0 or h <= 0.35 or h >= 0.65
+        return {"hurst": round(h, 4), "z_score": round(z, 4), "vol_spike": round(spike, 2), "interesting": interesting}
+
     def analyze(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Pipeline Esecutiva completa dell'Agente #1.

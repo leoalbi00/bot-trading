@@ -176,6 +176,8 @@ def journal_operation(status, pos=None):
         return "STOP LOSS"
     if status == "TAKE_PROFIT":
         return "TAKE PROFIT"
+    if status == "BREAKEVEN_STOP":
+        return "STOP LOSS"
     if status == "TRAILING_STOP":
         return "TAKE PROFIT" if pos and pos["unrealized_pl"] > 0 else "STOP LOSS"
     return "SELL"
@@ -304,12 +306,20 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         held_yf = [p["yf_symbol"] for p in positions]
         analysis = core.market_analyst(held_yf, log=log_message) if positions else {}
         drawdown = core.drawdown_controller(acc, state, log=log_message)
-        vol, stops, trailing = core.volatility_agent(held_yf, positions, cfg, log=log_message, ledger=ledger) if positions else ({}, {}, {})
+        if positions:
+            core.refresh_held_evaluations(held_yf, log=log_message)   # score CIO aggiornato per l'Alpha Decay
+        vol, stops, trailing = (core.volatility_agent(held_yf, positions, cfg, log=log_message, ledger=ledger,
+                                                      market_open=market_open) if positions else ({}, {}, {}))
+        # Stop effettivo dell'Agente #6 (breakeven / trailing): il radar lo controlla h24 ogni ~20 secondi
+        with state_lock:
+            for key, g in trailing.items():
+                bot_state["ledger_open"].setdefault(key, {})["effective_stop_pct"] = g.get("effective_stop_pct")
         risk = core.risk_manager(positions, analysis, acc, cfg, log=log_message, stops=stops, trailing=trailing, ledger=ledger,
                                  market_open=market_open)
         sold = set()
         for r in risk["positions"]:
-            if r["status"] not in ("STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP", "RIBASSISTA", "STALLO"):
+            if r["status"] not in ("STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP", "BREAKEVEN_STOP", "ALPHA_DECAY",
+                                   "TIME_STOP", "RIBASSISTA", "STALLO"):
                 continue
             pos = r["pos"]
             key = core.normalize_symbol(pos["symbol"])
@@ -490,6 +500,7 @@ def radar_loop():
                 held = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
                 pending = core.get_pending_order_symbols(log=lambda m: None) or set()
                 core.run_scout_swarm(held_keys=held, pending=pending, log=log_message, rotate=True,
+                                     exposure_usd=sum(abs(p["market_value"]) for p in positions), positions_count=len(positions),
                                      on_approved=lambda: request_cio("schede approvate dal Comitato Rischi"))
                 # Mercato USA chiuso: pulse silenzioso dei panieri azionari (si autolimita a 1 volta ogni 15 min)
                 core.run_closed_market_pulse(log=log_message)
@@ -497,15 +508,31 @@ def radar_loop():
                 stops = bot_state.get("ledger_open", {})
                 fallback = core.get_config()["stop_loss_pct"]
                 for p in positions:
-                    stop = (stops.get(core.normalize_symbol(p["symbol"])) or {}).get("stop_pct") or fallback
+                    info = stops.get(core.normalize_symbol(p["symbol"])) or {}
+                    stop = info.get("stop_pct") or fallback
+                    # Agente #6: stop rialzato a breakeven o dal trailing ATR (calcolato nell'ultimo ciclo del CIO)
+                    if info.get("effective_stop_pct") is not None:
+                        stop = max(stop, info["effective_stop_pct"])
                     if p["unrealized_plpc"] <= stop and core.normalize_symbol(p["symbol"]) not in pending:
-                        log_message(f"🛑 [Radar] {p['symbol']} a {p['unrealized_plpc']:.2f}% ha toccato lo stop {stop:.1f}%: sveglio il CIO.")
+                        log_message(f"🛑 [Radar] {p['symbol']} a {p['unrealized_plpc']:.2f}% ha toccato lo stop {stop:+.2f}%: sveglio il CIO.")
                         request_cio(f"stop toccato su {p['symbol']}", urgent=True)
             except Exception as e:
                 log_message(f"📡 Errore sciame: {e}")
         # Scansione continua: un paniere ogni RADAR_INTERVAL_SEC / numero di panieri (~20s)
         tick = core.RADAR_INTERVAL_SEC / len(core.DESK_BASKETS)
         time.sleep(max(5, tick - (time.time() - started)))
+
+def chop_loop():
+    """Agente #7 (CHOP Watchdog): auto-healing e audit dello sciame ogni 30 secondi."""
+    time.sleep(core.STARTUP_GRACE_SECONDS + 30)
+    while True:
+        try:
+            line = core.chop_audit(log=log_message)
+            if line:
+                core.agent_say("CHOP", line.replace("🐝 [CHOP SWARM AUDIT] ", ""), "muted")
+        except Exception as e:
+            log_message(f"🐝 [CHOP] Errore audit: {e}")
+        time.sleep(5)
 
 def keep_alive_url():
     base = os.getenv("RENDER_EXTERNAL_URL")
@@ -561,6 +588,7 @@ def start_background_threads():
     threading.Thread(target=background_loop, daemon=True).start()
     threading.Thread(target=keep_alive_loop, daemon=True).start()
     threading.Thread(target=radar_loop, daemon=True).start()
+    threading.Thread(target=chop_loop, daemon=True).start()
     log_message(f"🧵 Thread di trading, radar Esploratore e Keep-Alive avviati (PID {os.getpid()})")
     cfg = core.get_config()
     mode = "Auto-Trading attivo" if cfg["auto_execute_trades"] else "Advisor (nessun ordine)"
@@ -801,9 +829,15 @@ def api_liquidate():
     if not alpaca_client:
         return jsonify({"status": "error", "message": "Credenziali Alpaca non configurate."}), 503
 
+    # PANIC: il bot va in pausa, altrimenti al ciclo successivo riaprirebbe posizioni
+    bot_state["active"] = False
+    if not scan_lock.locked():
+        bot_state["status"] = "In pausa (PANIC)"
+    log_message("🚨 PANIC - CHIUDI TUTTO dalla dashboard: bot in pausa, annullo gli ordini e chiudo tutte le posizioni.")
+    core.agent_say("Execution Desk", "🚨 PANIC: bot in pausa, chiusura di tutte le posizioni", "veto")
     positions = get_open_positions()
     if not positions:
-        return jsonify({"status": "warning", "message": "Nessuna posizione aperta da liquidare."})
+        return jsonify({"status": "warning", "message": "Nessuna posizione aperta da liquidare. Bot in pausa."})
 
     # Annulla gli ordini aperti: altrimenti le quote sono bloccate e la vendita fallisce
     try:
@@ -818,14 +852,15 @@ def api_liquidate():
         try:
             order = core.close_position(sym)
             log_message(f"🚨 LIQUIDAZIONE MANUALE: Vendita {qty} x {sym}")
-            record_sell(pos, "MANUAL SELL", order, reason="Liquidazione manuale (Vendi tutto)", source="manual")
+            record_sell(pos, "PANIC SELL", order, reason="🚨 PANIC - CHIUDI TUTTO (dashboard)", source="manual")
             count += 1
         except Exception as e:
             log_message(f"Errore vendita manuale {sym}: {e}")
 
     with _cache_lock:
         _cache.clear()
-    return jsonify({"status": "success", "message": f"Liquidazione inviata: {count}/{len(positions)} posizioni in chiusura."})
+    return jsonify({"status": "success", "message": f"PANIC: {count}/{len(positions)} posizioni in chiusura, bot in pausa "
+                                                   "(premi Riprendi per riattivarlo)."})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
