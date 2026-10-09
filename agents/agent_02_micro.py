@@ -228,6 +228,9 @@ class MicrostructureAgent:
                 "queue_depletion_speed": round(queue_speed, 4),
                 "order_flow_imbalance": round(ofi_info["ofi"], 4),
                 "ofi_source": ofi_info["source"],
+                # Pressione istituzionale sul book: OFI oltre ±0.2 = un lato domina la liquidità esposta
+                "institutional_pressure": ("BUY_PRESSURE" if ofi_info["ofi"] >= 0.2 else
+                                           "SELL_PRESSURE" if ofi_info["ofi"] <= -0.2 else "BALANCED"),
                 "kyles_lambda": round(kyles_lambda, 6),
                 "iceberg_order": iceberg_info,
                 "liquidity_void_detected": has_liquidity_void

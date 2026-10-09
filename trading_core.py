@@ -77,21 +77,10 @@ ORDER_TAG_PREFIX = "brd-"  # prefisso del client_order_id degli acquisti del bot
 _ORDER_STOP_RE = re.compile(r"^brd-s(\d+)-(?:a(\d+)-)?(?:c(\d+)-)?")
 HTTP_TIMEOUT = 10
 
-# Regole di uscita attiva e rotazione del capitale
-STALL_ROC_PCT = 0.5            # |ROC(10)| sotto questa soglia = prezzo in stallo
-STALL_MIN_CYCLES = 3           # cicli consecutivi in portafoglio prima di vendere per stallo
-REVERSAL_ROC_PCT = -2.0        # ROC(10) sotto questa soglia con prezzo < SMA20 = inversione ribassista
-ROTATION_FUNDS_THRESHOLD = 50  # sotto questi fondi si valuta la rotazione del capitale
-ROTATION_MIN_SCORE = 80        # il nuovo asset deve avere score > di questo valore per la rotazione
-ROTATION_MIN_EDGE = 10         # vantaggio minimo di score sul titolo venduto (evita compravendite inutili)
-
 # Desk multi-agente: soglie dello Score di Forza (0-100)
 SCORE_BUY = 75                 # > 75: candidato BUY
 STRONG_BUY_SCORE = 85          # >= 85: STRONG BUY, allocazione maggiorata (25-30%)
 SCORE_SELL = 45                # < 45: candidato SELL / debolezza
-STALL_SCORE = 55               # stallo: ROC vicino a 0 e score < 55...
-STALL_MIN_HOLD_MIN = 45        # ...con posizione aperta da almeno 45 minuti (3 cicli), letta da Alpaca
-TECH_EXIT_MIN_HOLD_MIN = 60    # uscite tecniche (RIBASSISTA) solo dopo 60 minuti: evita compra-vendi sul rumore
 MAX_RISK_PER_TRADE_PCT = 2.0   # perdita massima allo stop per operazione, in % del capitale (sizing vs stop)
 
 # ---------------------------------------------------------------------------
@@ -129,8 +118,8 @@ DEFAULT_CONFIG = {
         "NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META", "PLTR", "COIN", "SMCI",
     ],
     "base_allocation_pct": 5.0,    # minimo della banda più bassa (compatibilità)
-    "max_allocation_pct": 35.0,   # soffitto di sicurezza: il CIO decide 5-35% in base alla convinzione
-    "max_exposure_pct": 100.0,
+    "max_allocation_pct": 50.0,   # soffitto di sicurezza: 50% solo per SUPER_CONVICTION (Ensemble >= 90)
+    "max_exposure_pct": 40.0,     # Risk Safety Net: mai oltre il 40% del capitale (tetto anche se configurato più alto)
     "stop_loss_pct": -5.0,
     "scan_interval_min": 15,
     "auto_execute_trades": True,
@@ -576,6 +565,35 @@ def summarize_reason(text, limit=160):
 _groq_client = None
 
 
+from agents.agent_07_chop import GROQ_TIMEOUT_S
+from agents.agent_03_risk import (MAX_EXPOSURE_PCT as RISK_MAX_EXPOSURE_PCT, MAX_POSITIONS as RISK_MAX_POSITIONS,
+                                  clamp_stop_pct, crypto_night_blocked, hard_stop_pct)
+
+
+def groq_news_llm(system, prompt):
+    """Agente #4 -> Groq con output JSON rigoroso. Testo della risposta o None (nessuna chiave / errore).
+
+    Il limite di 2.0 s è doppio: timeout del client HTTP e guard dell'Agente #7 (guarded_llm_call).
+    """
+    global _groq_client
+    if not GROQ_KEY:
+        return None
+    import groq
+    if _groq_client is None:
+        _groq_client = groq.Groq(api_key=GROQ_KEY, timeout=GROQ_TIMEOUT_S, max_retries=0)
+    for model in [m for m in GROQ_MODELS if m not in _unavailable_groq_models][:1]:
+        try:
+            res = _groq_client.chat.completions.create(
+                model=model, max_tokens=200, temperature=0, response_format={"type": "json_object"},
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}])
+            return res.choices[0].message.content if res.choices else None
+        except groq.NotFoundError:
+            _unavailable_groq_models.add(model)
+        except Exception as e:
+            _warn_throttled("groq-news", f"⚠️ [Agente #4] Groq news non disponibile: {str(e)[:160]}", print, every=600)
+    return None
+
+
 def query_groq_ai(prompt, log=print):
     """Interroga Groq (Llama 3.3 70B). In caso di errore la decisione diventa HOLD."""
     return _ask_groq(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Groq"
@@ -600,7 +618,8 @@ def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024)
     try:
         import groq
         if _groq_client is None:
-            _groq_client = groq.Groq(api_key=GROQ_KEY, timeout=45, max_retries=1)
+            # Agente #7: nessuna chiamata a Groq può superare GROQ_TIMEOUT_S (2.0 s)
+            _groq_client = groq.Groq(api_key=GROQ_KEY, timeout=GROQ_TIMEOUT_S, max_retries=0)
     except Exception as e:
         log(f"❌ Impossibile inizializzare il client Groq: {e}")
         return None
@@ -856,59 +875,6 @@ def ta_score(ind):
     return int(max(0, min(100, round(score))))
 
 
-def ta_exit_signal(ind):
-    """Segnali tecnici di uscita: ('ribassista' | 'stallo' | None, motivo)."""
-    bearish_cross = ind["macd_cross"] == "ribassista"
-    if bearish_cross and ind["price"] < ind["sma20"]:
-        return "ribassista", "incrocio MACD ribassista con prezzo sotto SMA20"
-    if ind["sma20"] < ind["sma50"] and ind["macd"] < 0 and ind["roc"] < -STALL_ROC_PCT:
-        return "ribassista", f"SMA20 sotto SMA50, MACD negativo e ROC {ind['roc']:.2f}%"
-    if ind["price"] < ind["sma20"] and ind["macd_hist"] < 0 and ind["roc"] <= REVERSAL_ROC_PCT:
-        return "ribassista", f"inversione: prezzo sotto SMA20, MACD in calo e ROC {ind['roc']:.2f}%"
-    if abs(ind["roc"]) <= STALL_ROC_PCT and (ind["macd_hist"] < 0 or bearish_cross):
-        return "stallo", f"ROC {ind['roc']:.2f}% piatto e MACD {'in incrocio ribassista' if bearish_cross else 'negativo'}"
-    return None, ""
-
-
-def format_indicators(ind):
-    trend = "rialzista (SMA20 > SMA50)" if ind["sma20"] > ind["sma50"] else "ribassista (SMA20 < SMA50)"
-    cross = f", incrocio {ind['macd_cross']} recente" if ind["macd_cross"] else ""
-    return (
-        f"- Prezzo: ${ind['price']:.4f}\n"
-        f"- RSI(14, 1h): {ind['rsi']:.1f}\n"
-        f"- MACD(12,26,9): {ind['macd']:.4f}, segnale {ind['macd_signal']:.4f}, istogramma {ind['macd_hist']:.4f}{cross}\n"
-        f"- ROC(10): {ind['roc']:.2f}%\n"
-        f"- SMA20: ${ind['sma20']:.4f} | SMA50: ${ind['sma50']:.4f} → trend {trend}\n"
-        f"- Score tecnico: {ta_score(ind)}/100"
-    )
-
-
-def build_analysis_prompt(symbol, ind, news, position=None):
-    """Prompt per l'IA. Con `position` valuta SELL/HOLD, altrimenti BUY/HOLD."""
-    if position:
-        context = (
-            f"- Posizione aperta: {position['qty']} quote, valore ${position['market_value']:.2f}, "
-            f"PnL ${position['unrealized_pl']:.2f} ({position['unrealized_plpc']:.2f}%)\n"
-        )
-        options, task = "SELL|HOLD", (
-            "Decidi se VENDERE ora (trend ribassista, inversione, perdita di momentum o stallo che immobilizza capitale) "
-            "oppure MANTENERE la posizione."
-        )
-    else:
-        context = "- Posizione: non in portafoglio\n"
-        options, task = "BUY|HOLD", "Decidi se ACQUISTARE ora oppure attendere."
-    return (
-        f"Sei un trader quantitativo di Wall Street orientato alla rotazione del capitale. Analizza i dati per {symbol}.\n"
-        f"{context}{format_indicators(ind)}\n"
-        f"- Notizie recenti: {news}\n\n"
-        f"{task}\n"
-        f"Restituisci la decisione nel formato esatto:\n"
-        f"DECISIONE: [{options}]\n"
-        f"SCORE: [0-100] (forza del segnale rialzista: 100 = acquisto molto forte, 0 = forte ribasso)\n"
-        f"MOTIVO: [Breve spiegazione focalizzata su momentum, trend e rischio stallo]"
-    )
-
-
 def wait_for_fill(order_id, timeout=20, log=print):
     """Attende l'esecuzione di un ordine. Restituisce l'ordine eseguito oppure None."""
     deadline = time.time() + timeout
@@ -1022,19 +988,24 @@ def allocation_pct_for_score(score, cfg):
     return max(min(base, cap), min(strong, cap))
 
 
+def max_exposure_pct(cfg):
+    """Esposizione massima effettiva: quella configurata, mai oltre la Safety Net dell'Agente #3 (40%)."""
+    return min(float(cfg["max_exposure_pct"]), RISK_MAX_EXPOSURE_PCT)
+
+
 def buy_budget(account, exposure, cfg, crypto=False, score=None, pct=None, factor=1.0):
     """(fondi disponibili, importo del prossimo ordine) rispettando i limiti di rischio.
 
     - L'ordine è una percentuale del CAPITALE (equity) che cresce con lo score
       (vedi allocation_pct_for_score), non del buying power a margine.
     - L'esposizione totale (valore delle posizioni + nuovi ordini) non supera max_exposure_pct
-      del capitale: con 100% il bot non usa mai il margine.
+      del capitale, con tetto fisso al 40% (Risk Safety Net): il bot non usa mai il margine.
     """
     try:
         equity = max(0.0, float(account.get("portfolio", account.get("equity", 0)) or 0))
     except (TypeError, ValueError):
         equity = 0.0
-    room = equity * cfg["max_exposure_pct"] / 100 - exposure
+    room = equity * max_exposure_pct(cfg) / 100 - exposure
     funds = max(0.0, min(available_funds(account, crypto), room))
     pct = allocation_pct_for_score(score, cfg) if pct is None else pct
     allocation = min(equity * pct * factor / 100, funds)
@@ -1091,15 +1062,11 @@ def market_analyst(symbols, log=print):
 def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trailing=None, ledger=None, market_open=True):
     """FASE 2: classifica ogni posizione e calcola fondi ed esposizione.
 
-    Senza stato in memoria: il tempo di permanenza in posizione viene dalla data del primo acquisto
-    ancora aperto negli ordini Alpaca (ledger["open"]), non da contatori di cicli.
-    Stati: STOP_LOSS, SCALE_OUT (vendita parziale), TRAILING_STOP, BREAKEVEN_STOP, NEWS_SHOCK, OFI_REVERSAL,
-           ALPHA_DECAY, TIME_STOP (Agente #6),
-           RIBASSISTA, STALLO -> vendita obbligatoria;
-           IN_STALLO, IN_OSSERVAZIONE (segnale ribassista troppo presto o su dati fermi), OK, NO_DATA -> mantenute.
-    Nessun take profit fisso: al target (TARGET_RISK_REWARD x stop) l'Agente #6 incassa una quota (SCALE_OUT)
-    e il resto corre con trailing ATR. sell_pct: quota da vendere (100 tranne lo scaling out).
-    A mercato azionario chiuso le uscite tecniche delle azioni vengono rimandate: le barre non si aggiornano.
+    NESSUN TIME-STOP e nessuna uscita tecnica: una posizione piatta o in consolidamento resta aperta.
+    Stati: STOP_LOSS (hard stop 1.5-2.5%) e le uscite dell'Agente #6 -> SCALE_OUT (vendita parziale al Target 2R),
+           TRAILING_STOP, BREAKEVEN_STOP, THESIS_DECAY, OFI_REVERSAL, NEWS_SHOCK;
+           OK, NO_DATA -> mantenute.
+    sell_pct: quota da vendere (100 tranne lo scaling out).
     """
     open_info = (ledger or {}).get("open", {})
     now = now_local()
@@ -1111,42 +1078,21 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
         score = a["score"] if a else None
         opened = open_info.get(key, {}).get("opened_at")
         held_min = (now - opened).total_seconds() / 60 if opened else None  # None = oltre lo storico (90 gg)
-        stalled_now = bool(a) and abs(a["ind"]["roc"]) <= STALL_ROC_PCT and a["score"] < STALL_SCORE
-        held_long = held_min is None or held_min >= STALL_MIN_HOLD_MIN
         held_txt = "da oltre 90 giorni" if held_min is None else f"da {held_min:.0f} min"
-
-        stop = (stops or {}).get(key, cfg["stop_loss_pct"])
+        stop = clamp_stop_pct((stops or {}).get(key, cfg["stop_loss_pct"]))
         trail = (trailing or {}).get(key)
-        stale = not market_open and not pos.get("is_crypto")
-        too_early = held_min is not None and held_min < TECH_EXIT_MIN_HOLD_MIN
         if pl <= stop:
-            status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ stop loss {stop:.1f}%"
+            status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ hard stop {stop:.2f}%"
         elif trail and trail.get("hit"):
             status, reason = trail["action"], trail["reason"]
         elif not a:
-            status, reason = "NO_DATA", "indicatori non disponibili"
+            status, reason = "NO_DATA", "indicatori non disponibili (stop e Guardian restano attivi)"
         else:
-            kind, why = ta_exit_signal(a["ind"])
-            if kind != "ribassista" and a["score"] < SCORE_SELL:
-                kind, why = "ribassista", f"Score di Forza {a['score']} < {SCORE_SELL}"
-            if kind == "ribassista" and stale:
-                status, reason = "IN_OSSERVAZIONE", f"{why} · mercato chiuso: uscita rimandata all'apertura (dati fermi)"
-            elif kind == "ribassista" and too_early:
-                status, reason = "IN_OSSERVAZIONE", f"{why} · in posizione {held_txt} (uscita tecnica dopo {TECH_EXIT_MIN_HOLD_MIN} min)"
-            elif kind == "ribassista":
-                status, reason = "RIBASSISTA", why
-            elif stalled_now and held_long and stale:
-                status, reason = "IN_STALLO", f"ROC {a['ind']['roc']:.2f}% · mercato chiuso: valutazione rimandata all'apertura"
-            elif stalled_now and held_long:
-                status, reason = "STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']}, in posizione {held_txt}"
-            elif stalled_now:
-                status, reason = "IN_STALLO", f"ROC {a['ind']['roc']:.2f}% e score {a['score']}, in posizione {held_txt} (minimo {STALL_MIN_HOLD_MIN})"
-            else:
-                status, reason = "OK", f"ROC {a['ind']['roc']:.2f}%, in posizione {held_txt}"
+            status, reason = "OK", (trail or {}).get("hold_rationale") or f"ROC {a['ind']['roc']:.2f}%, in posizione {held_txt}"
         report.append({"pos": pos, "analysis": a, "score": score, "status": status, "reason": reason,
                        "held_min": held_min, "sell_pct": (trail or {}).get("sell_pct", 100) if status == "SCALE_OUT" else 100})
         log(f"🛡️ [Risk] {pos['symbol']}: {status} | score {score if score is not None else 'N/D'} | "
-            f"PnL {pl:.2f}% | stop {stop:.1f}% | {reason}")
+            f"PnL {pl:.2f}% | stop {stop:.2f}% | {reason}")
 
     exposure = sum(abs(p["market_value"]) for p in positions)
     equity = float(account.get("portfolio", account.get("equity", 0)) or 0)
@@ -1155,79 +1101,14 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
         "crypto": buy_budget(account, exposure, cfg, crypto=True),
     }
     pct = exposure / equity * 100 if equity else 0
-    log(f"🛡️ [Risk] Capitale ${equity:,.0f} | esposizione ${exposure:,.0f} ({pct:.0f}%, limite {cfg['max_exposure_pct']:.0f}%) | "
+    log(f"🛡️ [Risk] Capitale ${equity:,.0f} | esposizione ${exposure:,.0f} ({pct:.0f}%, limite {max_exposure_pct(cfg):.0f}%) | "
+        f"posizioni {len(positions)}/{RISK_MAX_POSITIONS} | "
         f"fondi disponibili azioni ${funds['stock'][0]:,.0f}, crypto ${funds['crypto'][0]:,.0f} | "
         f"buying power Alpaca ${float(account.get('buying_power', 0) or 0):,.0f}")
     return {"positions": report, "exposure": exposure, "equity": equity, "funds": funds}
 
 
 BROKER_ACTIONS = ("BUY", "SELL", "ROTATE", "HOLD")
-
-BROKER_SYSTEM_PROMPT = (
-    "Sei un Senior Portfolio Manager & Quant Broker di un bot di trading algoritmico che opera su un conto paper "
-    "(simulato) Alpaca. Le tue risposte vengono lette da un programma: rispondi SOLO con un oggetto JSON valido, "
-    "senza testo prima o dopo."
-)
-
-
-def broker_candidates(analysis, held_keys, pending, market_open):
-    """Asset della watchlist acquistabili ora con Score > SCORE_BUY, dal più forte."""
-    out = []
-    for key, a in analysis.items():
-        if key in held_keys or key in pending or a["class"] != "BUY":
-            continue
-        if not is_crypto(a["symbol"]) and not market_open:
-            continue
-        out.append(a)
-    return sorted(out, key=lambda a: a["score"], reverse=True)
-
-
-def build_broker_prompt(risk, candidates, cfg, news=None):
-    news = news or {}
-    lines = []
-    for r in risk["positions"]:
-        p, a = r["pos"], r["analysis"]
-        ind = (f"RSI {a['ind']['rsi']:.1f}, ROC {a['ind']['roc']:.2f}%, MACD hist {a['ind']['macd_hist']:.4f}, "
-               f"SMA20 {'>' if a['ind']['sma20'] > a['ind']['sma50'] else '<'} SMA50") if a else "indicatori N/D"
-        lines.append(f"  - {p['yf_symbol']}: valore ${p['market_value']:,.0f}, PnL {p['unrealized_plpc']:.2f}%, "
-                     f"score {r['score']}, stato {r['status']} ({r['reason']}); {ind}")
-    positions_txt = "\n".join(lines) or "  (nessuna posizione aperta)"
-    cand_txt = "\n".join(
-        f"  - {a['symbol']}: score {a['score']}, prezzo ${a['ind']['price']:.4f}, RSI {a['ind']['rsi']:.1f}, "
-        f"ROC {a['ind']['roc']:.2f}%, MACD hist {a['ind']['macd_hist']:.4f}, "
-        f"SMA20 {'>' if a['ind']['sma20'] > a['ind']['sma50'] else '<'} SMA50"
-        + (f"; notizie: {news[a['symbol']]}" if news.get(a['symbol']) else "")
-        for a in candidates[:5]
-    ) or "  (nessun candidato con score > %d)" % SCORE_BUY
-    f_stock, f_crypto = risk["funds"]["stock"][0], risk["funds"]["crypto"][0]
-    return (
-        "Sei un Quantitative Portfolio Broker. Ricevi l'elenco degli asset e delle posizioni correnti.\n"
-        "Analizza l'opportunità di rotazione del capitale: se trovi un asset più promettente di quelli attuali "
-        "e non c'è liquidità, indica quale vendere e quale acquistare. Il confronto con le posizioni attuali "
-        "serve SOLO per la rotazione, quando la liquidità è esaurita.\n\n"
-        f"Capitale: ${risk['equity']:,.0f} | esposizione: ${risk['exposure']:,.0f} | "
-        f"liquidità disponibile: azioni ${f_stock:,.0f}, crypto ${f_crypto:,.0f}\n"
-        f"Posizioni aperte:\n{positions_txt}\n"
-        f"Candidati all'acquisto (Score di Forza > {SCORE_BUY}):\n{cand_txt}\n\n"
-        "Regole del desk:\n"
-        "- Se c'è liquidità disponibile (almeno $10) e c'è almeno un candidato, scegli BUY del candidato migliore: "
-        "il capitale libero va investito. Non confrontare i candidati con le posizioni già aperte: "
-        f"un candidato con score > {SCORE_BUY} è un acquisto valido anche se una posizione esistente ha score più alto. "
-        "Usa HOLD solo se nessun candidato è convincente per motivi concreti (es. RSI in ipercomprato estremo, "
-        "notizie negative).\n"
-        "- buy_symbol deve essere tra i candidati elencati.\n"
-        f"- ROTATE solo se la liquidità è insufficiente (< ${ROTATION_FUNDS_THRESHOLD}), buy_symbol ha score > "
-        f"{ROTATION_MIN_SCORE} e almeno {ROTATION_MIN_EDGE} punti più di sell_symbol (preferisci posizioni in stallo o deboli).\n"
-        "- SELL per chiudere una posizione debole o in stallo; HOLD se nessuna azione è vantaggiosa.\n"
-        "- Le vendite per stop loss, trend ribassista e stallo prolungato sono già gestite dal Risk Manager.\n\n"
-        "Restituisci la risposta in formato JSON pulito:\n"
-        '{\n  "action": "BUY" | "SELL" | "ROTATE" | "HOLD",\n  "sell_symbol": "TICKER_DA_VENDERE",\n'
-        '  "buy_symbol": "TICKER_DA_COMPRARE",\n  "score": 0-100,\n'
-        '  "reason": "Spiegazione focalizzata su rotazione capitale e stallo"\n}\n'
-        "score = tua confidenza nell'operazione (85-100 = STRONG BUY, aumenta il capitale investito).\n"
-        "Usa i ticker esattamente come scritti sopra e stringa vuota per i campi non usati."
-    )
-
 
 def parse_broker_json(text):
     """Estrae e normalizza la decisione JSON del Broker, oppure None."""
@@ -1271,114 +1152,6 @@ def _clean_score(value):
         return None
 
 
-def ask_broker_ai(prompt, log=print, system=None):
-    """Interroga l'IA del Broker secondo ai_provider. Restituisce (decisione, motore) o (None, None)."""
-    provider = _resolve_provider(get_config()["ai_provider"], log)
-    if provider == "quant":
-        return None, None
-    ask = lambda fn: parse_broker_json(fn(prompt, log, system=system or BROKER_SYSTEM_PROMPT,
-                                          validate=lambda t: parse_broker_json(t) is not None,
-                                          **({"max_tokens": 2048} if fn is _ask_groq else {})))
-    if provider == "hybrid":
-        d_gemini, d_groq = ask(_ask_gemini), ask(_ask_groq)
-        if d_gemini and d_groq:
-            same = all(d_gemini[k] == d_groq[k] for k in ("action", "sell_symbol", "buy_symbol"))
-            if same:
-                return d_groq, "Ibrido Gemini+Groq"
-            return ({"action": "HOLD", "sell_symbol": "", "buy_symbol": "",
-                     "reason": f"Gemini ({d_gemini['action']}) e Groq ({d_groq['action']}) non concordano"},
-                    "Ibrido Gemini+Groq")
-        if d_gemini or d_groq:
-            return (d_gemini, _last_model["gemini"]) if d_gemini else (d_groq, _last_model["groq"])
-        return None, None
-
-    order = [_ask_gemini, _ask_groq] if provider == "gemini" else [_ask_groq, _ask_gemini]
-    keys = {_ask_gemini: GEMINI_KEY, _ask_groq: GROQ_KEY}
-    for i, fn in enumerate(order):
-        if i and not keys[fn]:
-            continue
-        if i:
-            log(f"🔁 {'Gemini' if order[0] is _ask_gemini else 'Groq'} non ha risposto: provo "
-                f"{'Groq' if fn is _ask_groq else 'Gemini'} come riserva.")
-        decision = ask(fn)
-        if decision:
-            return decision, _last_model["groq" if fn is _ask_groq else "gemini"]
-    return None, None
-
-
-def weakest_holding(risk, exclude=()):
-    """Posizione più debole vendibile: prima quelle in stallo, poi score e PnL più bassi."""
-    choices = [r for r in risk["positions"]
-               if r["status"] in ("OK", "IN_STALLO") and r["score"] is not None
-               and normalize_symbol(r["pos"]["symbol"]) not in exclude]
-    if not choices:
-        return None
-    return min(choices, key=lambda r: (r["status"] != "IN_STALLO", r["score"], r["pos"]["unrealized_plpc"]))
-
-
-def ta_broker(risk, candidates):
-    """Broker quantitativo di riserva (senza IA), con le stesse regole del desk."""
-    if not candidates:
-        return {"action": "HOLD", "sell_symbol": "", "buy_symbol": "", "reason": f"[Quant] Nessun asset con score > {SCORE_BUY}"}
-    best = candidates[0]
-    funds = risk["funds"]["crypto" if is_crypto(best["symbol"]) else "stock"]
-    if funds[1] >= MIN_ORDER_USD:
-        return {"action": "BUY", "sell_symbol": "", "buy_symbol": best["symbol"],
-                "reason": f"[Quant] {best['symbol']} ha lo Score di Forza più alto ({best['score']})"}
-    weak = weakest_holding(risk)
-    if (funds[0] < ROTATION_FUNDS_THRESHOLD and best["score"] > ROTATION_MIN_SCORE and weak
-            and best["score"] - weak["score"] >= ROTATION_MIN_EDGE):
-        return {"action": "ROTATE", "sell_symbol": weak["pos"]["yf_symbol"], "buy_symbol": best["symbol"],
-                "reason": f"[Quant] Rotazione: {weak['pos']['yf_symbol']} (score {weak['score']}, {weak['status']}) → "
-                          f"{best['symbol']} (score {best['score']})"}
-    return {"action": "HOLD", "sell_symbol": "", "buy_symbol": "",
-            "reason": f"[Quant] Liquidità insufficiente e nessuna rotazione conveniente per {best['symbol']} (score {best['score']})"}
-
-
-def validate_broker_decision(decision, risk, candidates, sold_keys=(), log=print):
-    """Applica le regole del desk alla decisione del Broker; se non le rispetta la corregge o la annulla."""
-    hold = lambda why: {"action": "HOLD", "sell_symbol": "", "buy_symbol": "", "reason": why}
-    action = decision["action"]
-    cand = {normalize_symbol(a["symbol"]): a for a in candidates}
-    holdings = {normalize_symbol(r["pos"]["yf_symbol"]): r for r in risk["positions"]
-                if normalize_symbol(r["pos"]["symbol"]) not in sold_keys}
-    buy = cand.get(normalize_symbol(decision["buy_symbol"])) if decision["buy_symbol"] else None
-    sell = holdings.get(normalize_symbol(decision["sell_symbol"])) if decision["sell_symbol"] else None
-
-    if action == "HOLD":
-        return decision
-    if action == "SELL":
-        if not sell:
-            return hold(f"SELL scartato: {decision['sell_symbol'] or '?'} non è una posizione vendibile")
-        return {**decision, "sell_symbol": sell["pos"]["yf_symbol"]}
-    if not buy:
-        return hold(f"{action} scartato: {decision['buy_symbol'] or '?'} non è tra i candidati acquistabili")
-
-    funds = risk["funds"]["crypto" if is_crypto(buy["symbol"]) else "stock"]
-    if action == "BUY":
-        if funds[1] >= MIN_ORDER_USD:
-            return {**decision, "buy_symbol": buy["symbol"]}
-        # BUY senza liquidità: diventa una rotazione se il segnale è abbastanza forte
-        sell = weakest_holding(risk, exclude=sold_keys)
-        action = "ROTATE"
-        log(f"💼 [Broker] Liquidità insufficiente per {buy['symbol']}: valuto la rotazione.")
-
-    # ROTATE
-    if funds[1] >= MIN_ORDER_USD:
-        return {**decision, "action": "BUY", "sell_symbol": "", "buy_symbol": buy["symbol"],
-                "reason": decision["reason"] + " (c'è liquidità: acquisto senza vendere)"}
-    if not sell:
-        sell = weakest_holding(risk, exclude=sold_keys)
-    if not sell:
-        return hold(f"Rotazione verso {buy['symbol']} impossibile: nessuna posizione vendibile")
-    if buy["score"] <= ROTATION_MIN_SCORE:
-        return hold(f"Rotazione scartata: {buy['symbol']} ha score {buy['score']} (serve > {ROTATION_MIN_SCORE})")
-    if sell["score"] is not None and buy["score"] - sell["score"] < ROTATION_MIN_EDGE:
-        return hold(f"Rotazione scartata: vantaggio {buy['symbol']} {buy['score']} vs {sell['pos']['yf_symbol']} "
-                    f"{sell['score']} inferiore a {ROTATION_MIN_EDGE} punti")
-    return {**decision, "action": "ROTATE", "sell_symbol": sell["pos"]["yf_symbol"], "buy_symbol": buy["symbol"]}
-
-
 # ===========================================================================
 # VIRTUAL BOARDROOM: 8 agenti quantitativi
 #   1 Market Analyst        -> market_analyst (RSI, MACD, SMA20/50, ROC, Score di Forza)
@@ -1388,17 +1161,17 @@ def validate_broker_decision(decision, risk, candidates, sold_keys=(), log=print
 #   5 Volume & Liquidity    -> volume_agent (vol_ratio < 0.8 con prezzo in salita = falso breakout)
 #   6 Drawdown Controller   -> drawdown_controller (perdita giornaliera > 5% -> stop acquisti 24h)
 #   7 Post-Trade Auditor    -> post_trade_auditor (trade_history.json, win rate per ticker)
-#   8 CIO / Portfolio Broker-> build_cio_prompt + ask_broker_ai (una chiamata JSON)
+#   8 CIO del desk          -> build_desk_cio_prompt + ask_desk_cio / quant_desk_cio, validate_desk_decision
 # ===========================================================================
 DATA_DIR = os.getenv("BOT_DATA_DIR", os.path.dirname(CONFIG_PATH))
 TRADE_HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.json")
 BOARDROOM_STATE_PATH = os.path.join(DATA_DIR, "boardroom_state.json")
 
 SENTIMENT_VETO = -40
-ATR_MULT_STOCK = 1.5
+ATR_MULT_STOCK = 1.5            # Chandelier Exit del runner: distanza dal picco = mult x ATR% giornaliero
 ATR_MULT_CRYPTO = 2.0
-STOP_TIGHTEST_PCT = -2.0       # limiti dello stop dinamico
-STOP_WIDEST_PCT = -15.0
+STOP_TIGHTEST_PCT = -1.5       # Hard Stop Loss non negoziabile (Agente #3): tra -1.5% ...
+STOP_WIDEST_PCT = -2.5         # ... e -2.5%
 MACRO_RISK_OFF_FACTOR = 0.5
 VOLUME_LOW_RATIO = 0.8
 DAILY_DRAWDOWN_LIMIT = -5.0
@@ -1510,9 +1283,9 @@ def atr_pct(df):
     return round(float(atr.iloc[-1]) / float(df["Close"].iloc[-1]) * 100, 2)
 
 
-def dynamic_stop_pct(atr_percent, crypto):
-    mult = ATR_MULT_CRYPTO if crypto else ATR_MULT_STOCK
-    return round(max(STOP_WIDEST_PCT, min(STOP_TIGHTEST_PCT, -mult * atr_percent)), 2)
+def dynamic_stop_pct(atr_percent, crypto=False):
+    """Hard stop non negoziabile dell'Agente #3: 1.5 x ATR% riportato tra -1.5% e -2.5% (azioni e crypto)."""
+    return hard_stop_pct(atr_percent)
 
 
 def _peak_since(yf_symbol, opened_at):
@@ -1527,60 +1300,206 @@ def _peak_since(yf_symbol, opened_at):
 
 
 _guardian = None
-GUARDIAN_INTERVAL_SEC = 20       # Agente #6: loop indipendente sulle posizioni aperte
+GUARDIAN_INTERVAL_SEC = 20       # Agente #6: loop indipendente sulle posizioni aperte (e hold_rationale aggiornato)
 GUARDIAN_ATR_TTL_SEC = 3600      # ATR giornaliero: cambia una volta al giorno
 GUARDIAN_PEAK_TTL_SEC = 900      # picco dalle chiusure orarie di yfinance: riletto ogni 15 minuti
-GUARDIAN_REFRESH_SEC = 120       # 7 agenti sulle posizioni (Alpha Decay, News Shock, OFI) ricalcolati ogni 2 minuti
+GUARDIAN_REFRESH_SEC = 120       # 7 agenti sulle posizioni (Thesis Decay, OFI) ricalcolati ogni 2 minuti
 GUARDIAN_SIGNAL_MAX_AGE_SEC = 900  # uscite anticipate solo su letture degli agenti più recenti di 15 minuti
-GUARDIAN_TIME_STOP_MIN = 60      # Time-Stop: spinta d'inerzia esaurita se dopo 60 minuti la posizione è piatta
 GUARDIAN_ENTRY_MATCH_PCT = 0.5   # prezzo medio cambiato oltre lo 0.5%: nuova posizione, stato del Guardian azzerato
+GUARDIAN_CLOSED_MAX = 30         # chiusure recenti (con exit_reason) conservate in guardian_positions.json
+THESIS_NEWS_DROP = 0.3           # rotazione: tesi degradata se l'impact delle notizie fresche scende di 0.3 dall'ingresso
 GUARDIAN_STATE_PATH = os.path.join(DATA_DIR, "guardian_positions.json")
 _guardian_cache = {"atr": {}, "peak": {}}
-_guardian_cache_lock = threading.Lock()
+_guardian_cache_lock = threading.RLock()
+
+
+def _gstate_read():
+    """guardian_positions.json: {"positions": {chiave: stato}, "closed": [ultime chiusure]} (migra il formato piatto)."""
+    data = read_json_file(GUARDIAN_STATE_PATH, {"positions": {}, "closed": []})
+    if not isinstance(data.get("positions"), dict):
+        data = {"positions": {k: v for k, v in data.items() if isinstance(v, dict)}, "closed": []}
+    if not isinstance(data.get("closed"), list):
+        data["closed"] = []
+    return data
+
+
+def _thesis_fields(q, buy_thesis=None):
+    """Memoria della tesi d'ingresso dall'ultima valutazione dei 7 agenti (quant_rationale)."""
+    q = q or {}
+    cio, macro = q.get("agent_05_cio") or {}, q.get("agent_04_macro") or {}
+    news = macro.get("news") or {}
+    path = (q.get("agent_01_quant") or {}).get("expected_path")
+    return {"buy_thesis": buy_thesis or cio.get("buy_thesis"), "trade_class": cio.get("trade_class"),
+            "horizon": cio.get("horizon"), "entry_ensemble": cio.get("score"),
+            "entry_news_impact": news.get("impact_score") if news.get("status") == "OK" else None,
+            "catalyst_type": news.get("catalyst_type"), "thesis_summary": news.get("thesis_summary") if news.get("status") == "OK" else None,
+            "entry_ofi": cio.get("ofi"), "path": {**path, "bar_minutes": 60} if path else None}
+
+
+def guardian_register_entry(yf_symbol, buy_thesis, q=None, price=None, vix=None):
+    """Acquisto inviato: scheda di ingresso (buy_thesis) e tesi salvate prima ancora del primo giro del Guardian."""
+    key = normalize_symbol(yf_symbol)
+    with _guardian_cache_lock:
+        data = _gstate_read()
+        data["positions"][key] = {"entry": None, "vix0": vix, "scaled": False, "scale_out": None, "order_price": price,
+                                  "registered_at": time.time(), "hold_rationale": "in attesa del primo giro del Guardian",
+                                  "exit_reason": None, **_thesis_fields(q, buy_thesis)}
+        write_json_file(GUARDIAN_STATE_PATH, data)
+
+
+def buy_thesis_for(yf_symbol, price, q=None):
+    """Scheda di ingresso al prezzo di esecuzione, dai voti del Fusion Engine sull'ultima valutazione."""
+    from agents.agent_05_cio import build_buy_thesis
+    q = q or quant_rationale(yf_symbol, max_age_sec=None) or {}
+    cio = q.get("agent_05_cio") or {}
+    news = (q.get("agent_04_macro") or {}).get("news") or {}
+    quant = (cio.get("components") or {}).get("quant")
+    if quant is None:
+        quant = (q.get("agent_01_quant") or {}).get("score") or 0.0
+    impact = float(news.get("impact_score") or 0.0) if news.get("status") == "OK" else 0.0
+    return build_buy_thesis(yf_symbol, price, float(quant), impact,
+                            news.get("thesis_summary") if news.get("status") == "OK" else "", cio.get("ofi"))
+
+
+def _fallback_thesis(yf_symbol):
+    """Posizioni aperte prima del Fusion Engine o fuori dal bot: scheda ricostruita dal journal se possibile."""
+    try:
+        r = (last_entry_execution(yf_symbol) or {}).get("rationale") or {}
+    except Exception:
+        r = {}
+    if r.get("buy_thesis"):
+        return r["buy_thesis"]
+    desk = r.get("desk_cio") or {}
+    if desk.get("reason"):
+        return f"Acquistato {yf_symbol} (scheda precedente al Fusion Engine): {summarize_reason(desk['reason'], 160)}"
+    return f"{yf_symbol}: posizione senza scheda di ingresso registrata (aperta prima del Fusion Engine o fuori dal bot)"
 
 
 def guardian_position_state(p, vix=None):
-    """Stato persistente della posizione per l'Agente #6: {"entry", "vix0", "scaled"} (creato al primo giro)."""
+    """Stato persistente della posizione per l'Agente #6 (creato al primo giro, tesi registrata all'acquisto)."""
     key, entry = normalize_symbol(p["symbol"]), p.get("avg_entry_price") or p["current_price"]
     with _guardian_cache_lock:
-        data = read_json_file(GUARDIAN_STATE_PATH, {})
-        st = data.get(key)
-        if not st or abs(entry / (st.get("entry") or entry) - 1) * 100 > GUARDIAN_ENTRY_MATCH_PCT:
-            st = data[key] = {"entry": entry, "vix0": vix, "scaled": False}
-            write_json_file(GUARDIAN_STATE_PATH, data)
-        elif st.get("vix0") is None and vix is not None:
-            st["vix0"] = vix
+        data = _gstate_read()
+        st, changed = data["positions"].get(key), False
+        if st and st.get("entry") and abs(entry / st["entry"] - 1) * 100 > GUARDIAN_ENTRY_MATCH_PCT:
+            st = None                      # nuova posizione sullo stesso simbolo: memoria azzerata
+        if not st:
+            st = data["positions"][key] = {"entry": entry, "vix0": vix, "scaled": False, "scale_out": None,
+                                           "exit_reason": None, **_thesis_fields(quant_rationale(p["yf_symbol"], max_age_sec=3600))}
+            changed = True
+        elif not st.get("entry"):
+            st["entry"], changed = entry, True
+        if st.get("vix0") is None and vix is not None:
+            st["vix0"], changed = vix, True
+        if not st.get("buy_thesis"):
+            st["buy_thesis"], changed = _fallback_thesis(p["yf_symbol"]), True
+        if changed:
             write_json_file(GUARDIAN_STATE_PATH, data)
         return dict(st)
 
 
-def guardian_mark_scaled(symbol):
-    """Scaling out eseguito: il resto della posizione è il runner (stop a breakeven, trailing sempre attivo)."""
-    key = normalize_symbol(symbol)
+def guardian_record_exit(pos, action, detail="", pct=100, stop_price=None):
+    """Vendita inviata: genera exit_reason e aggiorna la memoria dello scaling out. Restituisce exit_reason.
+
+    SCALE_OUT: il resto è il runner (stop a breakeven + commissioni, trailing ATR senza tetto).
+    Chiusura totale: lo stato resta finché Alpaca non conferma, poi passa tra le chiusure recenti (guardian_prune).
+    """
+    key = normalize_symbol(pos["symbol"])
     with _guardian_cache_lock:
-        data = read_json_file(GUARDIAN_STATE_PATH, {})
-        if key in data:
-            data[key]["scaled"] = True
-            write_json_file(GUARDIAN_STATE_PATH, data)
+        data = _gstate_read()
+        st = data["positions"].setdefault(key, {"entry": pos.get("avg_entry_price"), "scaled": False, "scale_out": None})
+        full = pct >= 100
+        reason = portfolio_guardian().exit_reason(action, pos.get("current_price"), pct,
+                                                  scale_out=st.get("scale_out") if full else None,
+                                                  stop_price=stop_price, detail=detail)
+        st["exit_reason"] = reason
+        if action == "SCALE_OUT" and not full:
+            st["scaled"] = True
+            st["scale_out"] = {"price": pos.get("current_price"), "pct": pct, "at": now_local().isoformat(timespec="seconds")}
+        if full:
+            st.update(closing=True, exit_action=action, exit_price=pos.get("current_price"),
+                      closed_at=now_local().isoformat(timespec="seconds"))
+        write_json_file(GUARDIAN_STATE_PATH, data)
+    return reason
 
 
 def guardian_prune(live_keys):
-    """Rimuove lo stato delle posizioni chiuse."""
+    """Posizioni non più aperte su Alpaca: spostate tra le chiusure recenti con il loro exit_reason."""
     with _guardian_cache_lock:
-        data = read_json_file(GUARDIAN_STATE_PATH, {})
-        kept = {k: v for k, v in data.items() if k in live_keys}
-        if kept != data:
-            write_json_file(GUARDIAN_STATE_PATH, kept)
+        data = _gstate_read()
+        gone = [k for k in data["positions"] if k not in live_keys]
+        if not gone:
+            return
+        for k in gone:
+            st = data["positions"].pop(k)
+            if st.get("entry") is None and time.time() - float(st.get("registered_at") or 0) < 600:
+                data["positions"][k] = st      # acquisto appena inviato, non ancora eseguito: si aspetta
+                continue
+            data["closed"].append({"symbol": k, "closed_at": st.get("closed_at") or now_local().isoformat(timespec="seconds"),
+                                   "buy_thesis": st.get("buy_thesis"), "last_hold_rationale": st.get("hold_rationale"),
+                                   "exit_reason": (st.get("exit_reason") if st.get("closing") else None)
+                                   or "Chiusa fuori dal Guardian (ordine manuale o lato Alpaca)",
+                                   "scale_out": st.get("scale_out"), "trade_class": st.get("trade_class"),
+                                   "horizon": st.get("horizon")})
+        data["closed"] = data["closed"][-GUARDIAN_CLOSED_MAX:]
+        write_json_file(GUARDIAN_STATE_PATH, data)
 
 
-def guardian_signals(q, vix, vix0):
-    """Letture degli Agenti #1, #2 e #4 per le uscite anticipate (vuote se la valutazione è troppo vecchia)."""
+def guardian_snapshot():
+    """Stato del Guardian per la dashboard: {"positions": {chiave: scheda}, "closed": [...]}."""
+    with _guardian_cache_lock:
+        return _gstate_read()
+
+
+def _save_hold_rationales(evals):
+    """hold_rationale aggiornati a ogni giro (ogni 20 s) in guardian_positions.json."""
+    with _guardian_cache_lock:
+        data = _gstate_read()
+        changed = False
+        for key, g in evals.items():
+            st = data["positions"].get(key)
+            if st is not None and g.get("hold_rationale") and st.get("hold_rationale") != g["hold_rationale"]:
+                st["hold_rationale"] = g["hold_rationale"]
+                st["hold_updated_at"] = now_local().isoformat(timespec="seconds")
+                st["effective_stop_pct"] = g.get("effective_stop_pct")
+                changed = True
+        if changed:
+            write_json_file(GUARDIAN_STATE_PATH, data)
+
+
+def guardian_signals(q, vix, vix0, entry_impact=None):
+    """Letture degli Agenti #2 e #4 per le uscite anticipate (solo VIX se la valutazione è troppo vecchia)."""
     sig = {"vix": vix, "vix_at_entry": vix0}
     if q and time.time() - q["evaluated_at"] <= GUARDIAN_SIGNAL_MAX_AGE_SEC:
-        sig.update(quant_score=q["agent_01_quant"]["score"], ofi=q["agent_02_micro"]["ofi"],
-                   micro_signal=q["agent_02_micro"]["signal"], news_sentiment=q["agent_04_macro"]["news_sentiment"],
-                   headlines=q["agent_04_macro"]["headlines"], stress_level=q["agent_04_macro"]["stress_level"])
+        news = q["agent_04_macro"].get("news") or {}
+        sig.update(ofi=q["agent_02_micro"]["ofi"], news=news,
+                   thesis_decay=quant_engine().agent_macro.thesis_decay(entry_impact, news))
     return sig
+
+
+def thesis_degraded(yf_symbol):
+    """(degradata, motivo) per la Rotazione Intelligente del Capitale: SOLO tesi concretamente degradate.
+
+    Degradata = OFI diventato negativo o notizie fresche con impact negativo / sceso di THESIS_NEWS_DROP
+    dall'ingresso. Senza una valutazione recente la tesi resta intatta: nessuna vendita "al buio".
+    """
+    q = quant_rationale(yf_symbol, max_age_sec=GUARDIAN_SIGNAL_MAX_AGE_SEC)
+    if not q:
+        return False, "nessuna valutazione recente: tesi considerata intatta"
+    ofi = q["agent_02_micro"].get("ofi")
+    if ofi is not None and ofi < 0:
+        return True, f"OFI diventato negativo ({ofi:+.2f})"
+    news = q["agent_04_macro"].get("news") or {}
+    if news.get("status") == "OK":
+        impact = float(news.get("impact_score") or 0)
+        with _guardian_cache_lock:
+            st = _gstate_read()["positions"].get(normalize_symbol(yf_symbol)) or {}
+        entry_impact = st.get("entry_news_impact")
+        if impact <= -0.15:
+            return True, f"News Score sceso (impact {impact:+.2f}: {news.get('thesis_summary')})"
+        if entry_impact is not None and impact < entry_impact - THESIS_NEWS_DROP:
+            return True, f"News Score sceso (impact {entry_impact:+.2f} → {impact:+.2f})"
+    return False, f"tesi intatta (OFI {ofi:+.2f})" if ofi is not None else "tesi intatta"
 
 
 def guardian_atr(yf_symbol):
@@ -1615,7 +1534,8 @@ def guardian_peak(yf_symbol, opened_at, price):
 
 
 def guardian_evaluate(p, info, stop, atr, market_open, now=None):
-    """Agente #6 su una posizione: stop effettivo (breakeven / trailing ATR), scaling out e uscite anticipate."""
+    """Agente #6 su una posizione: hard stop, Target 1 (scaling out), runner con trailing ATR, uscite anticipate
+    (Thesis Decay, Orderbook Reversal, News Shock) e scheda dinamica hold_rationale."""
     opened = info.get("opened_at")
     if isinstance(opened, str):
         opened = dt.datetime.fromisoformat(opened)
@@ -1625,13 +1545,19 @@ def guardian_evaluate(p, info, stop, atr, market_open, now=None):
     q = quant_rationale(p["yf_symbol"], max_age_sec=3600)
     vix = (latest_channels().get("macro") or {}).get("vix")
     st = guardian_position_state(p, vix)
-    g = portfolio_guardian().evaluate_position(entry=entry, price=price, peak=peak, stop_pct=stop, atr_pct=atr,
-                                               is_crypto=p["is_crypto"],
-                                               held_min=(now - opened).total_seconds() / 60 if opened else None,
-                                               cio_score=q["agent_05_cio"]["score"] if q else None, market_open=market_open,
-                                               scaled_out=st["scaled"], signals=guardian_signals(q, vix, st.get("vix0")))
-    g["cio_score"] = q["agent_05_cio"]["score"] if q else None
-    g["stop_pct"] = stop
+    sig = guardian_signals(q, vix, st.get("vix0"), st.get("entry_news_impact"))
+    agent = portfolio_guardian()
+    g = agent.evaluate_position(entry=entry, price=price, peak=peak, stop_pct=clamp_stop_pct(stop), atr_pct=atr,
+                                is_crypto=p["is_crypto"], market_open=market_open, scaled_out=bool(st.get("scaled")),
+                                signals=sig)
+    elapsed = ((now - opened).total_seconds() / 60 if opened else
+               (time.time() - st["registered_at"]) / 60 if st.get("registered_at") else None)
+    trajectory, expected = agent.trajectory_status(st.get("path"), entry, price, elapsed)
+    thesis = None if sig.get("thesis_decay") else st.get("thesis_summary")
+    g.update(trajectory=trajectory, expected_price=expected, buy_thesis=st.get("buy_thesis"),
+             exit_reason=st.get("exit_reason"), trade_class=st.get("trade_class"), horizon=st.get("horizon"),
+             hold_rationale=agent.hold_rationale(g, sig, trajectory, thesis),
+             cio_score=q["agent_05_cio"]["score"] if q else None)
     return g
 
 
@@ -1642,27 +1568,27 @@ def guardian_watch(positions, open_info, cfg, market_open):
         key = normalize_symbol(p["symbol"])
         info = open_info.get(key, {})
         atr = guardian_atr(p["yf_symbol"])
-        stop = info.get("stop_pct") or (dynamic_stop_pct(atr, p["is_crypto"]) if atr else cfg["stop_loss_pct"])
+        stop = info.get("stop_pct") or (dynamic_stop_pct(atr) if atr else cfg["stop_loss_pct"])
         out[key] = guardian_evaluate(p, info, stop, atr, market_open, now=now)
+    _save_hold_rationales(out)
     return out
 
 
 def portfolio_guardian():
-    """Agente #6 (Portfolio Guardian) con gli stessi moltiplicatori ATR del desk."""
+    """Agente #6 (Portfolio Guardian): Target 1 a 2R, runner con Chandelier Exit agli stessi moltiplicatori ATR del desk."""
     global _guardian
     if _guardian is None:
         from agents.agent_06_sentinel import PortfolioGuardianAgent
-        _guardian = PortfolioGuardianAgent(min_hold_min=TECH_EXIT_MIN_HOLD_MIN, time_stop_min=GUARDIAN_TIME_STOP_MIN,
-                                           target_r=TARGET_RISK_REWARD, news_shock_sentiment=SENTIMENT_VETO / 100,
-                                           atr_mult_stock=ATR_MULT_STOCK, atr_mult_crypto=ATR_MULT_CRYPTO)
+        _guardian = PortfolioGuardianAgent(target_r=TARGET_RISK_REWARD, atr_mult_stock=ATR_MULT_STOCK,
+                                           atr_mult_crypto=ATR_MULT_CRYPTO)
     return _guardian
 
 
 def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_open=True):
-    """ATR e stop dinamico per ogni simbolo; per le posizioni aperte l'Agente #6 (Portfolio Guardian) calcola
-    trailing ATR, breakeven a +1.5R, scaling out al primo target, News Shock, inversione OFI, Alpha Decay e Time-Stop.
+    """ATR e hard stop per ogni simbolo; per le posizioni aperte l'Agente #6 (Portfolio Guardian) calcola
+    Target 1 (scaling out a 2R), runner a breakeven con trailing ATR, Thesis Decay, Orderbook Reversal e News Shock.
 
-    - stop iniziale di una posizione: quello del CIO salvato nel client_order_id dell'acquisto, altrimenti da ATR;
+    - stop iniziale di una posizione: quello del CIO salvato nel client_order_id, riportato nella fascia -1.5/-2.5%;
     - picco: massimo dei prezzi dall'apertura (data letta dagli ordini Alpaca).
     Restituisce (vol, stops, guardian) dove guardian[chiave] contiene action/hit/reason/effective_stop_pct.
     La stessa valutazione gira anche nel loop indipendente del Guardian (guardian_watch, ogni 20 secondi).
@@ -1672,7 +1598,7 @@ def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_ope
         a = guardian_atr(sym)
         if a is None:
             continue
-        vol[normalize_symbol(sym)] = {"atr_pct": a, "stop_pct": dynamic_stop_pct(a, is_crypto(sym))}
+        vol[normalize_symbol(sym)] = {"atr_pct": a, "stop_pct": dynamic_stop_pct(a)}
 
     open_info = (ledger or {}).get("open", {})
     held = {normalize_symbol(p["symbol"]) for p in positions}
@@ -1682,15 +1608,15 @@ def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_ope
         key = normalize_symbol(p["symbol"])
         v = vol.get(normalize_symbol(p["yf_symbol"]))
         info = open_info.get(key, {})
-        stop = info.get("stop_pct") or (v["stop_pct"] if v else cfg["stop_loss_pct"])
+        stop = clamp_stop_pct(info.get("stop_pct") or (v["stop_pct"] if v else cfg["stop_loss_pct"]))
         stops[key] = stop
         g = guardian_evaluate(p, info, stop, v["atr_pct"] if v else None, market_open, now=now)
         guardian[key] = g
         parts.append(f"{p['symbol']} " + (f"ATR {v['atr_pct']:.1f}% " if v else "ATR N/D ")
-                     + f"stop {stop:.1f}%" + (" (CIO)" if info.get("stop_pct") else "")
+                     + f"hard stop {stop:.2f}%" + (" (CIO)" if info.get("stop_pct") else "")
                      + (f" → effettivo {g['effective_stop_pct']:+.2f}% [{g['stop_source']}]" if g["effective_stop_pct"] != stop else "")
-                     + (f" · CIO {g['cio_score']}" if g["cio_score"] is not None else "")
-                     + (f" · ⚠️ {g['action']}" if g["hit"] else ""))
+                     + (f" · ⚠️ {g['action']}" if g["hit"] else f" · {g['hold_rationale']}"))
+    _save_hold_rationales(guardian)
     cands = [f"{v_sym} stop {v['stop_pct']:.1f}%" for v_sym, v in vol.items() if v_sym not in held]
     log(f"🧿 [Agente #6 Guardian] Posizioni: {'; '.join(parts) or '-'}" + (f" | Candidati: {', '.join(cands)}" if cands else ""))
     return vol, stops, guardian
@@ -1909,108 +1835,6 @@ CIO_SYSTEM_PROMPT = (
 )
 
 
-def build_cio_prompt(board, cfg):
-    """Matrice dei report dei 7 agenti per il CIO."""
-    risk, macro, dd = board["risk"], board["macro"], board["drawdown"]
-    vol, sent, volume, stats = board["volatility"], board["sentiment"], board["volume"], board["audit"]
-
-    def row(key, a):
-        v, s, vf, st = vol.get(key), sent.get(key), volume.get(key, {}), stats.get(key)
-        ind = a["ind"]
-        return (
-            f"score {a['score']}{' (penalità auditor)' if a.get('audit_penalty') else ''}, "
-            f"RSI {ind['rsi']:.1f}, MACD hist {ind['macd_hist']:.4f}, ROC {ind['roc']:.2f}%, "
-            f"SMA20 {'>' if ind['sma20'] > ind['sma50'] else '<'} SMA50 | "
-            f"sentiment {s['sentiment']:+d}{' VETO' if s['veto'] else ''} | " if s else
-            f"score {a['score']}, RSI {ind['rsi']:.1f}, ROC {ind['roc']:.2f}% | sentiment N/D | "
-        ) + (
-            f"ATR {v['atr_pct']:.1f}% (stop {v['stop_pct']:.1f}%) | " if v else "ATR N/D | "
-        ) + (
-            f"volume {vf.get('ratio')}x {vf.get('status')} | "
-        ) + (
-            f"win rate {st['win_rate']:.0f}% su {st['trades']} trade" if st else "nessuno storico"
-        )
-
-    pos_lines = []
-    for r in risk["positions"]:
-        p, a = r["pos"], r["analysis"]
-        key = normalize_symbol(p["yf_symbol"])
-        detail = row(key, a) if a else "indicatori N/D"
-        pos_lines.append(f"  - {p['yf_symbol']}: valore ${p['market_value']:,.0f}, PnL {p['unrealized_plpc']:.2f}%, "
-                         f"stato {r['status']} ({r['reason']}) | {detail}")
-    cand_lines = [f"  - {a['symbol']}{' [ESPLORATORE #1]' if a.get('scout') else ''}: {row(normalize_symbol(a['symbol']), a)}"
-                  for a in board["candidates"][:8]]
-    scout = board.get("scout") or {}
-    scout_lines = [
-        f"  - {d['symbol']}: score {d['score']}, anomalie: {', '.join(d['anomalies'])} → Reparto Revisione: "
-        f"{(board.get('review') or {}).get(normalize_symbol(d['symbol']), {}).get('verdict', 'N/D')} "
-        f"({(board.get('review') or {}).get(normalize_symbol(d['symbol']), {}).get('detail', '')})"
-        for d in scout.get("discoveries", [])
-    ]
-    excluded = [f"{sym} ({why})" for sym, why in board["excluded"]]
-    f_stock, f_crypto = risk["funds"]["stock"][0], risk["funds"]["crypto"][0]
-    return (
-        "Sei il CIO dell'Ufficio Virtuale. Ricevi dal tuo Agente Esploratore #1 nuove proposte scovate sui mercati "
-        "globali (metalli, obbligazioni, ETF) filtrate dal Reparto Revisione.\n"
-        "Valuta se fare una ROTAZIONE DEL CAPITALE liquidando una posizione in stallo per investire nella scoperta "
-        "dell'Esploratore.\n\n"
-        f"[Esploratore #1] Settore perlustrato: {scout.get('sector_scanned', 'N/D')} | ticker ispezionati: "
-        f"{', '.join(scout.get('tickers_inspected', [])) or '-'}\n"
-        f"Scoperte:\n{chr(10).join(scout_lines) or '  (nessuna anomalia eccezionale)'}\n\n"
-        "Hai ricevuto anche le analisi dettagliate dei 7 agenti del tuo comitato:\n"
-        "1. Tecnico (RSI/MACD)\n2. Sentiment News (Veto attivo?)\n3. ATR (Stop Loss %)\n4. Macro (Regime Mercato)\n"
-        "5. Volume (Conferma Volumi)\n6. Drawdown (Rischio Globale)\n7. Auditor (Win Rate Storico)\n\n"
-        f"[Macro] Azioni: {macro['stock']['regime']} ({macro['stock']['detail']}); "
-        f"Crypto: {macro['crypto']['regime']} ({macro['crypto']['detail']})\n"
-        f"[Drawdown] Oggi {dd['drawdown_pct']:+.2f}%, acquisti {'BLOCCATI' if dd['blocked'] else 'consentiti'}\n"
-        f"[Conto] Capitale ${risk['equity']:,.0f}, esposizione ${risk['exposure']:,.0f}, "
-        f"liquidità disponibile azioni ${f_stock:,.0f}, crypto ${f_crypto:,.0f}\n"
-        f"Posizioni aperte:\n{chr(10).join(pos_lines) or '  (nessuna)'}\n"
-        f"Candidati all'acquisto ammessi dal comitato:\n{chr(10).join(cand_lines) or '  (nessuno)'}\n"
-        f"Esclusi dal comitato: {', '.join(excluded) or 'nessuno'}\n\n"
-        "Regole del boardroom:\n"
-        "- Se c'è liquidità disponibile (almeno $10) e c'è almeno un candidato ammesso, scegli BUY del migliore: "
-        "il capitale libero va investito. Non confrontare i candidati con le posizioni già aperte. "
-        "Usa HOLD solo per motivi concreti citati dagli agenti.\n"
-        f"- ROTATE solo se la liquidità è insufficiente (< ${ROTATION_FUNDS_THRESHOLD}), buy_symbol ha score > "
-        f"{ROTATION_MIN_SCORE} e almeno {ROTATION_MIN_EDGE} punti più di sell_symbol (preferisci posizioni deboli o in stallo).\n"
-        "- SELL per chiudere una posizione debole; le vendite per stop loss, trailing stop, trend ribassista "
-        "e stallo sono già eseguite dal Risk Manager.\n"
-        f"- allocation_pct tra {cfg['base_allocation_pct']:.0f} e {cfg['max_allocation_pct']:.0f} in base alla confidenza "
-        "(il regime macro RISK-OFF dimezza automaticamente il budget).\n"
-        f"- dynamic_stop_loss_pct negativo, coerente con l'ATR (tra {STOP_WIDEST_PCT:.0f} e {STOP_TIGHTEST_PCT:.0f}).\n\n"
-        "- Le scoperte dell'Esploratore sono acquistabili solo se compaiono tra i candidati ammessi "
-        "(approvate dal Reparto Revisione).\n\n"
-        "Restituisci la risposta in formato JSON pulito:\n"
-        '{\n  "action": "BUY" | "SELL" | "ROTATE" | "HOLD",\n  "sell_symbol": "TICKER_DA_VENDERE",\n'
-        '  "buy_symbol": "TICKER_PROPOSTO_DA_COMPRARE",\n  "allocation_pct": 15_a_30,\n'
-        '  "dynamic_stop_loss_pct": valore_numerico_negativo,\n'
-        '  "scout_discovery_approved": true|false,\n'
-        '  "reason": "Motivazione esecutiva della decisione dell\'Ufficio Virtuale"\n}\n'
-        "scout_discovery_approved = true solo se buy_symbol è una scoperta dell'Esploratore #1.\n"
-        "Usa i ticker esattamente come scritti sopra e stringa vuota per i campi non usati."
-    )
-
-
-def cio_allocation(decision, analysis_score, cfg, macro_factor):
-    """Percentuale del capitale per il BUY: quella del CIO (limitata a base..max) o quella da score."""
-    pct = decision.get("allocation_pct")
-    if pct is None:
-        pct = allocation_pct_for_score(decision.get("score") or analysis_score, cfg)
-    pct = max(cfg["base_allocation_pct"], min(cfg["max_allocation_pct"], pct))
-    return pct, pct * macro_factor
-
-
-def cio_stop(decision, vol_info):
-    """Stop per la nuova posizione: quello del CIO entro i limiti, altrimenti da ATR."""
-    stop = decision.get("dynamic_stop_loss_pct")
-    if stop is not None and stop > 0:
-        stop = -stop
-    if stop is None or stop == 0:
-        return vol_info["stop_pct"] if vol_info else None
-    return round(max(STOP_WIDEST_PCT, min(STOP_TIGHTEST_PCT, stop)), 2)
-
-
 # ===========================================================================
 # AVVIO: sincronizzazione con Alpaca (unica fonte di verità)
 # ===========================================================================
@@ -2145,10 +1969,11 @@ HIGH_BETA = 1.3                 # con VIX > 25 gli asset ad alto beta vengono bl
 EARNINGS_VETO_HOURS = 24
 TARGET_RISK_REWARD = 2.0
 
-# Sizing dinamico del CIO in base alla convinzione (percentuale del capitale)
-# Fascia 60-69: segnali con ensemble dei 7 agenti >= 60 (soglia BUY dell'Agente #5), taglia ridotta
-CONVICTION_BANDS = [(90, 25.0, 35.0), (80, 10.0, 20.0), (70, 5.0, 10.0), (60, 3.0, 5.0)]
+# Sizing dinamico del CIO in base alla convinzione = Ensemble Score dell'Agente #5 (percentuale del capitale)
+# 90+: SUPER_CONVICTION, fino al 50% autorizzato dall'Agente #3; sotto 72 nessun trade (no overtrading)
+CONVICTION_BANDS = [(90, 35.0, 50.0), (80, 15.0, 25.0), (72, 8.0, 15.0)]
 MIN_CONVICTION = CONVICTION_BANDS[-1][0]
+SUPER_CONVICTION_SCORE = CONVICTION_BANDS[0][0]
 
 # Soglia dello score tecnico per trasformare un'anomalia in scheda: 50 con volatilità standard (VIX < 20),
 # 75 con volatilità elevata o VIX non disponibile
@@ -2165,7 +1990,7 @@ def scout_pitch_threshold(macro):
     """Soglia di attivazione delle anomalie degli Scout in base al regime di volatilità (VIX)."""
     vix = (macro or {}).get("vix")
     return SCOUT_PITCH_SCORE_STANDARD if vix is not None and vix < VIX_STANDARD_MAX else SCORE_BUY
-ROTATE_SELL_STEPS = (30, 50, 100)
+ROTATE_SELL_STEPS = (30, 50, 100)   # quote vendibili in rotazione (solo tesi degradate, solo per SUPER_CONVICTION)
 CIO_MIN_GAP_SEC = 180           # il CIO può essere svegliato da una scheda approvata al massimo ogni 3 minuti
 
 # Stati del ciclo di vita di una scheda (Trade Pitch)
@@ -2609,7 +2434,9 @@ def gate_risk_atr(p, ctx):
     """Risk & ATR Specialist: stop dinamico ATR, drawdown, regime VIX/beta, negoziabilità e orari."""
     problems = []
     crypto = is_crypto(p["symbol"])
-    stop = dynamic_stop_pct(p["atr_pct"], crypto) if p.get("atr_pct") else get_config()["stop_loss_pct"]
+    stop = dynamic_stop_pct(p["atr_pct"]) if p.get("atr_pct") else clamp_stop_pct(get_config()["stop_loss_pct"])
+    if crypto and crypto_night_blocked():
+        problems.append("blocco crypto overnight (22:00-08:00 CET): nessuna nuova apertura")
     if ctx["drawdown_blocked"]:
         problems.append(f"drawdown giornaliero {ctx['drawdown_pct']:+.2f}%: acquisti bloccati")
     if ctx["macro"].get("risk_contraction") and p.get("beta") is not None and p["beta"] > HIGH_BETA:
@@ -2618,31 +2445,36 @@ def gate_risk_atr(p, ctx):
         problems.append("non negoziabile su Alpaca")
     if not crypto and not ctx["market_open"]:
         problems.append("mercato azionario chiuso")
-    detail = (f"ATR {p.get('atr_pct')}% → stop {stop:.1f}%, beta {p.get('beta')}, corr {p.get('corr')}, "
+    detail = (f"ATR {p.get('atr_pct')}% → hard stop {stop:.2f}%, beta {p.get('beta')}, corr {p.get('corr')}, "
               f"drawdown {ctx['drawdown_pct']:+.2f}%")
     return {"agent": "Risk & ATR", "veto": bool(problems), "reason": "; ".join(problems) or "ok",
             "detail": detail, "stop_pct": stop}
 
 
 PIPELINE_ORIGIN = "Pipeline Quant"
-PIPELINE_BUY_SCORE = 60.0
+PIPELINE_BUY_SCORE = 72.0       # soglia d'ingresso dell'Agente #5 (Ensemble Score)
 
 
 def gate_quant_ensemble(p):
-    """Ensemble dei 7 agenti (quant_core): veto se Risk/Macro/Guardian bocciano o se l'Agente #5 dà SELL.
+    """Fusion Engine (Agente #5): ogni scheda deve avere un BUY con Ensemble >= 72 (Q x 0.50 + News x 0.35 + OFI x 0.15).
 
-    Senza una valutazione recente (es. agenti non disponibili) non blocca: il veto è dei gate classici.
+    Senza una valutazione recente la scheda non passa: nessun trade senza la validazione dei 7 agenti e di Groq.
     """
     r = quant_rationale(p["symbol"], max_age_sec=RADAR_INTERVAL_SEC * 3)
     if not r:
-        return {"agent": "Quant Ensemble", "veto": False, "reason": "ok", "detail": "valutazione dei 5 agenti non disponibile"}
-    cio = r["agent_05_cio"]
+        return {"agent": "Quant Ensemble", "veto": True, "reason": "valutazione del Fusion Engine non disponibile",
+                "detail": "nessuna valutazione recente dei 7 agenti"}
+    cio, news = r["agent_05_cio"], (r["agent_04_macro"].get("news") or {})
     decision = str(cio.get("decision") or "")
-    veto = decision.startswith("VETO") or decision == "SELL"
-    detail = (f"ensemble {cio.get('score')}/100 → {decision} (Q {r['agent_01_quant']['score']} · M {r['agent_02_micro']['score']} · "
-              f"R {r['agent_03_risk']['score']} · Macro {r['agent_04_macro']['score']})")
-    return {"agent": "Quant Ensemble", "veto": veto, "reason": (cio.get("reason") or decision) if veto else "ok",
-            "detail": detail, "ensemble_score": cio.get("score")}
+    veto = decision != "BUY"
+    comp = cio.get("components") or {}
+    detail = (f"ensemble {cio.get('score')}/100 [{cio.get('trade_class')} · {cio.get('horizon')}] → {decision} "
+              f"(Q {comp.get('quant')} · News {comp.get('news')} · OFI {comp.get('ofi')}; Groq {news.get('status')}: "
+              f"impact {news.get('impact_score')}, '{news.get('thesis_summary') or ''}')")
+    return {"agent": "Quant Ensemble", "veto": veto,
+            "reason": (cio.get("reason") or decision) if veto else "ok", "detail": detail,
+            "ensemble_score": cio.get("score"), "trade_class": cio.get("trade_class"), "horizon": cio.get("horizon"),
+            "buy_thesis": cio.get("buy_thesis")}
 
 
 def is_tradable(yf_symbol):
@@ -2708,8 +2540,8 @@ def risk_committee(pitch, ctx, fng):
     quant_gate = gate_quant_ensemble(pitch)
     gates.append(quant_gate)
     vetoes = [f"{g['agent']}: {g['reason']}" for g in gates if g["veto"]]
-    # Le schede nate dallo Stage 3 hanno già superato la soglia dell'Agente #5 (ensemble >= 60)
-    ensemble_ok = from_pipeline and (quant_gate.get("ensemble_score") or 0) >= PIPELINE_BUY_SCORE
+    # Il Fusion Engine decide: con Ensemble >= 72 lo score tecnico dello Scout non serve più come soglia
+    ensemble_ok = (quant_gate.get("ensemble_score") or 0) >= PIPELINE_BUY_SCORE
     threshold = pitch.get("pitch_threshold", SCORE_BUY)
     if score <= threshold and not ensemble_ok:
         vetoes.append(f"Auditor: score {score} non superiore a {threshold} ({audit_note})")
@@ -2719,10 +2551,12 @@ def risk_committee(pitch, ctx, fng):
         price = pitch["ind"]["price"]
         package = {"entry_price": round(price, 6), "stop_pct": stop,
                    "target_price": round(price * (1 + TARGET_RISK_REWARD * abs(stop) / 100), 6),
+                   "trade_class": quant_gate.get("trade_class"), "horizon": quant_gate.get("horizon"),
+                   "buy_thesis": quant_gate.get("buy_thesis"),
                    "reason": f"{pitch['sector']}: {', '.join(pitch['anomalies'])}; MTF {pitch['mtf_aligned']}/3, "
                              f"RVOL {pitch['rvol']}x, VWAP {pitch['vwap_dist_pct']:+.2f}%, stop {stop:.1f}% (ATR)"}
     return {"approved": not vetoes, "gates": gates, "vetoes": vetoes, "score": score, "audit": audit_note,
-            "ensemble": quant_gate.get("ensemble_score"),
+            "ensemble": quant_gate.get("ensemble_score"), "trade_class": quant_gate.get("trade_class"),
             "package": package, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1)}
 
 
@@ -3014,6 +2848,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
                 continue
             p["review"] = {k: v[k] for k in ("gates", "vetoes", "score", "audit", "elapsed_ms")}
             p["ensemble"] = v.get("ensemble")
+            p["trade_class"] = v.get("trade_class")
             p["updated_at"] = now_local().isoformat(timespec="seconds")
             for g in v["gates"]:
                 agent_say(g["agent"], f"{p['symbol']} → {'VETO: ' + g['reason'] if g['veto'] else 'ok'} ({g['detail']})",
@@ -3079,13 +2914,16 @@ def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
         mtf = ", ".join(f"{tf} {'↑' if v and v['bullish'] else '↓'}{' RSI ' + str(v['rsi']) if v else ''}" for tf, v in p["mtf"].items())
         gates = "; ".join(f"{g['agent']}: {g['detail']}" for g in (p.get("review") or {}).get("gates", []))
         pitch_lines.append(
-            f"  - {p['symbol']} [{p['sector']}] score {p['score']}, anomalie: {', '.join(p['anomalies'])}\n"
+            f"  - {p['symbol']} [{p['sector']}] ENSEMBLE {p.get('ensemble')} ({p.get('trade_class') or 'STANDARD'}), "
+            f"score tecnico {p['score']}, anomalie: {', '.join(p['anomalies'])}\n"
+            f"      Tesi: {(p.get('package') or {}).get('buy_thesis') or 'N/D'}\n"
             f"      MTF: {mtf} | RVOL {p['rvol']}x | VWAP {p['vwap_dist_pct']:+.2f}% | beta {p['beta']} corr {p['corr']}\n"
             f"      Comitato: {gates}\n"
             f"      Target ${p['package']['target_price']:,.4f}, stop {p['package']['stop_pct']:.1f}% "
             f"(scade tra {max(0, int((p['expires_epoch'] - _now_epoch()) / 60))} min)")
     hold_lines = [f"  - {h['symbol']}: valore ${h['market_value']:,.0f} ({h['weight_pct']:.1f}% del capitale), "
-                  f"PnL {h['pnl_pct']:+.2f}%, score {h['score']}, stato {h['status']}" for h in holdings]
+                  f"PnL {h['pnl_pct']:+.2f}%, tesi {'DEGRADATA' if h.get('degraded') else 'INTATTA'} ({h.get('thesis_note', 'N/D')})"
+                  for h in holdings]
     bands = "; ".join(f"convinzione {f}+ → {lo:.0f}-{hi:.0f}%" for f, lo, hi in CONVICTION_BANDS)
     fng_line = f"[4 Sentiment crypto] Fear & Greed {fng['value']} ({fng['label']})\n" if fng else ""
     return (
@@ -3096,22 +2934,25 @@ def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
         f"regime azioni {macro.get('regime', {}).get('stock')}, crypto {macro.get('regime', {}).get('crypto')}\n"
         + fng_line +
         f"[Conto] Capitale ${account['equity']:,.0f} | esposizione ${account['exposure']:,.0f} | "
-        f"liquidità investibile ${account['funds']:,.0f} | esposizione massima {cfg['max_exposure_pct']:.0f}%\n"
+        f"liquidità investibile ${account['funds']:,.0f} | esposizione massima {max_exposure_pct(cfg):.0f}% | "
+        f"posizioni {len(holdings)}/{RISK_MAX_POSITIONS}\n"
         f"Posizioni aperte:\n{chr(10).join(hold_lines) or '  (nessuna)'}\n"
         f"Schede approvate dal Comitato Rischi (canali 2 multi-timeframe, 3 order flow, 5 correlazioni):\n"
         f"{chr(10).join(pitch_lines) or '  (nessuna)'}\n\n"
         "Regole:\n"
-        f"- Assegna una convinzione 0-100 e un'allocazione coerente: {bands}. Sotto {MIN_CONVICTION} rispondi HOLD. "
-        "Tieni conto dell'ensemble dei 7 agenti indicato nel Comitato (Quant Ensemble).\n"
-        f"- Soffitto di sicurezza: {cfg['max_allocation_pct']:.0f}% per operazione ed esposizione totale "
-        f"{cfg['max_exposure_pct']:.0f}%. In regime RISK-OFF l'allocazione viene dimezzata.\n"
-        f"- ROTATE se la liquidità non basta: indica sell_symbol (la posizione meno performante) e sell_pct "
-        f"tra {', '.join(map(str, ROTATE_SELL_STEPS))}; la scheda deve avere almeno {ROTATION_MIN_EDGE} punti più "
-        "della posizione venduta.\n"
-        "- SELL solo per chiudere una posizione debole; HOLD se nessuna scheda merita capitale.\n\n"
+        f"- La convinzione è l'ENSEMBLE del Fusion Engine (Q x 0.50 + News x 0.35 + OFI x 0.15); allocazione coerente: "
+        f"{bands}. Sotto {MIN_CONVICTION} rispondi HOLD.\n"
+        f"- Soffitto di sicurezza: {cfg['max_allocation_pct']:.0f}% per operazione (solo SUPER_CONVICTION oltre 25%), "
+        f"esposizione totale {max_exposure_pct(cfg):.0f}%, massimo {RISK_MAX_POSITIONS} posizioni. "
+        "In regime RISK-OFF l'allocazione viene dimezzata.\n"
+        f"- ROTATE solo per una scheda SUPER_CONVICTION (ensemble >= {SUPER_CONVICTION_SCORE}) e SOLO vendendo una posizione "
+        f"con tesi DEGRADATA (sell_pct tra {', '.join(map(str, ROTATE_SELL_STEPS))}). Mai vendere posizioni con tesi "
+        "INTATTA, anche se piatte o aperte da tempo: in quel caso la taglia si riduce alla liquidità disponibile.\n"
+        "- Non esiste SELL discrezionale: le uscite sono gestite dal Guardian (stop, Target 2R, trailing, uscite anticipate). "
+        "HOLD se nessuna scheda merita capitale.\n\n"
         "Restituisci la risposta in formato JSON pulito:\n"
-        '{\n  "action": "BUY" | "SELL" | "ROTATE" | "HOLD",\n  "buy_symbol": "TICKER",\n  "sell_symbol": "TICKER",\n'
-        '  "sell_pct": 30 | 50 | 100,\n  "conviction_score": 0-100,\n  "allocation_pct": 5-35,\n'
+        '{\n  "action": "BUY" | "ROTATE" | "HOLD",\n  "buy_symbol": "TICKER",\n  "sell_symbol": "TICKER",\n'
+        '  "sell_pct": 30 | 50 | 100,\n  "conviction_score": 0-100,\n  "allocation_pct": 8-50,\n'
         '  "dynamic_stop_loss_pct": valore_negativo,\n  "reason": "Motivazione che cita i 5 canali di intelligence"\n}\n'
         "Usa i ticker esattamente come scritti sopra e stringa vuota per i campi non usati."
     )
@@ -3151,8 +2992,8 @@ def ask_desk_cio(prompt, log=print):
 
 
 def pitch_conviction(p):
-    """Convinzione di una scheda: il migliore tra score tecnico ed ensemble dei 7 agenti (stessa scala 0-100)."""
-    return int(round(max(p.get("score") or 0, p.get("ensemble") or 0)))
+    """Convinzione di una scheda = Ensemble Score del Fusion Engine (lo score tecnico non può gonfiarla)."""
+    return int(round(p.get("ensemble") if p.get("ensemble") is not None else 0))
 
 
 def quant_desk_cio(pitches, holdings, account):
@@ -3171,8 +3012,12 @@ def quant_desk_cio(pitches, holdings, account):
 
 
 def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_keys=()):
-    """Applica i soffitti di sicurezza e le bande di convinzione alla decisione del CIO.
+    """Applica Safety Net, bande di convinzione e Rotazione Intelligente alla decisione del CIO.
 
+    - Nessun SELL discrezionale: le uscite sono solo quelle del Guardian (stop, Target 2R, trailing, uscite anticipate).
+    - Massimo 4 posizioni ed esposizione totale 40% (Agente #3); nessuna nuova crypto tra le 22:00 e le 08:00 CET.
+    - Liquidità insufficiente: solo un SUPER_CONVICTION (Ensemble >= 90) può ruotare capitale, e SOLO da posizioni
+      con tesi degradata (holdings[i]["degraded"]); con tesi intatte la taglia si riduce alla cassa rimanente.
     Restituisce la decisione esecutiva con: buy_amount, allocation_pct effettiva, sell_pct, stop, note.
     """
     hold = lambda why: {"action": "HOLD", "buy_symbol": "", "sell_symbol": "", "reason": why, "notes": []}
@@ -3184,19 +3029,22 @@ def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_ke
     if action == "HOLD":
         return {**d, "notes": notes}
     if action == "SELL":
-        h = hold_map.get(normalize_symbol(d.get("sell_symbol", "")))
-        if not h:
-            return hold(f"SELL scartato: {d.get('sell_symbol') or '?'} non è in portafoglio")
-        pct = _snap_sell_pct(d.get("sell_pct") or 100)
-        return {**d, "sell_symbol": h["yf_symbol"], "sell_pct": pct, "notes": notes}
+        return hold(f"SELL discrezionale su {d.get('sell_symbol') or '?'} ignorato: le uscite sono solo quelle del Guardian "
+                    "(nessun time-stop, nessuna chiusura di tesi valide)")
 
     pitch = pitch_map.get(normalize_symbol(d.get("buy_symbol", "")))
     if not pitch:
         return hold(f"{action} scartato: {d.get('buy_symbol') or '?'} non è una scheda APPROVED_BY_RISK")
-    conviction = d.get("conviction_score") if d.get("conviction_score") is not None else pitch_conviction(pitch)
+    crypto = is_crypto(pitch["symbol"])
+    if crypto and crypto_night_blocked():
+        return hold(f"{pitch['symbol']}: blocco crypto overnight (22:00-08:00 CET), nessuna nuova apertura")
+    # La convinzione è l'Ensemble del Fusion Engine: il CIO non può alzarla
+    ensemble = pitch_conviction(pitch)
+    conviction = min(d.get("conviction_score") if d.get("conviction_score") is not None else ensemble, ensemble)
     band = conviction_band(conviction)
     if not band:
         return hold(f"Convinzione {conviction} sotto {MIN_CONVICTION}: nessuna operazione su {pitch['symbol']}")
+    super_conviction = conviction >= SUPER_CONVICTION_SCORE
     requested = d.get("allocation_pct")
     pct = band[0] if requested is None else max(band[0], min(band[1], requested))
     if requested is not None and pct != requested:
@@ -3204,49 +3052,58 @@ def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_ke
     if pct > cfg["max_allocation_pct"]:
         notes.append(f"soffitto max_allocation_pct {cfg['max_allocation_pct']:.0f}%")
         pct = cfg["max_allocation_pct"]
-    regime = ((channels.get("macro") or {}).get("regime") or {}).get("crypto" if is_crypto(pitch["symbol"]) else "stock")
+    regime = ((channels.get("macro") or {}).get("regime") or {}).get("crypto" if crypto else "stock")
     if regime == "RISK-OFF":
         pct = pct / 2
         notes.append("regime RISK-OFF: allocazione dimezzata")
     stop = d.get("dynamic_stop_loss_pct")
-    stop = -abs(stop) if stop else pitch["package"]["stop_pct"]
-    stop = round(max(STOP_WIDEST_PCT, min(STOP_TIGHTEST_PCT, stop)), 2)
+    stop = clamp_stop_pct(-abs(stop) if stop else pitch["package"]["stop_pct"])
     # Sizing coerente con lo stop: allo stop non si perde più di MAX_RISK_PER_TRADE_PCT del capitale
     risk_cap = MAX_RISK_PER_TRADE_PCT / abs(stop) * 100
     if pct > risk_cap:
         notes.append(f"allocazione {pct:.1f}% → {risk_cap:.1f}% (stop {stop:.1f}%: rischio max {MAX_RISK_PER_TRADE_PCT:.0f}% del capitale)")
         pct = risk_cap
     target_amount = round(account["equity"] * pct / 100, 2)
-    funds = account["funds_crypto"] if is_crypto(pitch["symbol"]) else account["funds"]
+    funds = account["funds_crypto"] if crypto else account["funds"]
     out = {**d, "action": "BUY", "buy_symbol": pitch["symbol"], "conviction_score": conviction, "allocation_pct": round(pct, 2),
            "dynamic_stop_loss_pct": stop, "target_amount": round(target_amount, 2), "notes": notes, "sell_symbol": "",
-           "sell_pct": None}
+           "sell_pct": None, "trade_class": "SUPER_CONVICTION" if super_conviction else "STANDARD",
+           "horizon": pitch.get("package", {}).get("horizon")}
 
-    enough = funds >= target_amount
-    # BUY con almeno metà della taglia disponibile: si compra con quello che c'è, senza vendere nulla
-    partial_ok = action == "BUY" and funds >= max(MIN_ORDER_USD, target_amount / 2)
-    if enough or partial_ok:
-        out["buy_amount"] = round(min(target_amount, funds), 2)
-        if out["buy_amount"] < target_amount:
-            notes.append(f"taglia ridotta alla liquidità disponibile (${funds:,.0f})")
-        if out["buy_amount"] < MIN_ORDER_USD:
-            return hold("Liquidità insufficiente anche per l'ordine minimo")
-        return out
+    slots_full = len(hold_map) >= RISK_MAX_POSITIONS
+    degraded = sorted((h for h in hold_map.values() if h.get("degraded")), key=lambda h: h["pnl_pct"])
+    if not super_conviction:
+        if slots_full:
+            return hold(f"Safety Net: {len(hold_map)}/{RISK_MAX_POSITIONS} posizioni aperte, {pitch['symbol']} "
+                        f"(ensemble {conviction}) non è SUPER_CONVICTION")
+        if funds >= max(MIN_ORDER_USD, target_amount / 2):
+            out["buy_amount"] = round(min(target_amount, funds), 2)
+            if out["buy_amount"] < target_amount:
+                notes.append(f"taglia ridotta alla liquidità disponibile (${funds:,.0f})")
+            return out
+        return hold(f"Liquidità ${funds:,.0f} insufficiente per {pitch['symbol']} (servono almeno ${target_amount / 2:,.0f}); "
+                    "nessuna rotazione per un trade non SUPER_CONVICTION")
 
-    # Liquidità insufficiente: rotazione asimmetrica (parziale o totale)
-    h = hold_map.get(normalize_symbol(d.get("sell_symbol", ""))) if d.get("sell_symbol") else None
-    if not h and hold_map:
-        h = min(hold_map.values(), key=lambda x: (x["score"] if x["score"] is not None else 50, x["pnl_pct"]))
-    if not h:
-        return hold(f"Liquidità insufficiente per {pitch['symbol']} e nessuna posizione da ruotare")
-    if h["score"] is not None and conviction - h["score"] < ROTATION_MIN_EDGE:
-        return hold(f"Rotazione scartata: convinzione {conviction} vs {h['yf_symbol']} score {h['score']} "
-                    f"(servono {ROTATION_MIN_EDGE} punti di vantaggio)")
+    # SUPER_CONVICTION: rotazione SOLO da tesi degradate, altrimenti taglia ridotta alla cassa
     needed = max(0.0, target_amount - funds)
-    needed_pct = needed / h["market_value"] * 100 if h["market_value"] else 100.0
-    sell_pct = _snap_sell_pct(d.get("sell_pct") or needed_pct, minimum=needed_pct)
-    out.update(action="ROTATE", sell_symbol=h["yf_symbol"], sell_pct=sell_pct,
-               buy_amount=round(min(target_amount, funds + h["market_value"] * sell_pct / 100), 2))
+    if (needed > 0 or slots_full) and degraded:
+        h = next((x for x in degraded if normalize_symbol(x["yf_symbol"]) == normalize_symbol(d.get("sell_symbol") or "")),
+                 degraded[0])
+        needed_pct = needed / h["market_value"] * 100 if h["market_value"] else 100.0
+        sell_pct = 100 if slots_full else _snap_sell_pct(d.get("sell_pct") or needed_pct, minimum=needed_pct)
+        notes.append(f"rotazione da {h['yf_symbol']}: tesi degradata ({h.get('thesis_note')})")
+        out.update(action="ROTATE", sell_symbol=h["yf_symbol"], sell_pct=sell_pct,
+                   buy_amount=round(min(target_amount, funds + h["market_value"] * sell_pct / 100), 2))
+        return out
+    if slots_full:
+        return hold(f"SUPER_CONVICTION {pitch['symbol']} ({conviction}): {len(hold_map)}/{RISK_MAX_POSITIONS} posizioni "
+                    "con tesi tutte intatte, nessuna vendita forzata")
+    out["buy_amount"] = round(min(target_amount, funds), 2)
+    if out["buy_amount"] < MIN_ORDER_USD:
+        return hold(f"SUPER_CONVICTION {pitch['symbol']}: liquidità ${funds:,.0f} esaurita e tesi in portafoglio intatte, "
+                    "nessuna vendita forzata")
+    if out["buy_amount"] < target_amount:
+        notes.append(f"SUPER_CONVICTION: tesi in portafoglio intatte, taglia ridotta alla cassa (${funds:,.0f})")
     return out
 
 
@@ -3507,29 +3364,30 @@ def quant_engine():
     with _quant_lock:
         if _quant_engine_ref["core"] is None:
             from quant_core import QuantitativeTradingCore
-            _quant_engine_ref["core"] = QuantitativeTradingCore(portfolio_max_slots=3, num_workers=4,
-                                                                swarm_size=QUANT_SWARM_SIZE, news_provider=news_for_agents)
+            from agents.agent_04_macro import NewsRadar
+            radar = NewsRadar(finnhub_key=FINNHUB_KEY, polygon_key=os.getenv("POLYGON_API_KEY"),
+                              sec_user_agent=os.getenv("SEC_USER_AGENT"))
+            _quant_engine_ref["core"] = QuantitativeTradingCore(portfolio_max_slots=RISK_MAX_POSITIONS, num_workers=4,
+                                                                swarm_size=QUANT_SWARM_SIZE, news_radar=radar,
+                                                                news_llm=groq_news_llm if GROQ_KEY else None,
+                                                                events_provider=events_for_agents)
         return _quant_engine_ref["core"]
 
 
-def news_for_agents(yf_symbol):
-    """Stage 2 · ricerca notizie per l'Agente #4: titoli (yfinance/Finnhub), sentiment -1..+1 e trimestrali.
+def events_for_agents(yf_symbol):
+    """Stage 2 · calendario per il blackout dell'Agente #4: trimestrale entro 24h (cache di 15 minuti per ticker).
 
-    Cache di 15 minuti per ticker: lo Stage 2 resta nell'ordine dei millisecondi dopo la prima ricerca.
+    I titoli arrivano dal News Radar multi-canale (Finnhub, Polygon, RSS, SEC) valutato da Groq in quant_core.
     """
     cached = _news_cache.get(yf_symbol)
     if cached and time.time() - cached[0] < NEWS_CACHE_SEC:
-        return {**cached[1], "source": "cache"}
-    news = get_recent_news(yf_symbol)
-    score, hits = sentiment_score(news)
+        return cached[1]
     events = []
     earnings = earnings_within(yf_symbol)
     if earnings:
         events.append({"timestamp": f"{earnings}T13:30:00", "event_name": f"Trimestrale {yf_symbol}"})
-    headlines = 0 if news.startswith("Nessuna notizia") else news.count(" | ") + 1
-    out = {"sentiment": score / 100.0, "headlines": headlines, "keywords": hits, "events": events, "source": "web"}
-    _news_cache[yf_symbol] = (time.time(), out)
-    return out
+    _news_cache[yf_symbol] = (time.time(), events)
+    return events
 
 
 def account_balance_for_agents():
@@ -3593,7 +3451,8 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
     forced = {normalize_symbol(f) for f in force}
     payloads = [build_scout_payload(sym, frame, order_book=books.get(sym), macro_inputs=macro_inputs,
                                     account_balance=balance, scout_id=f"{scout_id:02d}",
-                                    force_full=normalize_symbol(sym) in forced, scout_meta=(scout_meta or {}).get(sym))
+                                    force_full=normalize_symbol(sym) in forced, scout_meta=(scout_meta or {}).get(sym),
+                                    is_crypto=is_crypto(sym))
                 for scout_id, sym, frame in scout_frames]
     held = {normalize_symbol(h) for h in held_keys}
     exposure_pct = (exposure_usd / balance * 100) if exposure_usd is not None and balance else 0.0
@@ -3603,7 +3462,7 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
         # Agente #6 e slot dell'Agente #5 riflettono le posizioni reali su Alpaca
         engine.portfolio_context = {"held": held, "pending": {normalize_symbol(x) for x in pending},
                                     "exposure_pct": exposure_pct, "positions": positions_count if positions_count is not None else len(held),
-                                    "max_exposure_pct": get_config()["max_exposure_pct"]}
+                                    "max_exposure_pct": max_exposure_pct(get_config())}
         engine.active_portfolio = {k: engine.active_portfolio.get(k) or {"symbol": k, "side": "BUY", "cio_ensemble_score": 50.0,
                                                                          "strength": 50.0, "details": {}}
                                    for k in held}
@@ -3620,9 +3479,10 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
         r = engine.rationale_for(sym, max_age_sec=120)
         if r:
             cio = r["agent_05_cio"]
-            agent_say("Agente #5 CIO", f"{sym} → ensemble {cio['score']}/100 → {cio['decision']} "
-                                       f"(Q {r['agent_01_quant']['score']} · M {r['agent_02_micro']['score']} · "
-                                       f"R {r['agent_03_risk']['score']} · Macro {r['agent_04_macro']['score']})",
+            comp, nv = cio.get("components") or {}, r["agent_04_macro"].get("news") or {}
+            agent_say("Agente #5 CIO", f"{sym} → ensemble {cio['score']}/100 [{cio.get('trade_class')} · {cio.get('horizon')}] "
+                                       f"→ {cio['decision']} (Q {comp.get('quant')} · News {comp.get('news')} "
+                                       f"[Groq {nv.get('status')}, impact {nv.get('impact_score')}] · OFI {comp.get('ofi')})",
                       "veto" if str(cio["decision"]).startswith("VETO") else ("ok" if cio["decision"] in ("BUY", "SELL") else "info"))
     if plan:
         log("👑 [Agente #5] Stage 3 approvati: " + ", ".join(
@@ -3667,7 +3527,7 @@ def _audit_stages(engine, sym, frame, cycle_start, meta):
 
 
 def refresh_held_evaluations(held_yf, log=print):
-    """Valuta subito con i 7 agenti le posizioni aperte (per l'Alpha Decay dell'Agente #6), senza filtri di Stage."""
+    """Valuta subito con i 7 agenti le posizioni aperte (uscite anticipate dell'Agente #6 e tesi degradate), senza filtri di Stage."""
     held_yf = list(dict.fromkeys(held_yf))
     if not held_yf:
         return
@@ -3797,8 +3657,10 @@ def last_entry_execution(symbol):
 # CICLO DI TEST SIMULATO:  python trading_core.py
 #   Universo reale dal Dynamic Universe Screener (solo elenchi pubblici; se la rete manca si usa la cache o
 #   i panieri statici) e prezzi SINTETICI. Percorre tutti i blocchi della rotazione con il flusso di produzione:
-#   run_scout_swarm (100 Scout + Stage 1-3) -> Comitato Rischi -> APPROVED_BY_RISK -> CIO del desk -> ordine SIMULATO.
-#   Nessun ordine inviato; registro in una cartella temporanea. SIM_VERBOSE=1 mostra ogni riga degli agenti.
+#   run_scout_swarm (100 Scout + Stage 1-3) -> Comitato Rischi -> APPROVED_BY_RISK -> CIO del desk -> ordine SIMULATO,
+#   poi il ciclo di vita di una posizione nel Guardian (buy_thesis -> hold_rationale -> Target 2R -> runner -> exit_reason).
+#   News Radar e Groq SIMULATI (MSFT: Groq lento per provare il timeout di 2 s). Nessun ordine inviato; registro e
+#   guardian_positions.json in una cartella temporanea. SIM_VERBOSE=1 mostra ogni riga degli agenti.
 # ===========================================================================
 if __name__ == "__main__":
     import logging
@@ -3841,6 +3703,31 @@ if __name__ == "__main__":
                                      "macro": macro, "stats": {}}
     SCOUT_REGISTRY_PATH = os.path.join(tempfile.mkdtemp(prefix="sim-registry-"), "scout_registry.json")
     AUDIT_LOG_PATH = os.path.join(os.path.dirname(SCOUT_REGISTRY_PATH), "data", "pitch_audit_log.json")
+    GUARDIAN_STATE_PATH = os.path.join(os.path.dirname(SCOUT_REGISTRY_PATH), "guardian_positions.json")
+    last_entry_execution = lambda sym: None
+
+    # News Radar e Groq simulati: catalizzatore fresco sui titoli in trend, notizie vecchie o assenti sugli altri
+    from agents.agent_04_macro import NewsRadar
+
+    def _sim_headlines(sym, crypto):
+        if sym.upper() in UPTREND:
+            return [{"title": f"{sym} beats estimates and raises full-year guidance", "published": time.time() - 240,
+                     "source": "SIM Finnhub"}]
+        if zlib.crc32(sym.encode()) % 4 == 0:
+            return [{"title": f"{sym} shares drift in a quiet session", "published": time.time() - 3 * 3600, "source": "SIM RSS"}]
+        return []
+
+    def _sim_groq(system, prompt):
+        if "Ticker: MSFT" in prompt:
+            time.sleep(2.5)                      # oltre il limite dell'Agente #7: News Score neutro
+        bullish = "beats estimates" in prompt
+        return json.dumps({"impact_score": 0.85 if bullish else 0.05, "novelty_index_minutes": 4,
+                           "catalyst_type": "EARNINGS" if bullish else "MACRO",
+                           "thesis_summary": "Utili sopra le attese e guidance annuale rialzata" if bullish
+                           else "Nessun catalizzatore concreto"})
+
+    quant_engine().news_radar = NewsRadar(fetchers={"sim": _sim_headlines})
+    quant_engine().news_llm = _sim_groq
     _balance_cache.update(ts=time.time(), value=100000.0)
     say = lambda m: print(m, flush=True)
 
@@ -3876,7 +3763,7 @@ if __name__ == "__main__":
     inbox = cio_inbox()
     account = {"equity": 100000.0, "exposure": 20000.0, "funds": 80000.0, "funds_crypto": 80000.0}
     holdings = [{"symbol": "AMZN", "yf_symbol": "AMZN", "market_value": 20000.0, "weight_pct": 20.0,
-                 "pnl_pct": 0.7, "score": 83, "status": "OK"}]
+                 "pnl_pct": 0.7, "score": 83, "status": "OK", "degraded": False, "thesis_note": "tesi intatta"}]
     while inbox:
         decision = quant_desk_cio(inbox, holdings, account)
         final = validate_desk_decision(decision, inbox, holdings, account, get_config(), latest_channels())
@@ -3893,9 +3780,37 @@ if __name__ == "__main__":
         account["funds"] -= final["buy_amount"]
         account["funds_crypto"] -= final["buy_amount"]
         holdings.append({"symbol": final["buy_symbol"], "yf_symbol": final["buy_symbol"], "market_value": final["buy_amount"],
-                         "weight_pct": final["allocation_pct"], "pnl_pct": 0.0, "score": None, "status": "OK"})
+                         "weight_pct": final["allocation_pct"], "pnl_pct": 0.0, "score": None, "status": "OK",
+                         "degraded": False, "thesis_note": "tesi intatta"})
+        account["exposure"] += final["buy_amount"]
         inbox = cio_inbox()
     chop_audit(log=say, force=True)
+
+    # Ciclo di vita di una posizione nel Guardian: ingresso -> piatto (nessun time-stop) -> Target 2R -> runner -> trailing
+    print("\n--- 🧿 Agente #6 Guardian · posizione simulata ---", flush=True)
+    sim_sym = next((h["yf_symbol"] for h in holdings[1:]), "NVDA")
+    q_sim = quant_rationale(sim_sym, max_age_sec=None)
+    entry_px = 100.0
+    guardian_register_entry(sim_sym, buy_thesis_for(sim_sym, entry_px, q_sim), q=q_sim, price=entry_px, vix=15.3)
+    guardian_atr = lambda sym: 3.0
+    _peak_since = lambda sym, opened: None
+    opened = now_local() - dt.timedelta(hours=5)
+    pos = {"symbol": sim_sym, "yf_symbol": sim_sym, "is_crypto": is_crypto(sim_sym), "qty": 100.0, "avg_entry_price": entry_px}
+    for label, px in (("piatta da 5 ore", 100.2), ("Target 2R", 104.0), ("runner in corsa", 112.0), ("ritracciamento", 106.5)):
+        pos.update(current_price=px, market_value=px * pos["qty"], unrealized_plpc=(px / entry_px - 1) * 100)
+        g = guardian_watch([pos], {normalize_symbol(sim_sym): {"opened_at": opened, "stop_pct": -2.0}}, get_config(), True)[normalize_symbol(sim_sym)]
+        st = guardian_snapshot()["positions"][normalize_symbol(sim_sym)]
+        print(f"  [{label} · ${px}] azione {g['action']} | stop effettivo {g['effective_stop_pct']:+.2f}%", flush=True)
+        print(f"     hold_rationale: {st['hold_rationale']}", flush=True)
+        if g["hit"]:
+            reason = guardian_record_exit(pos, g["action"], g["reason"], pct=g["sell_pct"], stop_price=g.get("trigger"))
+            print(f"     exit_reason: {reason}", flush=True)
+            if g["sell_pct"] < 100:
+                pos["qty"] *= (100 - g["sell_pct"]) / 100
+    print(f"  buy_thesis: {guardian_snapshot()['positions'][normalize_symbol(sim_sym)]['buy_thesis']}", flush=True)
+    guardian_prune(set())
+    closed = guardian_snapshot()["closed"][-1]
+    print(f"  chiusa → exit_reason in {GUARDIAN_STATE_PATH}: {closed['exit_reason']}", flush=True)
 
     pitch_audit().flush(force=True)
     board = audit_board(held_symbols=[h["symbol"] for h in holdings])

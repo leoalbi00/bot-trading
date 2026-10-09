@@ -23,8 +23,9 @@ FLUSH_EVERY_SEC = 15
 TARGET_R = 2.0            # target = 2 volte la distanza dello stop (come il pacchetto del Comitato Rischi)
 QUANT_BULLISH = 60.0      # Agente #1: segnale tecnico rialzista
 MICRO_CONFIRMED = 50.0    # Agente #2: volumi / order flow a favore
-GUARDIAN_EXITS = ("TRAILING STOP", "BREAKEVEN STOP", "ALPHA DECAY", "TIME STOP", "TAKE PROFIT", "SCALE OUT",
-                  "NEWS SHOCK", "OFI REVERSAL")
+# ALPHA DECAY / TIME STOP restano solo per riconoscere le uscite storiche: il Guardian non le genera più
+GUARDIAN_EXITS = ("TRAILING STOP", "BREAKEVEN STOP", "TAKE PROFIT", "SCALE OUT", "THESIS DECAY", "NEWS SHOCK",
+                  "OFI REVERSAL", "ALPHA DECAY", "TIME STOP")
 
 AGENT_NAMES = {
     1: "Agente #1 · Quant", 2: "Agente #2 · Microstruttura", 3: "Agente #3 · Risk", 4: "Agente #4 · Macro/News",
@@ -268,7 +269,7 @@ class PitchAuditRegister:
             {"no": 6, "name": AGENT_NAMES[6], "win_rate": _rate(sum(1 for p in g_pnl if p > 0), len(g_pnl)),
              "pnl": round(sum(g_pnl), 2) if g_pnl else 0.0, "samples": len(guardian),
              "metric": f"Guadagno medio recuperato {round(sum(g_pnl) / len(g_pnl), 2) if g_pnl else '—'}$ per uscita",
-             "detail": f"{len(guardian)} uscite da Trailing / Breakeven / Scaling Out / Early Exit / Alpha Decay"},
+             "detail": f"{len(guardian)} uscite da Trailing / Breakeven / Scaling Out / Thesis Decay / OFI Reversal / News Shock"},
             {"no": 7, "name": AGENT_NAMES[7], "win_rate": None, "pnl": None, "samples": None,
              "metric": f"Uptime {uptime_s // 3600}h {uptime_s % 3600 // 60:02d}m · riavvii Scout {chop.get('restarts', 0)} · "
                        f"auto-healing {chop.get('heals', 0)}",

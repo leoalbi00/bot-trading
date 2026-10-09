@@ -7,10 +7,12 @@ Flusso (trading_core.stream_scouts_to_agents):
       -> process_scout_stream(): Worker che portano ogni candidato attraverso gli Stage
            STAGE 1 Fast-Quant (< 5 ms): Hurst, Z-Score, Volatility Spike + segnali degli Scout;
                    scarta il rumore (ticker senza Scout attivati o con prezzo casuale)
-           STAGE 2 Deep Filter: Agente #1 completo (GARCH), Agente #2 (VPIN, OFI),
-                   notizie e calendario via Agente #4; scarta chi non può più arrivare a BUY
-           STAGE 3 Executive & Risk Desk: Agente #3 (rischio), #6 (Portfolio Guardian), #5 (CIO)
-      -> piano dell'Agente #5 (aperture / Asset Swap)
+           STAGE 2 Deep Filter: Agente #1 completo (GARCH, Traiettoria Attesa), Agente #2 (VPIN, OFI);
+                   se l'Ensemble può ancora arrivare a 72, News Radar + Groq via Agente #4 (timeout 2 s, veto);
+                   scarta chi resta sotto la soglia d'ingresso
+           STAGE 3 Executive & Risk Desk: Agente #3 (Safety Net), #6 (Portfolio Guardian), #5 (CIO, Fusion Engine
+                   Q x 0.50 + News x 0.35 + OFI x 0.15)
+      -> piano dell'Agente #5 (aperture; SUPER_CONVICTION con portafoglio pieno -> rotazione delle tesi degradate)
 L'Agente #7 (CHOP Watchdog) misura latenze, coda, RAM/CPU e fa auto-healing.
 Ogni passaggio viene registrato su console (a colori) e su file (quant_agents.log).
 """
@@ -30,8 +32,8 @@ import pandas as pd
 from agents.agent_01_quant import QuantEngineAgent
 from agents.agent_02_micro import MicrostructureAgent
 from agents.agent_03_risk import RiskManagerAgent
-from agents.agent_04_macro import MacroSentimentAgent
-from agents.agent_05_cio import CIOStrategistAgent
+from agents.agent_04_macro import MacroSentimentAgent, NEWS_MAX_NOVELTY_MIN, NewsRadar
+from agents.agent_05_cio import CIOStrategistAgent, SUPER_CONVICTION, ofi_to_score
 from agents.agent_06_sentinel import PortfolioGuardianAgent
 from agents.agent_07_chop import ChopWatchdog
 from scouts.swarm import ScoutSwarm
@@ -42,6 +44,8 @@ STREAM_END = None   # sentinella: fine del pacchetto inviato dagli Scout sulla c
 SWARM_SIZE = 100
 RVOL_STAGE1_BYPASS = 2.5        # volume relativo eccezionale: passa lo Stage 1...
 STAGE1_BYPASS_MIN_SCORE = 35    # ...se lo score tecnico dello Scout è almeno intermedio
+HEADLINES_TTL_SEC = 120         # titoli del News Radar riletti al massimo ogni 2 minuti per ticker
+NEWS_ASSESSMENT_TTL_SEC = 600   # giudizio di Groq riusato finché i titoli non cambiano (novelty invecchiata)
 
 
 class _ColorFormatter(logging.Formatter):
@@ -91,6 +95,24 @@ def _build_logger() -> logging.Logger:
 logger = _build_logger()
 
 
+def looks_crypto(symbol: str) -> bool:
+    """Crypto nei formati usati dal bot (BTC-USD, BTC/USD, BTC/USDT)."""
+    s = str(symbol).upper().replace("/", "-")
+    return s.endswith(("-USD", "-USDT", "-USDC"))
+
+
+def age_assessment(assessment: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+    """Giudizio di Groq in cache invecchiato: la novelty cresce col tempo e oltre 30 minuti l'Impact torna 0."""
+    a = dict(assessment)
+    if a.get("novelty_index_minutes") is None or not a.get("assessed_at"):
+        return a
+    elapsed = max(0, int(((now or time.time()) - a["assessed_at"]) / 60))
+    a["novelty_index_minutes"] = int(a["novelty_index_minutes"]) + elapsed
+    if a.get("status") == "OK" and a["novelty_index_minutes"] > NEWS_MAX_NOVELTY_MIN:
+        a.update(status="STALE", impact_score=0.0, news_score=50.0)
+    return a
+
+
 def symbol_key(symbol: str) -> str:
     """Chiave di confronto unica (BTC-USD, BTC/USD e BTCUSD -> BTCUSD), come trading_core.normalize_symbol."""
     return str(symbol).upper().replace("-", "").replace("/", "")
@@ -114,6 +136,7 @@ def build_scout_payload(
     scout_id: Optional[Union[int, str]] = None,
     force_full: bool = False,
     scout_meta: Optional[Dict[str, Any]] = None,
+    is_crypto: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Payload standard di un candidato.
 
@@ -135,6 +158,7 @@ def build_scout_payload(
         "force_full": bool(force_full),
         # Esito dello Scout classico (score tecnico 0-100 e RVOL): abilita il bypass RVOL dello Stage 1
         "scout_meta": dict(scout_meta or {}),
+        "is_crypto": looks_crypto(symbol) if is_crypto is None else bool(is_crypto),
     }
 
 
@@ -160,18 +184,27 @@ class QuantitativeTradingCore:
     """
     def __init__(
         self,
-        portfolio_max_slots: int = 3,
+        portfolio_max_slots: int = 4,
         num_workers: int = 4,
-        swap_delta_threshold: float = 20.0,
         swarm_size: int = SWARM_SIZE,
         news_provider: Optional[Callable[[str], Dict[str, Any]]] = None,
         watchdog: Optional[ChopWatchdog] = None,
+        news_radar: Optional[NewsRadar] = None,
+        news_llm: Optional[Callable[[str, str], Optional[str]]] = None,
+        events_provider: Optional[Callable[[str], List[Dict[str, Any]]]] = None,
     ):
+        """news_radar: ingestione multi-canale dei titoli; news_llm(system, prompt): chiamata a Groq (JSON),
+        eseguita dall'Agente #7 con timeout di 2 s; events_provider(symbol): eventi per il blackout (trimestrali).
+        news_provider(symbol): sostituisce radar + Groq e restituisce direttamente il giudizio (test offline)."""
         self.portfolio_max_slots = portfolio_max_slots
         self.num_workers = num_workers
         self.base_workers = num_workers
-        self.swap_delta_threshold = swap_delta_threshold
         self.news_provider = news_provider
+        self.news_radar = news_radar
+        self.news_llm = news_llm
+        self.events_provider = events_provider
+        self._headlines_cache: Dict[str, Any] = {}
+        self._assessment_cache: Dict[str, Any] = {}
 
         # Squadra di Agenti (stateless: condivisibili tra i worker)
         self.agent_quant = QuantEngineAgent()
@@ -218,9 +251,33 @@ class QuantitativeTradingCore:
             logger.warning(f"[{label}] ⚠️ {symbol} scartato -> dati insufficienti: {res.get('reason', 'N/D')}")
         return res
 
-    def _best_case_score(self, quant: float, micro: float, macro: float) -> float:
-        """Ensemble massimo raggiungibile con Agente #3 a 100: se è sotto la soglia BUY lo Stage 3 è inutile."""
-        return max(self.agent_cio.ensemble_score(quant, micro, 100.0, macro, high) for high in (False, True))
+    def news_assessment(self, symbol: str, is_crypto: bool) -> Dict[str, Any]:
+        """Agente #4 · News Radar: titoli multi-canale (cache 2 min) + giudizio di Groq (riusato se i titoli non cambiano).
+
+        Groq passa dal guard dell'Agente #7 (timeout 2.0 s): in timeout il giudizio è neutro e non viene messo in cache.
+        """
+        if self.news_provider:
+            return self.news_provider(symbol) or {}
+        key, now = symbol_key(symbol), time.time()
+        cached = self._headlines_cache.get(key)
+        if cached and now - cached[0] < HEADLINES_TTL_SEC:
+            headlines = cached[1]
+        else:
+            headlines = self.news_radar.collect(symbol, is_crypto, now=now) if self.news_radar else []
+            self._headlines_cache[key] = (now, headlines)
+            if self.news_radar and self.news_radar.last_errors:
+                logger.debug(f"[AGENTE #4 NEWS] {symbol} canali in errore: {self.news_radar.last_errors}")
+        titles = tuple(h["title"] for h in headlines)
+        prev = self._assessment_cache.get(key)
+        if prev and prev[1] == titles and now - prev[0] < NEWS_ASSESSMENT_TTL_SEC:
+            return age_assessment(prev[2], now)
+        llm = None
+        if self.news_llm:
+            llm = lambda system, prompt: self.watchdog.guarded_llm_call(self.news_llm, system, prompt)
+        assessment = self.agent_macro.assess_news(symbol, headlines, llm, now=now)
+        if assessment.get("status") not in ("TIMEOUT", "INVALID"):
+            self._assessment_cache[key] = (now, titles, assessment)
+        return assessment
 
     def _filtered(self, symbol: str, stage: int, reason: str, extra: Dict[str, Any]) -> None:
         with self._eval_lock:
@@ -292,38 +349,59 @@ class QuantitativeTradingCore:
                     f"OFI: {_fmt(mm.get('order_flow_imbalance', 'N/D'))} ({mm.get('ofi_source', 'N/D')}) "
                     f"-> Score: {_fmt(res_micro.get('microstructure_score'), 2)}")
 
-        news = {"sentiment": macro_inputs.get("news_sentiment", 0.0), "headlines": 0, "events": [], "source": "nessuna"}
-        if self.news_provider:
+        quant_score = float(res_quant.get("quant_score", 50.0))
+        ofi = mm.get("order_flow_imbalance")
+        best = self.agent_cio.best_case_score(quant_score, ofi_to_score(ofi))
+        if not force and best < self.agent_cio.buy_threshold:
+            # Nemmeno una notizia perfetta porterebbe l'Ensemble a 72: Groq non viene interrogato
+            ms2 = (time.perf_counter() - t2) * 1000
+            self.watchdog.record_latency("stage2", ms2)
+            logger.info(f"[STAGE 2 · DEEP FILTER] 🔎 {symbol} -> ensemble massimo raggiungibile {best:.1f} "
+                        f"< {self.agent_cio.buy_threshold:.0f} anche con News 100 -> FILTRATO ({ms2:.1f}ms)")
+            self._filtered(symbol, 2, f"ensemble massimo {best:.1f} < {self.agent_cio.buy_threshold:.0f} (Q {quant_score:.0f}, "
+                                      f"OFI {_fmt(ofi, 2)})", {"fast": fast, "scouts": scout_txt})
+            return None
+
+        is_crypto = bool(candidate_data.get("is_crypto"))
+        try:
+            news = self.news_assessment(symbol, is_crypto)
+        except Exception as e:
+            logger.warning(f"[AGENTE #4 NEWS] ⚠️ {symbol} -> News Radar fallito {type(e).__name__}: {e}")
+            news = self.agent_macro.assess_news(symbol, [], None)
+        events = list(macro_inputs.get("upcoming_events", []))
+        if self.events_provider:
             try:
-                news = {**news, **(self.news_provider(symbol) or {})}
+                events += list(self.events_provider(symbol) or [])
             except Exception as e:
-                logger.warning(f"[AGENTE #4 MACRO] ⚠️ {symbol} -> ricerca notizie fallita {type(e).__name__}: {e}")
-        events = list(macro_inputs.get("upcoming_events", [])) + list(news.get("events") or [])
+                logger.warning(f"[AGENTE #4 MACRO] ⚠️ {symbol} -> calendario eventi non disponibile {type(e).__name__}: {e}")
         res_macro = self._run_agent("AGENTE #4 MACRO", symbol, lambda: self.agent_macro.analyze(
             df=df_ohlcv,
             vix_level=macro_inputs.get("vix_level", 16.5),
             fear_greed_index=macro_inputs.get("fear_greed_index", 50.0),
-            news_sentiment=news.get("sentiment", 0.0),
             central_bank_speech=macro_inputs.get("central_bank_speech", ""),
-            upcoming_events=events
-        ), {"agent_id": self.agent_macro.agent_id, "macro_approved": False, "macro_score": 0.0, "stress_level": "UNKNOWN"})
-        logger.info(f"[AGENTE #4 MACRO] 🌐 {symbol} -> Macro Stress: {res_macro.get('stress_level', 'N/D')}, "
-                    f"Macro Approved: {res_macro.get('macro_approved')} | notizie {news.get('headlines', 0)} "
-                    f"(sentiment {float(news.get('sentiment') or 0):+.2f}, {news.get('source')}), eventi {len(events)}"
+            upcoming_events=events,
+            news_assessment=news,
+            quant_score=quant_score,
+        ), {"agent_id": self.agent_macro.agent_id, "macro_approved": False, "macro_score": 0.0, "news_score": 50.0,
+            "stress_level": "UNKNOWN"})
+        nv = res_macro.get("news") or {}
+        logger.info(f"[AGENTE #4 NEWS] 📰 {symbol} -> Groq {nv.get('status', 'N/D')}: impact {float(nv.get('impact_score') or 0):+.2f}, "
+                    f"novelty {nv.get('novelty_index_minutes', 'N/D')} min, {nv.get('catalyst_type') or '—'} "
+                    f"('{nv.get('thesis_summary') or ''}') | {nv.get('headlines', 0)} titoli ({', '.join(nv.get('sources') or []) or '—'})"
+                    f" | Stress {res_macro.get('stress_level', 'N/D')}, eventi {len(events)}"
                     + (f" ({res_macro['reason']})" if res_macro.get("reason") else ""))
         if not res_macro.get("macro_approved"):
-            logger.warning(f"[AGENTE #4 MACRO] ⚠️ {symbol} respinto dall'Agente Macro: {res_macro.get('reason', 'N/D')}")
+            logger.warning(f"[AGENTE #4 MACRO] ⚠️ {symbol} respinto dall'Agente #4: {res_macro.get('reason', 'N/D')}")
 
         ms2 = (time.perf_counter() - t2) * 1000
         self.watchdog.record_latency("stage2", ms2)
-        best = self._best_case_score(res_quant.get("quant_score", 50.0), res_micro.get("microstructure_score", 50.0),
-                                     res_macro.get("macro_score", 50.0))
-        deep_ok = force or best >= self.agent_cio.buy_threshold or best <= self.agent_cio.sell_threshold
-        logger.info(f"[STAGE 2 · DEEP FILTER] 🔎 {symbol} -> ensemble massimo raggiungibile {best:.1f} "
-                    f"(soglia BUY {self.agent_cio.buy_threshold:.0f}) -> "
-                    f"{'PASSA → Stage 3' if deep_ok else 'FILTRATO (non può arrivare a BUY)'} ({ms2:.1f}ms)")
+        ensemble = self.agent_cio.ensemble_score(quant_score, float(res_macro.get("news_score", 50.0)), ofi_to_score(ofi))
+        deep_ok = force or ensemble >= self.agent_cio.buy_threshold
+        logger.info(f"[STAGE 2 · DEEP FILTER] 🔎 {symbol} -> ensemble {ensemble:.1f} (soglia d'ingresso "
+                    f"{self.agent_cio.buy_threshold:.0f}) -> {'PASSA → Stage 3' if deep_ok else 'FILTRATO (sotto soglia)'} ({ms2:.1f}ms)")
         if not deep_ok:
-            self._filtered(symbol, 2, f"ensemble massimo {best:.1f} < {self.agent_cio.buy_threshold:.0f}",
+            self._filtered(symbol, 2, f"ensemble {ensemble:.1f} < {self.agent_cio.buy_threshold:.0f} "
+                                      f"(Groq {nv.get('status')}: impact {float(nv.get('impact_score') or 0):+.2f})",
                            {"fast": fast, "scouts": scout_txt})
             return None
         self.watchdog.count("stage2_pass")
@@ -331,7 +409,8 @@ class QuantitativeTradingCore:
         # ============================== STAGE 3: Executive & Risk Desk ==============================
         t3 = time.perf_counter()
         res_risk = self._run_agent("AGENTE #3 RISK", symbol,
-                                   lambda: self.agent_risk.analyze(df_ohlcv, account_balance=account_balance),
+                                   lambda: self.agent_risk.analyze(df_ohlcv, account_balance=account_balance,
+                                                                   is_crypto=is_crypto, portfolio=self.portfolio_context),
                                    {"agent_id": self.agent_risk.agent_id, "risk_approved": False, "risk_score": 0.0})
         stop = res_risk.get("position_parameters", {}).get("stop_loss_price", "N/D")
         logger.info(f"[AGENTE #3 RISK] 🛡️ {symbol} -> ATR Stop: {_fmt(stop)}, "
@@ -356,13 +435,17 @@ class QuantitativeTradingCore:
                 agent_03_risk_res=res_risk,
                 agent_04_macro_res=res_macro,
                 agent_06_guardian_res=res_guard,
+                symbol=symbol,
+                price=float(df_ohlcv["close"].iloc[-1]),
             )
         except Exception as e:
             logger.warning(f"[AGENTE #5 CIO] ⚠️ {symbol} scartato -> eccezione {type(e).__name__}: {e}")
             return None
         decision = res_cio.get("veto") or res_cio.get("final_decision")
         logger.info(f"[AGENTE #5 CIO] 👑 {symbol} -> Ensemble Score: {_fmt(res_cio.get('cio_ensemble_score'), 2)}/100 "
-                    f"-> Decisione: {decision}" + (f" ({res_cio.get('reason')})" if res_cio.get("veto") else ""))
+                    f"[{res_cio.get('trade_class')} · {res_cio.get('horizon')}] -> Decisione: {decision}"
+                    + (f" ({res_cio.get('reason')})" if res_cio.get("veto") else "")
+                    + (f" | {res_cio['buy_thesis']}" if res_cio.get("buy_thesis") else ""))
         ms3 = (time.perf_counter() - t3) * 1000
         self.watchdog.record_latency("stage3", ms3)
         self.watchdog.count("stage3_done")
@@ -397,23 +480,32 @@ class QuantitativeTradingCore:
             return None
         raw, cio, st = ev["raw_results"], ev["cio_result"], ev.get("stage_info", {})
         guard = raw.get("guardian")
+        news = st.get("news") or {}
         return {
             "evaluated_at": ev["evaluated_at"],
             "agent_01_quant": {"score": raw["quant"].get("quant_score"), "signal": raw["quant"].get("trade_signal"),
-                               "metrics": raw["quant"].get("metrics", {})},
+                               "metrics": raw["quant"].get("metrics", {}), "expected_path": raw["quant"].get("expected_path")},
             "agent_02_micro": {"score": raw["micro"].get("microstructure_score"), "signal": raw["micro"].get("trade_signal"),
                                "vpin": raw["micro"].get("metrics", {}).get("vpin_toxicity"),
-                               "ofi": raw["micro"].get("metrics", {}).get("order_flow_imbalance")},
+                               "ofi": raw["micro"].get("metrics", {}).get("order_flow_imbalance"),
+                               "ofi_source": raw["micro"].get("metrics", {}).get("ofi_source"),
+                               "pressure": raw["micro"].get("metrics", {}).get("institutional_pressure")},
             "agent_03_risk": {"score": raw["risk"].get("risk_score"), "approved": raw["risk"].get("risk_approved"),
                               "reason": raw["risk"].get("reason"),
                               "stop_loss_price": raw["risk"].get("position_parameters", {}).get("stop_loss_price"),
-                              "take_profit_price": raw["risk"].get("position_parameters", {}).get("take_profit_price")},
+                              "stop_loss_pct": raw["risk"].get("position_parameters", {}).get("stop_loss_pct"),
+                              "take_profit_price": raw["risk"].get("position_parameters", {}).get("take_profit_price"),
+                              "safety_net": raw["risk"].get("safety_net")},
             "agent_04_macro": {"score": raw["macro"].get("macro_score"), "approved": raw["macro"].get("macro_approved"),
-                               "stress_level": raw["macro"].get("stress_level"),
-                               "news_sentiment": (st.get("news") or {}).get("sentiment"),
-                               "headlines": (st.get("news") or {}).get("headlines")},
+                               "stress_level": raw["macro"].get("stress_level"), "reason": raw["macro"].get("reason"),
+                               "news_score": raw["macro"].get("news_score"), "news": news,
+                               "news_sentiment": news.get("impact_score"), "headlines": news.get("headlines"),
+                               "swing_catalyst": raw["macro"].get("swing_catalyst")},
             "agent_05_cio": {"score": cio.get("cio_ensemble_score"), "decision": cio.get("veto") or cio.get("final_decision"),
-                             "reason": cio.get("reason")},
+                             "reason": cio.get("reason"), "trade_class": cio.get("trade_class"), "horizon": cio.get("horizon"),
+                             "components": cio.get("agent_scores"), "buy_thesis": cio.get("buy_thesis"),
+                             "needs_rotation": cio.get("needs_rotation"), "news_impact": cio.get("news_impact"),
+                             "ofi": cio.get("ofi")},
             "agent_06_guardian": ({"approved": guard.get("guardian_approved"), "reason": guard.get("reason")}
                                   if guard else {"approved": None, "reason": "posizione già aperta: monitoraggio h24"}),
             "agent_07_chop": {"scouts": [f"#{s['scout_id']:03d} {s['category']} {s['side']}: {s['detail']}"
@@ -424,48 +516,27 @@ class QuantitativeTradingCore:
     # ------------------------------------------------------------------ allocazione
     def evaluate_capital_recycling_swap(self, new_opportunity: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Algoritmo di Asset Swap: determina se la nuova opportunità deve sostituire
-        una posizione debole attiva in portafoglio.
+        Piano di allocazione dell'Agente #5. Il bot è long-only: solo i BUY aprono posizioni.
+        - Slot liberi (max 4 posizioni): apertura.
+        - Portafoglio pieno: entra solo un SUPER_CONVICTION (Ensemble >= 90). Il desk esecutivo potrà liquidare
+          SOLO posizioni con tesi degradata (OFI negativo o News Score sceso); con tesi intatte la taglia del
+          nuovo trade si riduce alla cassa rimanente. Nessuna posizione viene chiusa perché piatta o vecchia.
         """
         symbol = new_opportunity["symbol"]
         cio_res = new_opportunity["cio_result"]
-        new_strength = conviction_strength(cio_res)
         decision = cio_res.get("final_decision", "HOLD")
 
-        if decision not in ["BUY", "SELL"]:
+        if decision != "BUY":
             return {"action": "REJECT", "reason": f"DECISION_IS_{decision}"}
-
         if symbol_key(symbol) in self.active_portfolio:
             return {"action": "REJECT", "reason": "ALREADY_IN_PORTFOLIO"}
-
-        # Caso A: Il portafoglio ha ancora posti liberi
         if len(self.active_portfolio) < self.portfolio_max_slots:
             return {"action": "EXECUTE_NEW", "symbol": symbol, "reason": "SLOT_AVAILABLE"}
-
-        # Caso B: Il portafoglio è pieno -> Cerca la posizione più debole per eventuale SWAP
-        weakest_symbol = None
-        lowest_strength = 999.0
-
-        for active_sym, active_data in self.active_portfolio.items():
-            active_strength = active_data.get("strength", 50.0)
-            if active_strength < lowest_strength:
-                lowest_strength = active_strength
-                weakest_symbol = active_sym
-
-        # Verifica della condizione di Swap Delta
-        if weakest_symbol and new_strength > (lowest_strength + self.swap_delta_threshold):
-            return {
-                "action": "SWAP_POSITIONS",
-                "close_symbol": weakest_symbol,
-                "open_symbol": symbol,
-                "delta_score": round(new_strength - lowest_strength, 2),
-                "reason": f"HIGH_CONVICTION_SWAP (New: {new_strength} vs Old: {lowest_strength})"
-            }
-
-        return {
-            "action": "REJECT",
-            "reason": f"INSUFFICIENT_SWAP_DELTA (New: {new_strength} vs Lowest Active: {lowest_strength})"
-        }
+        if cio_res.get("trade_class") == SUPER_CONVICTION:
+            return {"action": "SUPER_CONVICTION_ROTATION", "open_symbol": symbol,
+                    "reason": (f"SUPER_CONVICTION (Ensemble {cio_res.get('cio_ensemble_score')}) con portafoglio pieno: "
+                               "rotazione solo delle tesi degradate, altrimenti taglia ridotta alla cassa")}
+        return {"action": "REJECT", "reason": f"PORTFOLIO_FULL ({len(self.active_portfolio)}/{self.portfolio_max_slots})"}
 
     def _register_position(self, symbol: str, cio_res: Dict[str, Any]) -> None:
         self.active_portfolio[symbol_key(symbol)] = {
@@ -491,12 +562,9 @@ class QuantitativeTradingCore:
                     self._register_position(item["symbol"], cio_res)
                     execution_queue.append({"action": "OPEN", "data": item, "swap_info": swap_decision})
 
-                elif swap_decision["action"] == "SWAP_POSITIONS":
-                    close_sym = swap_decision["close_symbol"]
-                    logger.info(f"🔄 [ASSET SWAP] Chiusura {close_sym} per apertura {item['symbol']} (Delta Score: {swap_decision['delta_score']})")
-                    self.active_portfolio.pop(close_sym, None)
-                    self._register_position(item["symbol"], cio_res)
-                    execution_queue.append({"action": "SWAP", "data": item, "swap_info": swap_decision})
+                elif swap_decision["action"] == "SUPER_CONVICTION_ROTATION":
+                    logger.info(f"🔄 [SUPER CONVICTION] {item['symbol']}: {swap_decision['reason']}")
+                    execution_queue.append({"action": "ROTATE", "data": item, "swap_info": swap_decision})
 
                 else:
                     logger.info(f"⚪ [REJECTED] {item['symbol']} - {swap_decision['reason']}")

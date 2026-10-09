@@ -8,8 +8,8 @@ from typing import Dict, Any
 class HyperQuantAgent:
     """
     AGENTE #1: Hyper-Quant & Non-Linear Intelligence Engine
-    Analisi quantitativa avanzata: Z-Score, Hurst Exponent, Decomposizione Spettrale (Koopman),
-    Entropia di Trasferimento e Garanzie Conformal Prediction.
+    Analisi quantitativa avanzata: Z-Score, Hurst Exponent, GARCH(1,1), Decomposizione Spettrale (Koopman),
+    Garanzie Conformal Prediction e Curva di Traiettoria Attesa (Expected Price Path) sulla volatilità reale.
     """
     def __init__(self, confidence_level: float = 0.99):
         self.agent_id = "AGENT_01_HYPER_QUANT"
@@ -115,6 +115,43 @@ class HyperQuantAgent:
         q_upper = float(np.quantile(returns, 1 - (alpha / 2)))
         return {"lower_bound_pct": q_lower, "upper_bound_pct": q_upper}
 
+    def expected_price_path(self, close: pd.Series, garch_vol_pct: float, hurst: float, z_score: float,
+                            horizon_bars: int = 24, drift_window: int = 20) -> Dict[str, Any]:
+        """
+        Curva di Traiettoria Attesa (Expected Price Path) sulle prossime `horizon_bars` barre.
+        Drift per barra: media dei rendimenti recenti, mantenuta in regime trending (H > 0.55), attenuata
+        in random walk e invertita verso la media in regime mean-reverting (H < 0.45, proporzionale allo Z-Score).
+        Banda: ±1σ GARCH x sqrt(barre), cioè la volatilità reale prevista e non un'ampiezza fissa.
+        `point_at(bars)` di guardian usa gli stessi parametri: expected = last x (1 + drift)^bars.
+        """
+        rets = close.pct_change().dropna().values[-drift_window:]
+        last = float(close.iloc[-1])
+        sigma = max(float(garch_vol_pct) / 100.0, 1e-6)
+        drift = float(np.mean(rets)) if len(rets) else 0.0
+        if hurst > 0.55:
+            regime = "TRENDING"
+        elif hurst < 0.45:
+            regime = "MEAN_REVERTING"
+            drift = -float(np.clip(z_score, -3.0, 3.0)) * sigma * 0.25
+        else:
+            regime = "RANDOM_WALK"
+            drift *= 0.5
+        # Il drift non può superare mezzo sigma per barra: evita traiettorie esplosive da poche barre anomale
+        drift = float(np.clip(drift, -0.5 * sigma, 0.5 * sigma))
+        steps = np.arange(1, horizon_bars + 1)
+        expected = last * (1.0 + drift) ** steps
+        band = sigma * np.sqrt(steps)
+        return {
+            "anchor_price": round(last, 6),
+            "drift_pct_per_bar": round(drift * 100, 5),
+            "vol_pct_per_bar": round(sigma * 100, 5),
+            "horizon_bars": horizon_bars,
+            "regime": regime,
+            "expected_end_price": round(float(expected[-1]), 6),
+            "upper_end_price": round(float(expected[-1] * (1 + band[-1])), 6),
+            "lower_end_price": round(float(expected[-1] * (1 - band[-1])), 6),
+        }
+
     def fast_screen(self, close: pd.Series, window: int = 120) -> Dict[str, Any]:
         """
         STAGE 1 (Fast-Quant): solo Hurst, Z-Score e Volatility Spike sulle ultime `window` chiusure.
@@ -155,6 +192,7 @@ class HyperQuantAgent:
         koopman_lambda = self.koopman_spectral_stability(close_prices)
         conformal_bounds = self.conformal_prediction_bounds(close_prices)
         garch_vol = self.garch_volatility(close_prices)
+        path = self.expected_price_path(close_prices, garch_vol, hurst, z_score)
 
         # 2. Logica di Punteggio Quantitativo (0 - 100)
         base_score = 50.0
@@ -198,7 +236,8 @@ class HyperQuantAgent:
                 "garch_vol_pct": round(garch_vol, 4),
                 "conformal_stop_loss_pct": round(conformal_bounds["lower_bound_pct"], 4),
                 "conformal_target_pct": round(conformal_bounds["upper_bound_pct"], 4)
-            }
+            },
+            "expected_path": path
         }
 
 # Alias usato dall'orchestratore quant_core.py

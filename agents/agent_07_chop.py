@@ -4,7 +4,9 @@ Traccia:
 - heartbeat di ogni modulo (Scout e Agenti #1-#6);
 - latenza in millisecondi di ciascuno Stage della pipeline;
 - occupazione della asyncio.Queue degli Scout;
-- memoria (RSS) e CPU del processo.
+- memoria (RSS) e CPU del processo;
+- chiamate a Groq: timeout massimo di 2.0 secondi (guarded_llm_call). Oltre il limite la chiamata viene
+  abbandonata e l'Agente #4 usa un News Score neutro: il ciclo di trading non resta mai bloccato.
 Auto-healing:
 - Scout in timeout o silenziosi -> riavvio (ScoutSwarm.restart_scout);
 - coda oltre `backlog_limit` elementi -> più Worker per gli agenti (scale_workers).
@@ -16,9 +18,11 @@ import resource
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 STAGES = ("stage1", "stage2", "stage3")
+GROQ_TIMEOUT_S = 2.0
 
 
 def _rss_mb() -> float:
@@ -36,7 +40,7 @@ def _rss_mb() -> float:
 class ChopWatchdog:
     def __init__(self, backlog_limit: int = 50, audit_interval: float = 30.0, scout_silence_s: float = 600.0,
                  module_silence_s: float = 900.0, max_workers: int = 16, scale_step: int = 2,
-                 scale_cooldown_s: float = 5.0):
+                 scale_cooldown_s: float = 5.0, llm_timeout_s: float = GROQ_TIMEOUT_S):
         self.agent_id = "AGENT_07_CHOP_WATCHDOG"
         self.backlog_limit = backlog_limit
         self.audit_interval = audit_interval
@@ -57,6 +61,34 @@ class ChopWatchdog:
         self._last_audit = 0.0
         self.universe: Dict[str, Any] = {}   # copertura dell'universo dinamico (impostata dallo sciame)
         self._cpu_mark = (time.process_time(), time.time())
+        self.llm_timeout_s = llm_timeout_s
+        self.llm_stats = {"calls": 0, "ok": 0, "timeouts": 0, "errors": 0}
+        self.llm_ms: Deque[float] = deque(maxlen=200)
+        self._llm_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="groq-guard")
+
+    # ------------------------------------------------------------------ Groq: timeout massimo 2.0 s
+    def guarded_llm_call(self, fn: Callable[..., Any], *args, **kwargs) -> Optional[Any]:
+        """Esegue fn con un limite di llm_timeout_s secondi: None su timeout o eccezione (registrati)."""
+        with self._lock:
+            self.llm_stats["calls"] += 1
+        started = time.perf_counter()
+        future = self._llm_pool.submit(fn, *args, **kwargs)
+        try:
+            result = future.result(timeout=self.llm_timeout_s)
+        except FutureTimeout:
+            future.cancel()
+            with self._lock:
+                self.llm_stats["timeouts"] += 1
+            self.record_heal(f"Groq oltre {self.llm_timeout_s:.1f}s: News Score neutro")
+            return None
+        except Exception:
+            with self._lock:
+                self.llm_stats["errors"] += 1
+            return None
+        with self._lock:
+            self.llm_stats["ok"] += 1
+            self.llm_ms.append((time.perf_counter() - started) * 1000)
+        return result
 
     # ------------------------------------------------------------------ telemetria
     def heartbeat(self, module: str) -> None:
@@ -143,6 +175,7 @@ class ChopWatchdog:
                 "latency_ms": lat, "workers": engine.num_workers if engine else None,
                 "stage_counts": dict(self.stage_counts), "stale_modules": stale, "agents_last_seen_s": agents_seen,
                 "heals": list(self.heals)[-5:],
+                "llm": {**self.llm_stats, "avg_ms": self._avg(self.llm_ms), "timeout_s": self.llm_timeout_s},
             }
             self.queue_peak = self.queue_now
         snap["ram_mb"] = round(_rss_mb(), 1)
@@ -163,6 +196,10 @@ class ChopWatchdog:
         if u:
             line += (f" | 🌐 Universo {u['total']} ticker ({u['stocks']} USA · {u['crypto']} crypto) · "
                      f"blocco {u['chunk']}/{u['chunks']} · giri completi {u['cycles']}")
+        llm = snap.get("llm") or {}
+        if llm.get("calls"):
+            line += (f" | Groq {llm['ok']}/{llm['calls']} ok · timeout {llm['timeouts']} (limite {llm['timeout_s']:.1f}s)"
+                     + (f" · {llm['avg_ms']:.0f}ms medi" if llm.get("avg_ms") is not None else ""))
         if snap["stale_modules"]:
             line += f" | ⚠️ senza heartbeat: {', '.join(snap['stale_modules'])}"
         if snap["heals"]:

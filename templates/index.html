@@ -448,27 +448,59 @@
                             <th class="font-medium px-4 py-2.5 text-right">%</th>
                         </tr>
                     </thead>
-                    <tbody class="divide-y divide-slate-800/70 num">
-                        <template x-if="!positions.length">
-                            <tr><td colspan="10" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
-                        </template>
-                        <template x-for="p in positions" :key="p.symbol">
+                    <tbody class="num" x-show="!positions.length">
+                        <tr><td colspan="10" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
+                    </tbody>
+                    <template x-for="p in positions" :key="p.symbol">
+                        <tbody class="num border-b border-slate-800/70">
                             <tr class="hover:bg-slate-800/30 cursor-pointer" @click="openPosition(p)" title="Apri la scheda della posizione">
-                                <td class="px-4 py-2.5 text-slate-100" x-text="p.symbol"></td>
+                                <td class="px-4 py-2.5 text-slate-100">
+                                    <span x-text="p.symbol"></span>
+                                    <span x-show="p.trade_class === 'SUPER_CONVICTION'" class="ml-1 text-[10px] font-sans px-1 rounded bg-amber-500/15 text-amber-300">SUPER</span>
+                                    <span x-show="p.horizon" class="ml-1 text-[10px] font-sans text-slate-500" x-text="p.horizon === 'SWING_CATALYST' ? 'swing' : 'intraday'"></span>
+                                    <span x-show="p.scaled_out" class="ml-1 text-[10px] font-sans text-emerald-400">runner</span>
+                                </td>
                                 <td class="px-4 py-2.5 text-right text-slate-300" x-text="qty(p.qty)"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.conviction ?? '—'"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.stop_pct != null ? p.stop_pct + '%' : '—'"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-400" x-text="usd(p.avg_entry_price)"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.current_price)"></td>
                                 <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.market_value)"></td>
                                 <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></td>
                                 <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></td>
                             </tr>
-                        </template>
-                    </tbody>
+                            <tr class="font-sans">
+                                <td colspan="10" class="px-4 pb-2.5 pt-0">
+                                    <dl class="grid grid-cols-1 lg:grid-cols-3 gap-x-4 gap-y-1 text-[11px] leading-snug">
+                                        <div class="min-w-0"><dt class="inline text-sky-400">buy_thesis · </dt><dd class="inline text-slate-300" x-text="p.buy_thesis || '—'"></dd></div>
+                                        <div class="min-w-0"><dt class="inline text-amber-300">hold_rationale · </dt><dd class="inline text-slate-300" x-text="p.hold_rationale || '—'"></dd></div>
+                                        <div class="min-w-0"><dt class="inline text-rose-300">exit_reason · </dt><dd class="inline text-slate-300" x-text="p.exit_reason || 'nessuna uscita (posizione intera)'"></dd></div>
+                                    </dl>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </template>
                 </table>
             </div>
+        </section>
+
+        <!-- ============ ULTIME CHIUSURE (exit_reason del Guardian) ============ -->
+        <section class="border border-slate-800 rounded-lg bg-slate-900/40" x-show="closedPositions.length">
+            <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Ultime chiusure</h2>
+                <span class="text-[11px] text-slate-500 num" x-text="closedPositions.length + ' recenti'"></span>
+            </div>
+            <ul class="divide-y divide-slate-800/70 text-[11px]">
+                <template x-for="c in closedPositions" :key="c.symbol + c.closed_at">
+                    <li class="px-4 py-2 space-y-0.5">
+                        <div class="flex items-center gap-2"><span class="text-slate-100 num" x-text="c.symbol"></span>
+                            <span class="text-slate-500 num" x-text="dateTime(c.closed_at)"></span></div>
+                        <div><span class="text-rose-300">exit_reason · </span><span class="text-slate-300" x-text="c.exit_reason"></span></div>
+                        <div x-show="c.buy_thesis"><span class="text-sky-400">buy_thesis · </span><span class="text-slate-400" x-text="c.buy_thesis"></span></div>
+                    </li>
+                </template>
+            </ul>
         </section>
 
         <!-- ============ LOG DI SISTEMA (chiusi di default) ============ -->
@@ -607,13 +639,22 @@
                             <div class="border border-slate-800 rounded p-3">
                                 <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Stop Loss</div>
                                 <div class="text-rose-300" x-text="price(posDetail.stop_loss.price) + ' (' + posDetail.stop_loss.pct + '%)'"></div>
-                                <div class="text-[11px] text-slate-500 font-sans" x-text="posDetail.stop_loss.source"></div>
+                                <div class="text-[11px] text-slate-500 font-sans" x-text="posDetail.stop_loss.source + (posDetail.stop_loss.effective_pct != null && posDetail.stop_loss.effective_pct !== posDetail.stop_loss.pct ? ' · stop effettivo del Guardian ' + posDetail.stop_loss.effective_pct + '%' : '')"></div>
                             </div>
                             <div class="border border-slate-800 rounded p-3">
-                                <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Take Profit</div>
+                                <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Target 1 (2R)</div>
                                 <div class="text-emerald-300" x-text="posDetail.take_profit.price ? price(posDetail.take_profit.price) + (posDetail.take_profit.pct != null ? ' (+' + posDetail.take_profit.pct + '%)' : '') : '—'"></div>
-                                <div class="text-[11px] text-slate-500 font-sans">target del Comitato Rischi / Agente #3</div>
+                                <div class="text-[11px] text-slate-500 font-sans" x-text="posDetail.take_profit.label || 'target del Comitato Rischi / Agente #3'"></div>
                             </div>
+                        </div>
+
+                        <div class="space-y-1.5" x-show="posDetail.guardian">
+                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Schede del Guardian
+                                <span class="normal-case tracking-normal text-slate-600" x-text="[posDetail.guardian?.trade_class, posDetail.guardian?.horizon].filter(Boolean).join(' · ')"></span></div>
+                            <div><span class="text-sky-400">buy_thesis · </span><span class="text-slate-300" x-text="posDetail.guardian?.buy_thesis || '—'"></span></div>
+                            <div><span class="text-amber-300">hold_rationale · </span><span class="text-slate-300" x-text="posDetail.guardian?.hold_rationale || '—'"></span>
+                                <span class="text-slate-600 num" x-show="posDetail.guardian?.hold_updated_at" x-text="'(' + dateTime(posDetail.guardian?.hold_updated_at) + ')'"></span></div>
+                            <div><span class="text-rose-300">exit_reason · </span><span class="text-slate-300" x-text="posDetail.guardian?.exit_reason || 'nessuna uscita (posizione intera)'"></span></div>
                         </div>
 
                         <div>
@@ -712,7 +753,7 @@
         function dashboard() {
             return {
                 connected: true,
-                account: {}, positions: [], bot: { logs: [] },
+                account: {}, positions: [], closedPositions: [], bot: { logs: [] },
                 radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
                 settings: { watchlist: [] }, envLocked: {},
                 showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
@@ -725,8 +766,8 @@
                 numberFields: [
                     { key: 'stop_loss_pct', label: 'Stop di riserva % (se manca ATR)', step: 0.5, min: -50, max: -0.5 },
                     { key: 'scan_interval_min', label: 'Intervallo di scansione (min)', step: 1, min: 1, max: 1440 },
-                    { key: 'max_allocation_pct', label: 'Soffitto per operazione % (il CIO decide 5-35%)', step: 0.5, min: 0.5, max: 100 },
-                    { key: 'max_exposure_pct', label: 'Esposizione massima %', step: 5, min: 10, max: 400 },
+                    { key: 'max_allocation_pct', label: 'Soffitto per operazione % (8-25%, fino a 50% solo SUPER_CONVICTION)', step: 0.5, min: 0.5, max: 100 },
+                    { key: 'max_exposure_pct', label: 'Esposizione massima % (tetto Safety Net 40)', step: 5, min: 10, max: 40 },
                 ],
 
                 init() {
@@ -864,6 +905,7 @@
                         const data = await res.json();
                         this.account = data.account || {};
                         this.positions = Array.isArray(data.positions) ? data.positions : [];
+                        this.closedPositions = Array.isArray(data.closed_positions) ? data.closed_positions : [];
                         this.bot = data.bot || { logs: [] };
                         this.radar = data.radar || {};
                         this.channels = this.radar.channels || {};
