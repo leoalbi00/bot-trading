@@ -119,7 +119,7 @@ DEFAULT_CONFIG = {
     ],
     "base_allocation_pct": 5.0,    # minimo della banda più bassa (compatibilità)
     "max_allocation_pct": 50.0,   # soffitto di sicurezza: 50% solo per SUPER_CONVICTION (Ensemble >= 90)
-    "max_exposure_pct": 40.0,     # Risk Safety Net: mai oltre il 40% del capitale (tetto anche se configurato più alto)
+    "max_exposure_pct": 50.0,     # Risk Safety Net: mai oltre il 50% del capitale (tetto anche se configurato più alto)
     "stop_loss_pct": -5.0,
     "scan_interval_min": 15,
     "auto_execute_trades": True,
@@ -989,7 +989,7 @@ def allocation_pct_for_score(score, cfg):
 
 
 def max_exposure_pct(cfg):
-    """Esposizione massima effettiva: quella configurata, mai oltre la Safety Net dell'Agente #3 (40%)."""
+    """Esposizione massima effettiva: quella configurata, mai oltre la Safety Net dell'Agente #3 (50%)."""
     return min(float(cfg["max_exposure_pct"]), RISK_MAX_EXPOSURE_PCT)
 
 
@@ -999,7 +999,7 @@ def buy_budget(account, exposure, cfg, crypto=False, score=None, pct=None, facto
     - L'ordine è una percentuale del CAPITALE (equity) che cresce con lo score
       (vedi allocation_pct_for_score), non del buying power a margine.
     - L'esposizione totale (valore delle posizioni + nuovi ordini) non supera max_exposure_pct
-      del capitale, con tetto fisso al 40% (Risk Safety Net): il bot non usa mai il margine.
+      del capitale, con tetto fisso al 50% (Risk Safety Net): il bot non usa mai il margine.
     """
     try:
         equity = max(0.0, float(account.get("portfolio", account.get("equity", 0)) or 0))
@@ -3015,7 +3015,7 @@ def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_ke
     """Applica Safety Net, bande di convinzione e Rotazione Intelligente alla decisione del CIO.
 
     - Nessun SELL discrezionale: le uscite sono solo quelle del Guardian (stop, Target 2R, trailing, uscite anticipate).
-    - Massimo 4 posizioni ed esposizione totale 40% (Agente #3); nessuna nuova crypto tra le 22:00 e le 08:00 CET.
+    - Massimo 4 posizioni ed esposizione totale 50% (Agente #3); nessuna nuova crypto tra le 22:00 e le 08:00 CET.
     - Liquidità insufficiente: solo un SUPER_CONVICTION (Ensemble >= 90) può ruotare capitale, e SOLO da posizioni
       con tesi degradata (holdings[i]["degraded"]); con tesi intatte la taglia si riduce alla cassa rimanente.
     Restituisce la decisione esecutiva con: buy_amount, allocation_pct effettiva, sell_pct, stop, note.

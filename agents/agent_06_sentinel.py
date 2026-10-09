@@ -2,7 +2,7 @@
 
 Due funzioni:
 1. pre_trade_check (Stage 3): un nuovo ingresso è ammesso solo se il ticker non è già in portafoglio
-   o con ordini pendenti (esposizione 40% e 4 posizioni sono la Safety Net dell'Agente #3).
+   o con ordini pendenti (esposizione 50% e 4 posizioni sono la Safety Net dell'Agente #3).
 2. evaluate_position (monitoraggio continuo). NESSUN TIME-STOP: una posizione piatta, in consolidamento
    o in accumulo resta aperta finché la tesi è valida. Il tempo trascorso non chiude mai una posizione.
    - Hard Stop Loss (1.5%-2.5%, Agente #3): sempre attivo;

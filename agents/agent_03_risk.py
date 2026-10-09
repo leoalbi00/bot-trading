@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 
 # Risk Safety Net (non negoziabile)
-MAX_EXPOSURE_PCT = 40.0            # esposizione totale massima del portafoglio, % del capitale
+MAX_EXPOSURE_PCT = 50.0            # esposizione totale massima del portafoglio, % del capitale (50%: un
+                                   # SUPER_CONVICTION può usare tutta la taglia autorizzata)
 MAX_POSITIONS = 4                  # posizioni aperte contemporaneamente
 HARD_STOP_MIN_PCT = 1.5            # hard stop loss tra 1.5% ...
 HARD_STOP_MAX_PCT = 2.5            # ... e 2.5% dal prezzo d'ingresso
@@ -42,7 +43,7 @@ class InstitutionalRiskAgent:
     """
     AGENTE #3: Comitato Rischi (Risk Safety Net)
     - Hard Stop Loss non negoziabile: 1.5 x ATR nella fascia 1.5%-2.5%, target 1 a 2R
-    - Esposizione totale massima 40% del capitale, massimo 4 posizioni simultanee
+    - Esposizione totale massima 50% del capitale, massimo 4 posizioni simultanee
     - Blocco crypto overnight (22:00-08:00 CET): nessuna nuova apertura
     - Sizing a rischio fisso, taglia massima 25% (50% solo per SUPER_CONVICTION, autorizzata qui)
     - Expected Shortfall (CVaR 99%), Beta vs Benchmark, Circuit Breaker sul drawdown giornaliero
@@ -178,7 +179,7 @@ class InstitutionalRiskAgent:
     ) -> Dict[str, Any]:
         """
         Pipeline Esecutiva completa dell'Agente #3.
-        portfolio: {"exposure_pct", "positions"} per i limiti di esposizione (40%) e posizioni (4).
+        portfolio: {"exposure_pct", "positions"} per i limiti di esposizione (50%) e posizioni (4).
         """
         net = self.safety_net(is_crypto, portfolio, now)
         if df.empty or len(df) < 15 or account_balance <= 0:
