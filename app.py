@@ -19,6 +19,7 @@ KEEP_ALIVE_INTERVAL = 600  # secondi tra un self-ping e l'altro
 # Protezione login: dopo MAX_LOGIN_ATTEMPTS errori l'IP viene bloccato per LOGIN_LOCKOUT secondi
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCKOUT = 300
+MANUAL_SELL_LOCK_TIMEOUT = 15  # secondi di attesa del lock di CIO/Guardian per le vendite manuali (PANIC, Vendi subito)
 DATA_CACHE_TTL = 2  # secondi: la dashboard interroga ogni secondo, Alpaca al massimo ogni 2 secondi
 
 # Lock per impedire scansioni multiple simultanee
@@ -92,6 +93,12 @@ def get_account_summary():
         return {"cash": 0, "portfolio": 0, "buying_power": 0, "non_marginable_buying_power": 0}
 
 def get_open_positions():
+    """Posizioni aperte; [] se Alpaca non risponde (usare fetch_open_positions per distinguere l'errore)."""
+    positions = fetch_open_positions()
+    return positions if positions is not None else []
+
+def fetch_open_positions():
+    """Posizioni aperte, oppure None se Alpaca non risponde (stato sconosciuto, diverso da "nessuna posizione")."""
     if not alpaca_client:
         return []
     try:
@@ -114,7 +121,7 @@ def get_open_positions():
         return res
     except Exception as e:
         log_message(f"Errore recupero posizioni: {e}")
-        return []
+        return None
 
 def has_valid_token():
     provided = request.headers.get("X-API-Key", "")
@@ -208,15 +215,19 @@ def execute_sell(pos, label, reason, auto_trade, pending, market_open, pct=100, 
         return None
     try:
         order = core.close_position_pct(sym, pct)
-        pending.add(core.normalize_symbol(sym))
-        note = "" if market_open or pos["is_crypto"] else " (mercato chiuso: eseguito all'apertura)"
-        log_message(f"🚨 [Execution Desk] VENDITA{part} ({label}) INVIATA: {sym} (ID: {order.id}){note}")
-        core.agent_say("Execution Desk", f"SELL{part} {sym} ({label}) inviato ad Alpaca", "veto")
-        record_sell(pos, operation, order, pct=pct, reason=f"{label}: {reason}", action=action, stop_price=stop_price)
-        return order
     except Exception as e:
         log_message(f"Errore Vendita {sym}: {e}")
         return None
+    # Da qui l'ordine è già su Alpaca: un errore del registro non deve farlo risultare fallito
+    pending.add(core.normalize_symbol(sym))
+    note = "" if market_open or pos["is_crypto"] else " (mercato chiuso: eseguito all'apertura)"
+    log_message(f"🚨 [Execution Desk] VENDITA{part} ({label}) INVIATA: {sym} (ID: {order.id}){note}")
+    try:
+        core.agent_say("Execution Desk", f"SELL{part} {sym} ({label}) inviato ad Alpaca", "veto")
+        record_sell(pos, operation, order, pct=pct, reason=f"{label}: {reason}", action=action, stop_price=stop_price)
+    except Exception as e:
+        log_message(f"[!] Vendita {sym} inviata (ID: {order.id}) ma registro non aggiornato: {type(e).__name__}: {e}")
+    return order
 
 def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=None, allocation_pct=None, conviction=None,
                 operation="BUY", rationale=None, price=None):
@@ -228,8 +239,13 @@ def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=Non
         return None
     try:
         order = core.submit_notional_buy(sym, amount, stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction)
-        pending.add(core.normalize_symbol(sym))
-        log_message(f"✅ [Execution Desk] {label} INVIATO: ${amount:,.2f} di {sym} (stop {stop_pct}%, ID: {order.id})")
+    except Exception as e:
+        log_message(f"Errore Ordine Acquisto {sym}: {e}")
+        return None
+    # Da qui l'ordine è già su Alpaca: un errore di scheda/journal non deve farlo risultare fallito
+    pending.add(core.normalize_symbol(sym))
+    log_message(f"✅ [Execution Desk] {label} INVIATO: ${amount:,.2f} di {sym} (stop {stop_pct}%, ID: {order.id})")
+    try:
         core.agent_say("Execution Desk", f"BUY {sym} ${amount:,.2f} inviato ad Alpaca (stop {stop_pct}%)", "ok")
         q = (rationale or {}).get("agents") or core.quant_rationale(sym)
         thesis = core.buy_thesis_for(sym, price, q)
@@ -239,10 +255,9 @@ def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=Non
         log_message(f"📄 [Scheda di ingresso] {thesis}")
         core.record_execution(sym, operation, "BUY", price=price, quantity=amount / price if price else None, notional=amount,
                               rationale=rationale, order_id=order.id, note=label, log=log_message)
-        return order
     except Exception as e:
-        log_message(f"Errore Ordine Acquisto {sym}: {e}")
-        return None
+        log_message(f"[!] Acquisto {sym} inviato (ID: {order.id}) ma scheda/registro non aggiornati: {type(e).__name__}: {e}")
+    return order
 
 def rotate_capital(pos, sell_pct, target, amount, cfg, auto_trade, pending, stop_pct=None, allocation_pct=None, conviction=None,
                    rationale=None, price=None):
@@ -427,15 +442,13 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                                         label=f"ACQUISTO CIO {final['allocation_pct']}%",
                                         stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
                                         conviction=final["conviction_score"], rationale=entry_rationale, price=entry_price))
-        elif orders_allowed and final["action"] in ("ROTATE", "SELL"):
+        elif orders_allowed and final["action"] == "ROTATE":
+            # validate_desk_decision non restituisce mai SELL: le uscite sono solo quelle del Guardian
             pos = next(p for p in positions if core.normalize_symbol(p["yf_symbol"]) == core.normalize_symbol(final["sell_symbol"]))
-            if final["action"] == "SELL":
-                log_message(f"💼 [CIO] SELL discrezionale di {pos['symbol']} ignorato: uscite solo dal Guardian.")
-            else:
-                rotate_capital(pos, final["sell_pct"], final["buy_symbol"], final["buy_amount"], cfg, auto_trade, pending,
-                               stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
-                               conviction=final["conviction_score"], rationale=entry_rationale, price=entry_price)
-                executed = auto_trade
+            rotate_capital(pos, final["sell_pct"], final["buy_symbol"], final["buy_amount"], cfg, auto_trade, pending,
+                           stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
+                           conviction=final["conviction_score"], rationale=entry_rationale, price=entry_price)
+            executed = auto_trade
         if inbox:
             core.record_cio_outcome(final.get("buy_symbol") or None, executed, describe_decision(final),
                                     details={**((entry_rationale or {}).get("desk_cio") or {}),
@@ -565,13 +578,16 @@ _guardian_state = {"stops": {}, "advised": set(), "refresh": 0.0}
 
 def guardian_tick():
     """Un giro dell'Agente #6: stop effettivo di ogni posizione e uscite eseguite subito, senza attendere il CIO."""
-    positions = get_open_positions()
+    positions = fetch_open_positions()
+    if positions is None:
+        return                      # Alpaca non risponde: nessuna archiviazione né uscita su dati incerti
     live = {core.normalize_symbol(p["symbol"]) for p in positions}
     _guardian_state["stops"] = {k: v for k, v in _guardian_state["stops"].items() if k in live}
     _guardian_state["advised"] = {k for k in _guardian_state["advised"] if k[0] in live}
+    # Lettura riuscita (anche vuota): le posizioni chiuse, compresa l'ultima, passano tra le chiusure recenti
+    core.guardian_prune(live)
     if not positions:
         return
-    core.guardian_prune(live)       # solo con posizioni lette: una lista vuota può essere un errore di Alpaca
     cfg = core.get_config()
     market_open = core.is_market_open(log=lambda m: None)
     held_yf = [p["yf_symbol"] for p in positions]
@@ -899,21 +915,31 @@ def api_position_close(symbol):
     """🔴 VENDI SUBITO: chiusura manuale immediata di una singola posizione."""
     if not alpaca_client:
         return jsonify({"status": "error", "message": "Credenziali Alpaca non configurate."}), 503
-    pos = _find_position(symbol)
-    if not pos:
-        return jsonify({"status": "error", "message": f"Nessuna posizione aperta su {symbol}"}), 404
+    # Stesso lock del CIO e del Guardian: mai due vendite della stessa posizione in parallelo.
+    # Attesa breve (non non-bloccante): l'utente ha chiesto di vendere subito.
+    if not scan_lock.acquire(timeout=MANUAL_SELL_LOCK_TIMEOUT):
+        return jsonify({"status": "warning", "message": "Ciclo del CIO o del Guardian in corso: riprova tra qualche secondo."}), 409
     try:
-        _cancel_open_orders(pos["symbol"])
-    except Exception as e:
-        log_message(f"Errore annullamento ordini aperti di {pos['symbol']}: {e}")
-    try:
-        order = core.close_position(pos["symbol"])
-    except Exception as e:
-        log_message(f"Errore vendita manuale {pos['symbol']}: {e}")
-        return jsonify({"status": "error", "message": f"Vendita di {pos['symbol']} non riuscita: {e}"}), 502
-    log_message(f"🔴 VENDI SUBITO dalla dashboard: {pos['qty']} x {pos['symbol']} (ID: {getattr(order, 'id', '?')})")
-    core.agent_say("Execution Desk", f"SELL 100% {pos['symbol']} (manuale, dashboard) inviato ad Alpaca", "veto")
-    record_sell(pos, "MANUAL SELL", order, reason="Vendi subito (dashboard)", source="manual", action="MANUAL")
+        pos = _find_position(symbol)    # riletta sotto lock: il Guardian potrebbe averla appena chiusa
+        if not pos:
+            return jsonify({"status": "error", "message": f"Nessuna posizione aperta su {symbol}"}), 404
+        try:
+            _cancel_open_orders(pos["symbol"])
+        except Exception as e:
+            log_message(f"Errore annullamento ordini aperti di {pos['symbol']}: {e}")
+        try:
+            order = core.close_position(pos["symbol"])
+        except Exception as e:
+            log_message(f"Errore vendita manuale {pos['symbol']}: {e}")
+            return jsonify({"status": "error", "message": f"Vendita di {pos['symbol']} non riuscita: {e}"}), 502
+        log_message(f"🔴 VENDI SUBITO dalla dashboard: {pos['qty']} x {pos['symbol']} (ID: {getattr(order, 'id', '?')})")
+        try:
+            core.agent_say("Execution Desk", f"SELL 100% {pos['symbol']} (manuale, dashboard) inviato ad Alpaca", "veto")
+            record_sell(pos, "MANUAL SELL", order, reason="Vendi subito (dashboard)", source="manual", action="MANUAL")
+        except Exception as e:
+            log_message(f"[!] Vendita {pos['symbol']} inviata ma registro non aggiornato: {type(e).__name__}: {e}")
+    finally:
+        scan_lock.release()
     with _cache_lock:
         _cache.clear()
     return jsonify({"status": "success", "message": f"Vendita di {pos['symbol']} inviata."})
@@ -1165,27 +1191,41 @@ def api_liquidate():
         bot_state["status"] = "In pausa (PANIC)"
     log_message("🚨 PANIC - CHIUDI TUTTO dalla dashboard: bot in pausa, annullo gli ordini e chiudo tutte le posizioni.")
     core.agent_say("Execution Desk", "🚨 PANIC: bot in pausa, chiusura di tutte le posizioni", "veto")
-    positions = get_open_positions()
-    if not positions:
-        return jsonify({"status": "warning", "message": "Nessuna posizione aperta da liquidare. Bot in pausa."})
-
-    # Annulla gli ordini aperti: altrimenti le quote sono bloccate e la vendita fallisce
+    # Stesso lock del CIO e del Guardian: il bot è già in pausa, si attende la fine di un'eventuale vendita in corso
+    if not scan_lock.acquire(timeout=MANUAL_SELL_LOCK_TIMEOUT):
+        return jsonify({"status": "warning", "message": "Bot in pausa, ma un ciclo del CIO/Guardian è ancora in corso: "
+                                                        "ripeti PANIC tra qualche secondo per chiudere le posizioni."}), 409
     try:
-        alpaca_client.cancel_orders()
-    except Exception as e:
-        log_message(f"Errore annullamento ordini aperti: {e}")
+        positions = fetch_open_positions()
+        if positions is None:
+            return jsonify({"status": "error", "message": "Posizioni non leggibili da Alpaca: riprova. Bot in pausa."}), 503
+        if not positions:
+            return jsonify({"status": "warning", "message": "Nessuna posizione aperta da liquidare. Bot in pausa."})
 
-    count = 0
-    for pos in positions:
-        sym = pos["symbol"]
-        qty = pos["qty"]
+        # Annulla gli ordini aperti: altrimenti le quote sono bloccate e la vendita fallisce
         try:
-            order = core.close_position(sym)
-            log_message(f"🚨 LIQUIDAZIONE MANUALE: Vendita {qty} x {sym}")
-            record_sell(pos, "PANIC SELL", order, reason="🚨 PANIC - CHIUDI TUTTO (dashboard)", source="manual", action="PANIC")
-            count += 1
+            alpaca_client.cancel_orders()
         except Exception as e:
-            log_message(f"Errore vendita manuale {sym}: {e}")
+            log_message(f"Errore annullamento ordini aperti: {e}")
+
+        count = 0
+        for pos in positions:
+            sym = pos["symbol"]
+            qty = pos["qty"]
+            try:
+                order = core.close_position(sym)
+            except Exception as e:
+                log_message(f"Errore vendita manuale {sym}: {e}")
+                continue
+            count += 1
+            log_message(f"🚨 LIQUIDAZIONE MANUALE: Vendita {qty} x {sym}")
+            try:
+                record_sell(pos, "PANIC SELL", order, reason="🚨 PANIC - CHIUDI TUTTO (dashboard)", source="manual",
+                            action="PANIC")
+            except Exception as e:
+                log_message(f"[!] Vendita {sym} inviata ma registro non aggiornato: {type(e).__name__}: {e}")
+    finally:
+        scan_lock.release()
 
     with _cache_lock:
         _cache.clear()

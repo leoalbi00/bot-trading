@@ -8,6 +8,7 @@ import os
 import re
 import datetime as dt
 from zoneinfo import ZoneInfo
+import copy
 import json
 import math
 import secrets
@@ -82,7 +83,7 @@ HTTP_TIMEOUT = 10
 SCORE_BUY = 75                 # > 75: candidato BUY
 STRONG_BUY_SCORE = 85          # >= 85: STRONG BUY, allocazione maggiorata (25-30%)
 SCORE_SELL = 45                # < 45: candidato SELL / debolezza
-MAX_RISK_PER_TRADE_PCT = 2.0   # perdita massima allo stop per operazione, in % del capitale (sizing vs stop)
+# MAX_RISK_PER_TRADE_PCT (2%) e il limite di drawdown giornaliero (5%) vengono dall'Agente #3: un'unica fonte
 
 # ---------------------------------------------------------------------------
 # Configurazione dinamica (config.json)
@@ -493,11 +494,6 @@ def _no_ai_keys(log):
     return "quant"
 
 
-def query_ai(prompt, log=print, symbol=None):
-    """Come query_ai_with_source, ma restituisce solo il testo della decisione."""
-    return query_ai_with_source(prompt, log=log, symbol=symbol)[0]
-
-
 def query_ai_with_source(prompt, log=print, symbol=None):
     """Restituisce (testo, motore) dove motore indica chi ha deciso (es. "Groq openai/gpt-oss-120b").
 
@@ -568,8 +564,8 @@ _groq_client = None
 
 from agents.agent_07_chop import GROQ_TIMEOUT_S
 from agents.agent_03_risk import (MAX_EXPOSURE_PCT as RISK_MAX_EXPOSURE_PCT, MAX_POSITIONS as RISK_MAX_POSITIONS,
-                                  HARD_STOP_ATR_MULT, HARD_STOP_MAX_PCT, HARD_STOP_MIN_PCT,
-                                  clamp_stop_pct, crypto_night_blocked, hard_stop_pct)
+                                  HARD_STOP_ATR_MULT, HARD_STOP_MAX_PCT, HARD_STOP_MIN_PCT, MAX_DAILY_DRAWDOWN_PCT,
+                                  MAX_RISK_PER_TRADE_PCT, clamp_stop_pct, crypto_night_blocked, hard_stop_pct)
 
 
 def groq_news_llm(system, prompt):
@@ -594,11 +590,6 @@ def groq_news_llm(system, prompt):
         except Exception as e:
             _warn_throttled("groq-news", f"⚠️ [Agente #4] Groq news non disponibile: {str(e)[:160]}", print, every=600)
     return None
-
-
-def query_groq_ai(prompt, log=print):
-    """Interroga Groq (Llama 3.3 70B). In caso di errore la decisione diventa HOLD."""
-    return _ask_groq(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Groq"
 
 
 _unavailable_groq_models = set()
@@ -663,11 +654,6 @@ def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024)
 
 # Modelli che hanno restituito 404 / deprecato: non vengono più riprovati
 _unavailable_gemini_models = set()
-
-
-def query_gemini_ai(prompt, log=print):
-    """Interroga Gemini provando i modelli configurati. In caso di errore la decisione diventa HOLD."""
-    return _ask_gemini(prompt, log) or "DECISIONE: HOLD | MOTIVO: Risposta fallback per errore API Gemini"
 
 
 def _ask_gemini(prompt, log, system=None, validate=_has_decision):
@@ -893,12 +879,6 @@ def wait_for_fill(order_id, timeout=20, log=print):
             log(f"Errore controllo ordine {order_id}: {e}")
         time.sleep(2)
     return None
-
-
-def get_rsi_and_price(yf_symbol):
-    """Restituisce (rsi, prezzo) su candele 1h dell'ultimo mese, oppure (None, None)."""
-    ind = get_indicators(yf_symbol)
-    return (ind["rsi"], ind["price"]) if ind else (None, None)
 
 
 def quant_rule(rsi, price, sma20):
@@ -1155,15 +1135,13 @@ def _clean_score(value):
 
 
 # ===========================================================================
-# VIRTUAL BOARDROOM: 8 agenti quantitativi
-#   1 Market Analyst        -> market_analyst (RSI, MACD, SMA20/50, ROC, Score di Forza)
-#   2 Sentiment Intelligence-> sentiment_agent (veto BUY se sentiment < -40)
-#   3 Volatility Manager    -> volatility_agent (ATR giornaliero, stop dinamico, trailing stop)
-#   4 Macro Regime Analyst  -> macro_regime (SPY / BTC sotto SMA50 -> budget -50%)
-#   5 Volume & Liquidity    -> volume_agent (vol_ratio < 0.8 con prezzo in salita = falso breakout)
-#   6 Drawdown Controller   -> drawdown_controller (perdita giornaliera > 5% -> stop acquisti 24h)
-#   7 Post-Trade Auditor    -> post_trade_auditor (trade_history.json, win rate per ticker)
-#   8 CIO del desk          -> build_desk_cio_prompt + ask_desk_cio / quant_desk_cio, validate_desk_decision
+# FUNZIONI DEL DESK SULLE POSIZIONI
+#   Market Analyst        -> market_analyst (RSI, MACD, SMA20/50, ROC, Score di Forza delle posizioni)
+#   Sentiment titoli      -> sentiment_score (veto BUY del Comitato Rischi se sentiment < -40)
+#   Volatility / Guardian -> volatility_agent, guardian_watch (ATR giornaliero, hard stop, Target 2R, trailing)
+#   Drawdown Controller   -> drawdown_controller / current_drawdown (perdita giornaliera oltre 5% -> stop acquisti 24h)
+#   Post-Trade Auditor    -> sync_ledger, win_rates (storico Alpaca, win rate per ticker)
+#   CIO del desk          -> build_desk_cio_prompt + ask_desk_cio / quant_desk_cio, validate_desk_decision
 # ===========================================================================
 DATA_DIR = os.getenv("BOT_DATA_DIR", os.path.dirname(CONFIG_PATH))
 TRADE_HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.json")
@@ -1174,9 +1152,7 @@ ATR_MULT_STOCK = 1.5            # Chandelier Exit del runner: distanza dal picco
 ATR_MULT_CRYPTO = 2.0
 STOP_TIGHTEST_PCT = -HARD_STOP_MIN_PCT   # Hard Stop Loss non negoziabile (Agente #3): tra -1.2% ...
 STOP_WIDEST_PCT = -HARD_STOP_MAX_PCT     # ... e -3.5% (1.5 x ATR%)
-MACRO_RISK_OFF_FACTOR = 0.5
-VOLUME_LOW_RATIO = 0.8
-DAILY_DRAWDOWN_LIMIT = -5.0
+DAILY_DRAWDOWN_LIMIT = -MAX_DAILY_DRAWDOWN_PCT   # -5%: stesso limite del circuit breaker dell'Agente #3
 DRAWDOWN_BLOCK_HOURS = 24
 AUDIT_MIN_TRADES = 3
 AUDIT_LOW_WINRATE = 30.0
@@ -1226,7 +1202,7 @@ def save_state(state):
     write_json_file(BOARDROOM_STATE_PATH, state)
 
 
-# ---------------- Agente 2: Sentiment Intelligence ----------------
+# ---------------- Sentiment dei titoli (Comitato Rischi) ----------------
 _POSITIVE_STEMS = (
     "beat", "surge", "soar", "rall", "upgrad", "record", "growth", "gain", "bullish", "outperform", "raise",
     "strong", "jump", "rise", "rising", "profit", "boost", "expan", "partnership", "approv", "breakthrough",
@@ -1256,21 +1232,7 @@ def sentiment_score(text):
     return int(round((pos - neg) / total * 100 * min(1.0, total / 3))), total
 
 
-def sentiment_agent(symbols, log=print):
-    """Notizie e sentiment per i simboli indicati. Veto agli acquisti se sentiment < SENTIMENT_VETO."""
-    out = {}
-    for sym in symbols:
-        news = get_recent_news(sym)
-        score, hits = sentiment_score(news)
-        out[normalize_symbol(sym)] = {"symbol": sym, "news": news, "sentiment": score, "hits": hits,
-                                      "veto": score < SENTIMENT_VETO}
-    vetoed = [f"{v['symbol']} ({v['sentiment']})" for v in out.values() if v["veto"]]
-    summary = ", ".join(f"{v['symbol']} {v['sentiment']:+d}" for v in out.values())
-    log(f"📰 [Sentiment] {summary or '-'}" + (f" | VETO BUY: {', '.join(vetoed)}" if vetoed else ""))
-    return out
-
-
-# ---------------- Agente 3: Volatility Manager ----------------
+# ---------------- Volatilità, stop e Agente #6 Guardian ----------------
 def get_daily_bars(yf_symbol, period="6mo"):
     try:
         df = yf.Ticker(yf_data_symbol(yf_symbol)).history(period=period, interval="1d")
@@ -1329,14 +1291,39 @@ _guardian_cache = {"atr": {}, "peak": {}}
 _guardian_cache_lock = threading.RLock()
 
 
+GUARDIAN_PERSIST_SEC = 60        # hold_rationale (cambia a ogni giro): su disco al massimo ogni 60 s
+_gstate_cache = {"data": None, "saved": 0.0, "dirty": False}
+
+
 def _gstate_read():
-    """guardian_positions.json: {"positions": {chiave: stato}, "closed": [ultime chiusure]} (migra il formato piatto)."""
-    data = read_json_file(GUARDIAN_STATE_PATH, {"positions": {}, "closed": []})
-    if not isinstance(data.get("positions"), dict):
-        data = {"positions": {k: v for k, v in data.items() if isinstance(v, dict)}, "closed": []}
-    if not isinstance(data.get("closed"), list):
-        data["closed"] = []
-    return data
+    """Stato del Guardian {"positions": {chiave: stato}, "closed": [ultime chiusure]}, tenuto IN MEMORIA.
+
+    guardian_positions.json viene letto solo al primo accesso (migra il formato piatto); poi il disco serve solo a
+    sopravvivere ai riavvii. Restituisce l'oggetto condiviso: va letto/modificato sotto _guardian_cache_lock e
+    salvato con _gstate_write.
+    """
+    with _guardian_cache_lock:
+        if _gstate_cache["data"] is None:
+            data = read_json_file(GUARDIAN_STATE_PATH, {"positions": {}, "closed": []})
+            if not isinstance(data.get("positions"), dict):
+                data = {"positions": {k: v for k, v in data.items() if isinstance(v, dict)}, "closed": []}
+            if not isinstance(data.get("closed"), list):
+                data["closed"] = []
+            _gstate_cache["data"] = data
+        return _gstate_cache["data"]
+
+
+def _gstate_write(data, force=True):
+    """Aggiorna lo stato in memoria e lo salva su disco: subito per ingressi, uscite e chiusure (force),
+    al massimo ogni GUARDIAN_PERSIST_SEC per gli aggiornamenti frequenti (hold_rationale)."""
+    with _guardian_cache_lock:
+        _gstate_cache["data"] = data
+        now = time.time()
+        if force or now - _gstate_cache["saved"] >= GUARDIAN_PERSIST_SEC:
+            write_json_file(GUARDIAN_STATE_PATH, data)
+            _gstate_cache.update(saved=now, dirty=False)
+        else:
+            _gstate_cache["dirty"] = True
 
 
 def _thesis_fields(q, buy_thesis=None):
@@ -1360,7 +1347,7 @@ def guardian_register_entry(yf_symbol, buy_thesis, q=None, price=None, vix=None)
         data["positions"][key] = {"entry": None, "vix0": vix, "scaled": False, "scale_out": None, "order_price": price,
                                   "registered_at": time.time(), "hold_rationale": "in attesa del primo giro del Guardian",
                                   "exit_reason": None, **_thesis_fields(q, buy_thesis)}
-        write_json_file(GUARDIAN_STATE_PATH, data)
+        _gstate_write(data)
 
 
 def buy_thesis_for(yf_symbol, price, q=None):
@@ -1410,7 +1397,7 @@ def guardian_position_state(p, vix=None):
         if not st.get("buy_thesis"):
             st["buy_thesis"], changed = _fallback_thesis(p["yf_symbol"]), True
         if changed:
-            write_json_file(GUARDIAN_STATE_PATH, data)
+            _gstate_write(data)
         return dict(st)
 
 
@@ -1436,7 +1423,7 @@ def guardian_record_exit(pos, action, detail="", pct=100, stop_price=None):
         if full:
             st.update(closing=True, exit_action=action, exit_price=pos.get("current_price"),
                       closed_at=now_local().isoformat(timespec="seconds"))
-        write_json_file(GUARDIAN_STATE_PATH, data)
+        _gstate_write(data)
     return reason
 
 
@@ -1459,20 +1446,20 @@ def guardian_prune(live_keys):
                                    "scale_out": st.get("scale_out"), "trade_class": st.get("trade_class"),
                                    "horizon": st.get("horizon")})
         data["closed"] = data["closed"][-GUARDIAN_CLOSED_MAX:]
-        write_json_file(GUARDIAN_STATE_PATH, data)
+        _gstate_write(data)
 
 
 def guardian_snapshot():
-    """Stato del Guardian per la dashboard: {"positions": {chiave: scheda}, "closed": [...]}."""
+    """Stato del Guardian per la dashboard: {"positions": {chiave: scheda}, "closed": [...]} (copia, dalla memoria)."""
     with _guardian_cache_lock:
-        return _gstate_read()
+        return copy.deepcopy(_gstate_read())
 
 
 def _save_hold_rationales(evals):
-    """hold_rationale aggiornati a ogni giro (ogni 20 s) in guardian_positions.json."""
+    """hold_rationale aggiornati a ogni giro (ogni 20 s) in memoria; su disco al massimo ogni GUARDIAN_PERSIST_SEC."""
     with _guardian_cache_lock:
         data = _gstate_read()
-        changed = False
+        changed = _gstate_cache["dirty"]
         for key, g in evals.items():
             st = data["positions"].get(key)
             if st is not None and g.get("hold_rationale") and st.get("hold_rationale") != g["hold_rationale"]:
@@ -1481,7 +1468,7 @@ def _save_hold_rationales(evals):
                 st["effective_stop_pct"] = g.get("effective_stop_pct")
                 changed = True
         if changed:
-            write_json_file(GUARDIAN_STATE_PATH, data)
+            _gstate_write(data, force=False)
 
 
 def guardian_signals(q, vix, vix0, entry_impact=None):
@@ -1668,51 +1655,7 @@ def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_ope
     return vol, stops, guardian
 
 
-# ---------------- Agente 4: Macro Regime Analyst ----------------
-def macro_regime(log=print):
-    """Regime di mercato: SPY (azioni) e BTC (crypto) rispetto alla SMA50 giornaliera."""
-    out = {}
-    for cls, sym in (("stock", "SPY"), ("crypto", "BTC-USD")):
-        df = get_daily_bars(sym)
-        if df is None:
-            out[cls] = {"symbol": sym, "regime": "N/D", "factor": 1.0, "detail": "dati non disponibili"}
-            continue
-        price = float(df["Close"].iloc[-1])
-        sma50 = float(df["Close"].rolling(50).mean().iloc[-1])
-        risk_off = price < sma50
-        out[cls] = {
-            "symbol": sym, "regime": "RISK-OFF" if risk_off else "RISK-ON",
-            "factor": MACRO_RISK_OFF_FACTOR if risk_off else 1.0,
-            "detail": f"{sym} ${price:,.2f} {'<' if risk_off else '>'} SMA50 ${sma50:,.2f}",
-        }
-    log("🌍 [Macro] " + " | ".join(
-        f"{'Azioni' if c == 'stock' else 'Crypto'}: {m['regime']} ({m['detail']})"
-        + (" → budget -50%" if m["factor"] < 1 else "") for c, m in out.items()))
-    return out
-
-
-# ---------------- Agente 5: Volume & Liquidity ----------------
-def volume_agent(analysis, log=print):
-    """Segnala i falsi breakout: prezzo in salita (ROC > 0) con volume < 0.8x la media."""
-    flags = {}
-    for key, a in analysis.items():
-        ratio, roc = a["ind"].get("vol_ratio"), a["ind"]["roc"]
-        if ratio is None:
-            status = "N/D"
-        elif roc > 0 and ratio < VOLUME_LOW_RATIO:
-            status = "FALSO_BREAKOUT"
-        elif ratio >= 1.5:
-            status = "VOLUMI_FORTI"
-        else:
-            status = "OK"
-        flags[key] = {"ratio": ratio, "status": status}
-    fake = [a["symbol"] for k, a in analysis.items() if flags[k]["status"] == "FALSO_BREAKOUT" and a["class"] == "BUY"]
-    strong = [a["symbol"] for k, a in analysis.items() if flags[k]["status"] == "VOLUMI_FORTI"]
-    log(f"📶 [Volumi] Falso breakout/bassa liquidità: {', '.join(fake) or '-'} | Volumi forti: {', '.join(strong) or '-'}")
-    return flags
-
-
-# ---------------- Agente 6: Drawdown & Risk Controller ----------------
+# ---------------- Drawdown Controller ----------------
 def _intraday_equity_peak():
     """Massimo dell'equity di oggi dallo storico del portafoglio Alpaca (None se non disponibile)."""
     if not alpaca_client:
@@ -1749,7 +1692,7 @@ def drawdown_controller(account, state, log=print):
     return {"drawdown_pct": round(drawdown, 2), "blocked": blocked, "hours_left": round(remaining, 1)}
 
 
-# ---------------- Agente 7: Post-Trade Auditor ----------------
+# ---------------- Post-Trade Auditor ----------------
 def sync_ledger(days=90, log=print):
     """Ricostruisce dagli ordini Alpaca eseguiti (FIFO) i trade chiusi e le posizioni aperte.
 
@@ -1831,12 +1774,6 @@ def sync_ledger(days=90, log=print):
     return {"trades": trades, "open": open_info}
 
 
-def rebuild_trade_history(days=90, log=print):
-    """Compatibilità: solo l'elenco dei trade chiusi."""
-    ledger = sync_ledger(days, log)
-    return ledger["trades"] if ledger else None
-
-
 def win_rates(trades):
     stats = {}
     for t in trades or []:
@@ -1849,36 +1786,6 @@ def win_rates(trades):
     for s in stats.values():
         s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1)
     return stats
-
-
-def post_trade_auditor(analysis, log=print, ledger=None):
-    """Penalizza lo score dei ticker con win rate < 30% (almeno 3 trade chiusi)."""
-    trades = ledger["trades"] if ledger else read_json_file(TRADE_HISTORY_PATH, [])
-    if not ledger:
-        log("🧾 [Auditor] Alpaca non disponibile: uso la copia locale di trade_history.json.")
-    stats = win_rates(trades)
-    penalized = []
-    for key, a in analysis.items():
-        s = stats.get(key)
-        if s and s["trades"] >= AUDIT_MIN_TRADES and s["win_rate"] < AUDIT_LOW_WINRATE:
-            a["score"] = max(0, a["score"] - AUDIT_PENALTY)
-            a["class"] = classify_score(a["score"])
-            a["audit_penalty"] = AUDIT_PENALTY
-            penalized.append(f"{a['symbol']} (win rate {s['win_rate']:.0f}% su {s['trades']})")
-    total = len(trades)
-    wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
-    pnl = sum(t.get("pnl", 0) for t in trades)
-    log(f"🧾 [Auditor] {total} trade chiusi (90gg), win rate {wins / total * 100 if total else 0:.0f}%, "
-        f"PnL realizzato ${pnl:,.2f}" + (f" | Penalità -{AUDIT_PENALTY}: {', '.join(penalized)}" if penalized else ""))
-    return stats
-
-
-# ---------------- Agente 8: Chief Investment Officer ----------------
-CIO_SYSTEM_PROMPT = (
-    "Sei il Chief Investment Officer dell'Ufficio Virtuale e del Virtual Boardroom Finanziario di un bot di trading algoritmico "
-    "che opera su un conto paper (simulato) Alpaca. Le tue risposte vengono lette da un programma: "
-    "rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo. Scrivi il campo reason in italiano."
-)
 
 
 # ===========================================================================
@@ -1928,7 +1835,7 @@ def startup_system_sync(log=print):
 
 # ===========================================================================
 # TRADING DESK ISTITUZIONALE A 5 LIVELLI
-#   Tier 1  Micro-Scout paralleli (pool fino a 100 worker, calcoli puramente matematici)
+#   Tier 1  Micro-Scout paralleli (pool di SCOUT_MAX_WORKERS thread, calcoli puramente matematici)
 #   Tier 2  Chief of Staff / Orchestrator (coda, TTL 15 min, cooldown 60 min, stati atomici)
 #   Tier 3  Comitato Rischi: 3 gatekeeper in parallelo con potere di veto
 #   Tier 4  CIO Portfolio Manager (Groq) con convinzione 0-100 e sizing dinamico 5%-35%
@@ -1994,7 +1901,9 @@ def is_us_market_open():
     if et.weekday() >= 5 or et.strftime("%Y-%m-%d") in NYSE_HOLIDAYS:
         return False
     return dt.time(9, 30) <= et.time() < dt.time(16, 0)
-SCOUT_MAX_WORKERS = 100
+# Thread dei micro-scout: i calcoli sono pandas/numpy sotto il GIL, oltre una dozzina di thread si aggiunge solo
+# memoria (stack e buffer per thread) senza guadagnare velocità
+SCOUT_MAX_WORKERS = 12
 RADAR_INTERVAL_SEC = 120        # una scansione completa dello sciame ogni 2 minuti
 PROPOSAL_TTL_MIN = 15           # una scheda non lavorata da più di 15 minuti è stantia
 REJECT_COOLDOWN_MIN = 60        # ticker respinto dal Comitato Rischi: 60 minuti di pausa
@@ -2131,17 +2040,41 @@ _earnings_cache = {}
 
 
 # ---------------------------------------------------------------- registro
+_registry_cache = {"data": None}
+
+
+def _registry_data():
+    """Registro IN MEMORIA (scout_registry.json letto solo al primo accesso). Da chiamare sotto _registry_lock.
+
+    L'oggetto in cache non viene mai modificato sul posto (_save_registry lo sostituisce con una copia):
+    i lettori possono quindi usarlo in sola lettura senza copiarlo.
+    """
+    if _registry_cache["data"] is None:
+        reg = read_json_file(SCOUT_REGISTRY_PATH, _REGISTRY_DEFAULT)
+        for key, default in _REGISTRY_DEFAULT.items():
+            if not isinstance(reg.get(key), type(default)):
+                reg[key] = json.loads(json.dumps(default))
+        _registry_cache["data"] = reg
+    return _registry_cache["data"]
+
+
 def load_scout_registry():
-    """Registro della sala mercati; rigenerato con la struttura di default se manca o è corrotto."""
-    reg = read_json_file(SCOUT_REGISTRY_PATH, _REGISTRY_DEFAULT)
-    for key, default in _REGISTRY_DEFAULT.items():
-        if not isinstance(reg.get(key), type(default)):
-            reg[key] = json.loads(json.dumps(default))
-    return reg
+    """Copia modificabile del registro della sala mercati (dalla memoria, senza leggere il disco)."""
+    with _registry_lock:
+        return json.loads(json.dumps(_registry_data()))
+
+
+def _registry_view():
+    """Registro in sola lettura (nessuna copia): per dashboard e letture frequenti. NON modificarlo."""
+    with _registry_lock:
+        return _registry_data()
 
 
 def _save_registry(reg):
-    write_json_file(SCOUT_REGISTRY_PATH, reg)
+    """Nuova versione del registro: sostituisce la cache in memoria e la salva su disco (sopravvive ai riavvii)."""
+    with _registry_lock:
+        _registry_cache["data"] = json.loads(json.dumps(reg, default=str))
+        write_json_file(SCOUT_REGISTRY_PATH, _registry_cache["data"])
 
 
 def _now_epoch():
@@ -2256,16 +2189,6 @@ def _daily_frames(tickers):
     if missing:
         _daily_cache["data"].update(_download(missing, "1y", "1d"))
     return {t: _daily_cache["data"][t] for t in tickers if t in _daily_cache["data"]}
-
-
-def batch_indicators(tickers):
-    """Compatibilità: indicatori 1h in batch."""
-    return {t: compute_indicators(df["Close"], volume=df["Volume"])
-            for t, df in _download(tickers, "3mo", "1h").items() if len(df) >= 60}
-
-
-def batch_atr(tickers):
-    return {t: atr_pct(df) for t, df in _daily_frames(tickers).items() if len(df) >= 20}
 
 
 def dynamic_volume_spikes(limit=10):
@@ -2541,20 +2464,41 @@ def is_tradable(yf_symbol):
     return ok
 
 
-def _review_context(macro):
-    ctx = {"drawdown_pct": 0.0, "drawdown_blocked": False, "market_open": True, "macro": macro,
-           "stats": win_rates(read_json_file(TRADE_HISTORY_PATH, []))}
+DRAWDOWN_CACHE_SEC = 60
+_drawdown_cache = {"ts": 0.0, "value": None}
+
+
+def current_drawdown(max_age_sec=DRAWDOWN_CACHE_SEC):
+    """(perdita del giorno in % <= 0, acquisti bloccati) con la formula del Drawdown Controller (cache 60 s).
+
+    Riferimento: massimo tra chiusura precedente e picco intraday di Alpaca; bloccato oltre DAILY_DRAWDOWN_LIMIT
+    o finché dura il blocco di 24 ore salvato in boardroom_state.json. Usato dal Comitato Rischi e dall'Agente #3.
+    """
+    now = time.time()
+    cached = _drawdown_cache["value"]
+    if cached is not None and now - _drawdown_cache["ts"] < max_age_sec:
+        return cached
+    dd = cached[0] if cached else 0.0
     if alpaca_client:
         try:
             acc = alpaca_client.get_account()
             equity, last = float(acc.equity), float(acc.last_equity or 0)
             peak = max([x for x in (last, _intraday_equity_peak(), equity) if x] or [0.0])
-            ctx["drawdown_pct"] = round((equity / peak - 1) * 100, 2) if peak else 0.0
+            dd = round((equity / peak - 1) * 100, 2) if peak else 0.0
         except Exception:
             pass
-        ctx["market_open"] = is_market_open(log=lambda m: None)
     block_until = float(load_state().get("drawdown", {}).get("block_until", 0))
-    ctx["drawdown_blocked"] = ctx["drawdown_pct"] <= DAILY_DRAWDOWN_LIMIT or time.time() < block_until
+    value = (dd, dd <= DAILY_DRAWDOWN_LIMIT or now < block_until)
+    _drawdown_cache.update(ts=now, value=value)
+    return value
+
+
+def _review_context(macro):
+    dd, blocked = current_drawdown()
+    ctx = {"drawdown_pct": dd, "drawdown_blocked": blocked, "market_open": True, "macro": macro,
+           "stats": win_rates(read_json_file(TRADE_HISTORY_PATH, []))}
+    if alpaca_client:
+        ctx["market_open"] = is_market_open(log=lambda m: None)
     return ctx
 
 
@@ -2674,6 +2618,32 @@ def universe_chunk(market_open, log=print):
     return list(groups.items()), [t for t, _, _ in chunk], {t: tr for t, _, tr in chunk}, info
 
 
+RUNTIME_CACHE_MAX = 1500          # voci massime per cache per simbolo (universo dinamico: 1000+ ticker)
+
+
+def _prune_cache(cache, ttl_sec, ts=lambda v: v[0], max_items=RUNTIME_CACHE_MAX):
+    """Rimuove le voci più vecchie di ttl_sec e, oltre max_items, le più vecchie in assoluto."""
+    now = time.time()
+    for k, v in list(cache.items()):
+        if now - ts(v) > ttl_sec:
+            cache.pop(k, None)
+    if len(cache) > max_items:
+        for k, _ in sorted(list(cache.items()), key=lambda kv: ts(kv[1]))[:len(cache) - max_items]:
+            cache.pop(k, None)
+
+
+def prune_runtime_caches():
+    """Tetto alle cache in memoria per simbolo: senza, crescerebbero con ogni ticker visto dallo sciame."""
+    _prune_cache(_tradable_cache, 6 * 3600)
+    _prune_cache(_earnings_cache, 6 * 3600)
+    _prune_cache(_news_cache, NEWS_CACHE_SEC)
+    _prune_cache(_yf_missing, YF_MISSING_TTL_SEC, ts=lambda v: v[1])
+    with _guardian_cache_lock:
+        _prune_cache(_guardian_cache["atr"], GUARDIAN_ATR_TTL_SEC)
+        # Il picco delle posizioni aperte viene riletto ogni 15 minuti (ts aggiornato): restano solo quelle vive
+        _prune_cache(_guardian_cache["peak"], 6 * 3600, ts=lambda v: v["ts"])
+
+
 def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotate=False, exposure_usd=None,
                     positions_count=None):
     """Tier 1 -> 2 -> 3: scansione parallela, schede all'Orchestrator, revisione immediata.
@@ -2682,6 +2652,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     rotate=False: tutti i panieri insieme.
     """
     reg = run_orchestrator_service(log=log)
+    prune_runtime_caches()
     market_open = is_us_market_open()
     tradable, uinfo = {}, None
     if DYNAMIC_UNIVERSE and rotate:
@@ -2919,11 +2890,6 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
     return channels
 
 
-# compatibilità con il nome precedente
-def run_esploratore_radar(held_keys=(), pending=(), log=print, scout_id=SCOUT_ID, on_approved=None):
-    return run_scout_swarm(held_keys, pending, log=log, on_approved=on_approved)
-
-
 # ---------------------------------------------------------------- Tier 4: CIO
 def cio_inbox():
     """Solo le schede APPROVED_BY_RISK ancora valide."""
@@ -2932,7 +2898,8 @@ def cio_inbox():
 
 
 def latest_channels():
-    return load_scout_registry().get("channels", {})
+    """Canali di intelligence dell'ultimo giro (dalla memoria, sola lettura)."""
+    return dict(_registry_view().get("channels") or {})
 
 
 def conviction_band(conviction):
@@ -3198,8 +3165,8 @@ def record_cio_outcome(selected_symbol, executed, decision_text, details=None):
 
 
 def radar_snapshot():
-    """Canali di intelligence, coda delle schede, veti e cooldown per la dashboard."""
-    reg = load_scout_registry()
+    """Canali di intelligence, coda delle schede, veti e cooldown per la dashboard (dalla memoria, senza copie)."""
+    reg = _registry_view()
     now = _now_epoch()
 
     def item(p):
@@ -3402,6 +3369,7 @@ _balance_cache = {"ts": 0.0, "value": None}
 
 QUANT_SWARM_SIZE = 100
 NEWS_CACHE_SEC = 900
+NEUTRAL_FEAR_GREED = 50.0   # Fear & Greed neutro: quello di alternative.me vale solo per le crypto
 _news_cache = {}
 
 
@@ -3490,8 +3458,10 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
         return []
     engine = quant_engine()
     macro_inputs = {"vix_level": (macro or {}).get("vix") or 16.5,
-                    "fear_greed_index": (fng or {}).get("value", 50.0),
                     "news_sentiment": 0.0, "central_bank_speech": "", "upcoming_events": []}
+    # Il Fear & Greed di alternative.me misura SOLO il mercato crypto: per le azioni l'Agente #4 usa il valore neutro
+    crypto_fng = float((fng or {}).get("value", NEUTRAL_FEAR_GREED))
+    fng_for = lambda sym: crypto_fng if is_crypto(sym) else NEUTRAL_FEAR_GREED
     books = crypto_order_books([sym for _, sym, _ in scout_frames]) if order_books is None else order_books
     balance = account_balance_for_agents()
     forced = {normalize_symbol(f) for f in force}
@@ -3500,19 +3470,25 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
     for _, sym, _ in scout_frames:
         if not scout_meta[sym].get("atr_pct"):
             scout_meta[sym]["atr_pct"] = guardian_atr(sym)
-    payloads = [build_scout_payload(sym, frame, order_book=books.get(sym), macro_inputs=macro_inputs,
+    payloads = [build_scout_payload(sym, frame, order_book=books.get(sym),
+                                    macro_inputs={**macro_inputs, "fear_greed_index": fng_for(sym)},
                                     account_balance=balance, scout_id=f"{scout_id:02d}",
                                     force_full=normalize_symbol(sym) in forced, scout_meta=scout_meta.get(sym),
                                     is_crypto=is_crypto(sym))
                 for scout_id, sym, frame in scout_frames]
     held = {normalize_symbol(h) for h in held_keys}
     exposure_pct = (exposure_usd / balance * 100) if exposure_usd is not None and balance else 0.0
+    # Circuit breaker dell'Agente #3: perdita reale del giorno (frazione positiva); con il blocco di 24 ore attivo
+    # vale almeno il limite, così l'Agente #3 resta allineato al Drawdown Controller
+    dd_pct, dd_blocked = current_drawdown()
+    daily_drawdown = max(-dd_pct, MAX_DAILY_DRAWDOWN_PCT if dd_blocked else 0.0) / 100
 
     cycle_start = time.time()
     with _quant_lock:
         # Agente #6 e slot dell'Agente #5 riflettono le posizioni reali su Alpaca
         engine.portfolio_context = {"held": held, "pending": {normalize_symbol(x) for x in pending},
-                                    "exposure_pct": exposure_pct, "positions": positions_count if positions_count is not None else len(held),
+                                    "exposure_pct": exposure_pct, "daily_drawdown": daily_drawdown,
+                                    "positions": positions_count if positions_count is not None else len(held),
                                     "max_exposure_pct": max_exposure_pct(get_config())}
         engine.active_portfolio = {k: engine.active_portfolio.get(k) or {"symbol": k, "side": "BUY", "cio_ensemble_score": 50.0,
                                                                          "strength": 50.0, "details": {}}

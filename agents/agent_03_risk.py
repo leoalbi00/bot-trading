@@ -12,6 +12,8 @@ MAX_POSITIONS = 4                  # posizioni aperte contemporaneamente
 HARD_STOP_MIN_PCT = 1.2            # hard stop loss tra 1.2% ...
 HARD_STOP_MAX_PCT = 3.5            # ... e 3.5% dal prezzo d'ingresso
 HARD_STOP_ATR_MULT = 1.5           # Stop_Loss_Pct = max(1.2%, min(3.5%, 1.5 x ATR%)); Target 1 = 2 x Stop_Loss_Pct
+MAX_RISK_PER_TRADE_PCT = 2.0       # perdita massima allo stop per operazione, % del capitale (unica fonte: anche trading_core)
+MAX_DAILY_DRAWDOWN_PCT = 5.0       # circuit breaker: perdita giornaliera oltre il 5% -> nessun nuovo ingresso (Drawdown Controller)
 STANDARD_MAX_ALLOCATION_PCT = 25.0  # taglia massima di un trade standard
 SUPER_CONVICTION_MAX_ALLOCATION_PCT = 50.0  # taglia massima autorizzata per un trade SUPER_CONVICTION
 CRYPTO_NIGHT_TZ = ZoneInfo("Europe/Rome")   # CET/CEST
@@ -50,11 +52,12 @@ class InstitutionalRiskAgent:
     Portafoglio pieno o senza margine di esposizione non è un veto qui: lo decide il CIO, perché un trade
     SUPER_CONVICTION può ancora entrare (rotazione delle sole tesi degradate o taglia ridotta).
     """
-    def __init__(self, max_daily_drawdown_pct: float = 0.03, max_risk_per_trade_pct: float = 0.01,
+    def __init__(self, max_daily_drawdown_pct: float = MAX_DAILY_DRAWDOWN_PCT / 100,
+                 max_risk_per_trade_pct: float = MAX_RISK_PER_TRADE_PCT / 100,
                  max_exposure_pct: float = MAX_EXPOSURE_PCT, max_positions: int = MAX_POSITIONS):
         self.agent_id = "AGENT_03_RISK_MANAGER"
-        self.max_daily_drawdown_pct = max_daily_drawdown_pct  # Es. 3% max drawdown giornaliero
-        self.max_risk_per_trade_pct = max_risk_per_trade_pct  # Es. 1% rischio max per trade
+        self.max_daily_drawdown_pct = max_daily_drawdown_pct  # frazione: 0.05 = 5% (stesso limite del Drawdown Controller)
+        self.max_risk_per_trade_pct = max_risk_per_trade_pct  # frazione: 0.02 = 2% del capitale allo stop
         self.max_exposure_pct = max_exposure_pct
         self.max_positions = max_positions
 
@@ -181,6 +184,7 @@ class InstitutionalRiskAgent:
         """
         Pipeline Esecutiva completa dell'Agente #3.
         portfolio: {"exposure_pct", "positions"} per i limiti di esposizione (50%) e posizioni (4).
+        current_daily_drawdown_pct: perdita del giorno come frazione positiva (0.05 = -5%), letta da Alpaca dal desk.
         atr_pct: ATR(14) GIORNALIERO in % del prezzo, lo stesso del gate Risk & ATR e del Guardian: stop e sizing
                  coincidono con lo stop reale dell'ordine. Senza, ATR delle barre di df (orarie) riportato su base
                  giornaliera (x radice delle ore di contrattazione), come la riserva del Guardian.

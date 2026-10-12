@@ -46,6 +46,10 @@ RVOL_STAGE1_BYPASS = 2.5        # volume relativo eccezionale: passa lo Stage 1.
 STAGE1_BYPASS_MIN_SCORE = 35    # ...se lo score tecnico dello Scout è almeno intermedio
 HEADLINES_TTL_SEC = 120         # titoli del News Radar riletti al massimo ogni 2 minuti per ticker
 NEWS_ASSESSMENT_TTL_SEC = 600   # giudizio di Groq riusato finché i titoli non cambiano (novelty invecchiata)
+# Tetto alle cache per simbolo: con l'universo dinamico (1000+ ticker) crescerebbero senza limite
+CACHE_MAX_ENTRIES = 1500
+EVALUATION_MAX_AGE_SEC = 6 * 3600   # valutazioni di Stage 3 / esiti di Stage 1-2 più vecchi: rimossi
+NEWS_CACHE_MAX_AGE_SEC = 3600       # titoli e giudizi di Groq oltre 1 ora non vengono più riusati
 
 
 class _ColorFormatter(logging.Formatter):
@@ -410,6 +414,8 @@ class QuantitativeTradingCore:
         t3 = time.perf_counter()
         res_risk = self._run_agent("AGENTE #3 RISK", symbol,
                                    lambda: self.agent_risk.analyze(df_ohlcv, account_balance=account_balance,
+                                                                   current_daily_drawdown_pct=float(
+                                                                       self.portfolio_context.get("daily_drawdown") or 0.0),
                                                                    is_crypto=is_crypto, portfolio=self.portfolio_context,
                                                                    atr_pct=(candidate_data.get("scout_meta") or {}).get("atr_pct")),
                                    {"agent_id": self.agent_risk.agent_id, "risk_approved": False, "risk_score": 0.0})
@@ -650,7 +656,26 @@ class QuantitativeTradingCore:
         """Sciame -> asyncio.Queue -> Stage 1-3, in streaming: gli agenti partono appena un ticker è pronto."""
         queue: asyncio.Queue = asyncio.Queue()
         _, plan = await asyncio.gather(self.swarm.stream(payloads, queue), self.process_scout_stream(queue))
+        self.prune_caches()
         return plan
+
+    def prune_caches(self, max_entries: int = CACHE_MAX_ENTRIES) -> None:
+        """Rimuove le voci scadute e, oltre max_entries, le più vecchie (valutazioni, esiti di Stage, notizie)."""
+        now = time.time()
+
+        def prune(cache: Dict[str, Any], ts, max_age: float) -> None:
+            for k, v in list(cache.items()):
+                if now - ts(v) > max_age:
+                    cache.pop(k, None)
+            if len(cache) > max_entries:
+                for k, _ in sorted(cache.items(), key=lambda kv: ts(kv[1]))[:len(cache) - max_entries]:
+                    cache.pop(k, None)
+
+        with self._eval_lock:
+            prune(self.latest_evaluations, lambda v: v["evaluated_at"], EVALUATION_MAX_AGE_SEC)
+            prune(self.stage_filtered, lambda v: v.get("at", 0), EVALUATION_MAX_AGE_SEC)
+        prune(self._headlines_cache, lambda v: v[0], NEWS_CACHE_MAX_AGE_SEC)
+        prune(self._assessment_cache, lambda v: v[0], NEWS_CACHE_MAX_AGE_SEC)
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=True)

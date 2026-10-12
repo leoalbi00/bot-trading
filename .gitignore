@@ -22,3 +22,6 @@ command_center.json
 
 # graphify knowledge graph (generato localmente)
 graphify-out/
+
+# Dipendenze npm non usate dalla dashboard (le librerie arrivano da CDN)
+node_modules/
