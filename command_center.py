@@ -408,8 +408,13 @@ def _segment_impact(ctx, kind, value):
             "gain_share": round(seg_gain / gains * 100) if gains else 0}
 
 
-def _decide(cmd, ctx, persona, force):
-    """Valuta e (se ammesso) applica l'ordine. -> (verdetto, testo, modifiche applicate)."""
+def _decide(cmd, ctx, persona, force, dry_run=False):
+    """Valuta e (se ammesso) applica l'ordine. -> (verdetto, testo, modifiche applicate).
+
+    dry_run=True: solo i controlli, nessuna modifica; se l'ordine è ammesso restituisce ("OK", None, None).
+    Serve a mostrare SCONSIGLIATO / IMPOSSIBILE insieme alla proposta, PRIMA della conferma dell'utente
+    (prima la proposta confermata veniva applicata con force=True e gli avvisi non comparivano mai).
+    """
     p = PERSONAS[persona]
     intent, aid = cmd["intent"], cmd["agent"]
     cfg = core.get_config()
@@ -438,6 +443,8 @@ def _decide(cmd, ctx, persona, force):
                 return "SCONSIGLIATO", (f"Comandante, il CIO ha {imp} schede già approvate dal Comitato Rischi in attesa "
                                         "di decisione: metterlo in pausa ora le lascerebbe scadere. Le uscite difensive "
                                         "resterebbero comunque attive. Scriva \"conferma\" se vuole procedere."), None
+        if dry_run:
+            return "OK", None, None
         set_agent(aid, paused=True)
         extra = {"01": " Lo sciame smette di generare nuove schede: l'Ensemble richiede il suo voto.",
                  "02": " Lo sciame smette di generare nuove schede: l'Ensemble richiede il suo voto.",
@@ -450,6 +457,8 @@ def _decide(cmd, ctx, persona, force):
     if intent == "resume_agent":
         if not is_paused(aid):
             return "INFO", f"{AGENTS[aid]['title']} è già operativo, Comandante.", None
+        if dry_run:
+            return "OK", None, None
         set_agent(aid, paused=False)
         return "ESEGUITO", f"{AGENTS[aid]['title']} è di nuovo operativo.", {"agent": aid, "paused": False}
 
@@ -460,6 +469,8 @@ def _decide(cmd, ctx, persona, force):
             return "IMPOSSIBILE", (f"{meta['title']} lavora con parametri di sicurezza fissi (stop 1.5x ATR nella fascia 1.2-3.5%, Target 1 a 2R) "
                                    "che non conviene toccare. Posso invece regolare la sensibilità di Quant, Micro, "
                                    "Macro/News o CIO."), None
+        if dry_run:
+            return "OK", None, None
         set_agent(aid, sensitivity=level)
         need = SENSITIVITY_MIN.get(aid, {}).get(level)
         return "ESEGUITO", (f"Sensibilità di {meta['title']} impostata su {SENSITIVITY_LABELS[level]}"
@@ -475,6 +486,8 @@ def _decide(cmd, ctx, persona, force):
                                    "(Tecnologia, Materie prime, Obbligazioni, Energia, Finanza, Biotech) o un ticker."), None
         label = _segment_label(kind, value)
         if intent == "unblock":
+            if dry_run:
+                return "OK", None, None
             set_block(kind, value, blocked=False)
             return "ESEGUITO", f"{label} di nuovo disponibile per i nuovi acquisti.", {"unblock": label}
         imp = _segment_impact(ctx, kind, value)
@@ -487,12 +500,16 @@ def _decide(cmd, ctx, persona, force):
             return "SCONSIGLIATO", (f"Comandante, bloccare {label} ora taglierebbe una parte rilevante dei profitti attesi: "
                                     + " e ".join(why) + ". Il Risk Manager ha già validato quei rischi. Consiglio di "
                                     "mantenere l'operatività attuale; se preferisce procedere scriva \"conferma\"."), None
+        if dry_run:
+            return "OK", None, None
         set_block(kind, value, blocked=True)
         note = (f" Le posizioni già aperte restano sotto la protezione del Guardian"
                 f"{' (contribuiscono al ' + str(imp['gain_share']) + '% dei guadagni aperti)' if imp['gain_share'] else ''}.")
         return "ESEGUITO", f"Fatto: nessun nuovo acquisto su {label}.{note}", {"block": label}
 
     if intent == "clear_blocks":
+        if dry_run:
+            return "OK", None, None
         clear_blocks()
         return "ESEGUITO", "Tutti i blocchi rimossi: il CIO può di nuovo valutare ogni mercato.", {"blocks": "cleared"}
 
@@ -517,6 +534,8 @@ def _decide(cmd, ctx, persona, force):
                                    + (f" Non esiste una leva di aggressività per singolo settore{hint}: posso però "
                                       "bloccare gli altri settori per concentrare il capitale." if hint else "")), None
         new = min(50.0, cur + 10)
+        if dry_run:
+            return "OK", None, None
         core.update_config({"max_exposure_pct": new})
         return "ESEGUITO", (f"Aggressività aumentata: esposizione massima da {cur:.0f}% a {new:.0f}% del capitale."
                             + (f" Nota: la leva è globale, non solo{hint}." if hint else "")), {"max_exposure_pct": new}
@@ -528,6 +547,8 @@ def _decide(cmd, ctx, persona, force):
         if cur <= 10:
             return "INFO", "Siamo già al livello più prudente: 10% investito, 90% di cassa protetta.", None
         new = max(10.0, cur - 10)
+        if dry_run:
+            return "OK", None, None
         core.update_config({"max_exposure_pct": new})
         return "ESEGUITO", (f"Profilo più prudente: esposizione massima da {cur:.0f}% a {new:.0f}%. Le posizioni aperte "
                             "non vengono vendute, ma i nuovi acquisti si fermano oltre la nuova soglia."), {"max_exposure_pct": new}
@@ -539,11 +560,15 @@ def _decide(cmd, ctx, persona, force):
                                    "va modificata lì."), None
         if want and dd_blocked and persona == "risk":
             return "SCONSIGLIATO", "Con il Drawdown Controller attivo consiglio di restare in modalità Advisor.", None
+        if dry_run:
+            return "OK", None, None
         core.update_config({"auto_execute_trades": want})
         return "ESEGUITO", ("Auto-Trading attivo: gli ordini vengono eseguiti." if want else
                             "Modalità Advisor: il sistema propone ma non invia più ordini."), {"auto_execute_trades": want}
 
     if intent in ("pause_bot", "resume_bot"):
+        if dry_run:
+            return "OK", None, None
         return "ESEGUITO", None, {"bot_active": intent == "resume_bot"}
 
     return "INFO", status_text(ctx, persona), None
@@ -823,6 +848,31 @@ def _apply(persona, cmd, ctx, apply_bot_state):
     return verdict, text, change
 
 
+def _precheck(cmd, ctx, persona):
+    """Controlli del Centro di Comando su una proposta, senza applicarla -> (verdetto, testo)."""
+    try:
+        verdict, text, _ = _decide(cmd, ctx, persona, force=False, dry_run=True)
+    except (ValueError, KeyError) as e:
+        return "IMPOSSIBILE", str(e)
+    return verdict, text
+
+
+def _propose(persona, cmd, summary, reply, ctx, parser, intro_verdict="PROPOSTA"):
+    """Registra la proposta in attesa di conferma, con l'avviso dei controlli se l'azione è sconsigliata.
+
+    Azioni impossibili, già in vigore o da chiarire non diventano proposte: si risponde subito con il motivo.
+    """
+    verdict, text = _precheck(cmd, ctx, persona)
+    if verdict in ("IMPOSSIBILE", "CHIARIMENTO", "INFO"):
+        return _push("agent", persona, (reply + "\n\n" if reply else "") + text, verdict=verdict, intent=cmd["intent"],
+                     parser=parser, change=None)
+    _pending[persona] = {"cmd": cmd, "summary": summary, "ts": time.time()}
+    warning = f"\n\n⚠️ {text}" if verdict == "SCONSIGLIATO" else ""
+    reply = (reply + warning + f"\n\nProposta: {summary}. Confermi? Rispondi \"sì\" per applicarla o \"no\" per annullare.")
+    return _push("agent", persona, reply.strip(), verdict="SCONSIGLIATO" if warning else intro_verdict,
+                 intent=cmd["intent"], parser=parser, change=None, proposal=summary)
+
+
 def chat(persona, message, ctx, apply_bot_state):
     """Messaggio al dirigente -> risposta. Le azioni vengono solo proposte e applicate dopo la conferma esplicita.
 
@@ -852,22 +902,16 @@ def chat(persona, message, ctx, apply_bot_state):
         proposal = llm["proposal"]
         reply = llm["reply"]
         if proposal:
-            _pending[persona] = {"cmd": proposal, "summary": proposal["summary"], "ts": time.time()}
-            # Conferma obbligatoria: la richiesta esplicita c'è sempre, anche se l'LLM l'ha omessa
-            reply += f"\n\nProposta: {proposal['summary']}. Confermi? Rispondi \"sì\" per applicarla o \"no\" per annullare."
-        return _push("agent", persona, reply, verdict="PROPOSTA" if proposal else "INFO",
-                     intent=proposal["intent"] if proposal else "chat", parser=f"Groq · {llm['model']}", change=None,
-                     proposal=proposal["summary"] if proposal else None)
+            # Conferma obbligatoria (la richiesta esplicita c'è sempre) e avvisi dei controlli prima della conferma
+            return _propose(persona, proposal, proposal["summary"], reply, ctx, f"Groq · {llm['model']}")
+        return _push("agent", persona, reply, verdict="INFO", intent="chat", parser=f"Groq · {llm['model']}", change=None)
 
     # Riserva senza LLM: comandi riconosciuti dalle regole, sempre con conferma
     cmd, source = parse_command(message)
     if cmd["intent"] in ACTION_INTENTS:
         summary = describe_command(cmd)
-        _pending[persona] = {"cmd": cmd, "summary": summary, "ts": time.time()}
-        text = (f"Assistente IA momentaneamente non disponibile: ho interpretato la richiesta come: {summary}. "
-                "Vuoi che proceda? Rispondi \"sì\" per confermare o \"no\" per annullare.")
-        return _push("agent", persona, text, verdict="PROPOSTA", intent=cmd["intent"], parser=source, change=None,
-                     proposal=summary)
+        return _propose(persona, cmd, summary, "Assistente IA momentaneamente non disponibile: ho interpretato la "
+                        f"richiesta come: {summary}.", ctx, source)
     text = "Risposta rapida dai dati di sistema (assistente IA momentaneamente non disponibile). " + local_reply(ctx)
     return _push("agent", persona, text, verdict="INFO", intent=cmd["intent"], parser="locale", change=None)
 

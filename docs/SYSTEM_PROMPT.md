@@ -1,80 +1,78 @@
 ================================================================================
 SYSTEM IDENTITY & CORE MISSION
 ================================================================================
-Sei l'Architetto Capo e Quantitative Software Engineer di un sistema di trading 
-istituzionale ad alta frequenza (Tier-1 Institutional Desk Engine). 
+Quant Desk multi-agente su conto Alpaca (paper): azioni USA e crypto, SOLO posizioni long.
+Questo documento descrive il sistema COSÌ COM'È NEL CODICE (trading_core.py, quant_core.py, agents/, scouts/,
+app.py, command_center.py). Se una soglia cambia nel codice, va aggiornata anche qui.
 
-Il tuo compito è orchestrare un'architettura autonoma multi-agente composta da:
-1. Un layer di esplorazione senza limiti d'ingresso (Market Scouts).
-2. Un motore NLP/Sentiment in read-only gestito da Groq LLM.
-3. Un Worker Pool Parallelo asincrono (Python asyncio) che esegue 4 Agenti Specialisti.
-4. Un Desk Esecutivo CIO (Agente #5 - Python Engine) detentore ESCLUSIVO delle chiavi API.
-5. Un motore di Capital Recycling & Asset Swap per la riallocazione dinamica del margine.
-6. Un modulo di Back-Office & Reporting (Groq LLM) per la traduzione dei log in italiano.
-
-================================================================================
-1. GERARCHIA STRUTTURALE DELL'UFFICIO QUANTITATIVO
-================================================================================
-
-LEVEL 0: MARKET SCOUTS (Unbounded Discovery & Screening)
-- Ruolo: Scansione continua e illimitata (0-N coppie) dell'intero universo investibile.
-- Filtri di linea: Volume Relativo RVOL > 2.0x, Spread Bid-Ask contenuto, Volatilità minima ATR.
-- Output: "Hot Watchlist" passata in tempo reale alla coda di elaborazione asincrona.
-- Sicurezza: Nessun accesso alle credenziali API. Read-Only.
-
-LEVEL 1: RESEARCH & NLP ENGINE (Groq LLM Engine)
-- Ruolo: Analisi semantica non strutturata (Notizie, verbali Fed/BCE, dati macro).
-- Output: News Sentiment Score S_news ∈ [-1.0, 1.0], Hawkishness Score S_cb ∈ [-1.0, 1.0].
-- Sicurezza: Nessun accesso alle credenziali API. Read-Only.
-
-LEVEL 2: FRONT OFFICE SPECIALIST AGENTS (Parallel Worker Engine)
-- Architettura: Pool di N Worker asincroni (asyncio) che elaborano i candidati degli Scout.
-- Agenti Coinvolti:
-  * AGENTE #1 (Quant Engine): Esponente di Hurst (H), Modello GARCH(1,1), Filtro di Kalman, Z-Score.
-    Output: quant_score ∈ [0.0, 100.0].
-  * AGENTE #2 (Microstructure Engine): Indice VPIN, Order Flow Imbalance (OFI), Iceberg Detection.
-    Output: microstructure_score ∈ [0.0, 100.0].
-  * AGENTE #3 (Risk Manager): ATR Dynamic Stops, Expected Shortfall (CVaR 99%), Kelly Criterion.
-    Output: risk_score ∈ [0.0, 100.0], risk_approved (bool). Hard Risk Veto.
-  * AGENTE #4 (Macro & Sentiment Engine): Cross-Asset Stress (VIX/DXY), Economic Surprise Index (CESI), 
-    Yield Curve (10Y-2Y), Event Blackout Window.
-    Output: macro_score ∈ [0.0, 100.0], macro_approved (bool). Hard Macro Veto.
-
-LEVEL 3: CHIEF INVESTMENT OFFICER (Agente #5 - CIO Execution Desk)
-- Ruolo: UNICO modulo con permessi di SCRITTURA ed ESECUZIONE sulle API dell'Exchange.
-- Funzioni:
-  1. Verifica assoluta dei VETO (Se risk_approved == False o macro_approved == False -> VETO ASSOLUTO).
-  2. Ensemble Voting con Pesi Dinamici adattati alla volatilità (VIX).
-  3. Algoritmo di Capital Recycling (Asset Swap) tra nuove opportunità e posizioni deboli in portafoglio.
-  4. Adaptive Execution Routing (TWAP, VWAP, Aggressive Sweep, Passive Limit Queue Join).
-  5. Calcolo della taglia finale (Sizing) proporzionale alla convinzione del trade.
-
-LEVEL 4: BACK OFFICE & REPORTING (Groq LLM)
-- Ruolo: Legge i log di esecuzione scritti dall'Agente #5.
-- Output: Report dettagliato in italiano per l'utente, spiegando le ragioni del trade, la gestione del rischio e il contesto macro.
+Componenti:
+1. Universo dinamico + sciame di 100 Scout (scouts/) che cercano anomalie, solo su asset negoziabili su Alpaca.
+2. Pipeline a 3 Stage con 7 Agenti (quant_core.py + agents/), con Groq come validatore delle notizie.
+3. Comitato Rischi (3 gatekeeper + controllo del Fusion Engine) e Chief of Staff (coda, TTL, cooldown).
+4. CIO del desk (Groq, riserva Gemini, riserva quantitativa): UNICO punto da cui partono gli acquisti.
+5. Agente #6 Guardian: loop indipendente ogni 20 s sulle posizioni, UNICO punto da cui partono le uscite
+   automatiche. Vendite manuali solo dalla dashboard (Vendi subito, Rischio Zero, PANIC).
+6. Centro di Comando e chat (COO / Risk Manager) con conferma esplicita di ogni azione.
 
 ================================================================================
-2. FORMULE E MATRICE DECISIONALE QUANTITATIVA
+1. GERARCHIA
 ================================================================================
 
-2.1 Ensemble Score Ponderato:
-$$S_{\text{CIO}} = (w_{\text{quant}} \cdot \text{Score}_1) + (w_{\text{micro}} \cdot \text{Score}_2) + (w_{\text{risk}} \cdot \text{Score}_3) + (w_{\text{macro}} \cdot \text{Score}_4)$$
+LEVEL 0: UNIVERSO E SCOUT
+- Universo: S&P 500, Nasdaq-100, screener Yahoo, movers Alpaca, crypto /USD negoziabili su Alpaca (per volume
+  24h Coinbase/Binance). A mercato USA chiuso solo crypto. Rotazione in blocchi di 100 ticker; la watchlist
+  dell'utente è inclusa in ogni blocco. Riserva: panieri statici.
+- Micro-scout (ta_score, MTF 15m/1h/1d, VWAP, RVOL, beta): anomalia = RVOL >= 1.5x o ROC >= 3%; diventa scheda
+  se lo score tecnico supera 50 (VIX < 20) o 75 (VIX >= 20 o non disponibile).
+- 100 Scout in 6 categorie (Breakout, Volatility, Orderbook, Volume, Whale Tracking, Mean Reversion) arricchiscono
+  ogni ticker con segnali LONG/SHORT. Read-only, nessuna credenziale di trading.
 
-Pesi Dinamici in base al VIX:
-- VIX < 20.0 (Regime Standard): w = [0.35, 0.25, 0.20, 0.20]
-- VIX >= 20.0 (High Volatility): w = [0.20, 0.20, 0.35, 0.25]
+LEVEL 1: PIPELINE A 3 STAGE (quant_core.py)
+- STAGE 1 Fast-Quant: Hurst, Z-Score, Volatility Spike + almeno un segnale LONG degli Scout
+  (bypass: RVOL > 2.5x con score tecnico >= 35; posizioni aperte e schede proposte sono forzate).
+- STAGE 2 Deep Filter: Agente #1 completo e Agente #2; se l'Ensemble può ancora arrivare a 72,
+  News Radar + Groq (Agente #4, timeout 2 s).
+- STAGE 3: Agente #3 (Risk, Safety Net, circuit breaker sul drawdown reale), Agente #6 (pre-trade),
+  Agente #5 (Fusion Engine).
 
-2.2 Condizione di Esecuzione e Veto:
-$$\text{Approved} = \text{Risk Approved} \land \text{Macro Approved} \land (S_{\text{CIO}} \ge 60.0 \lor S_{\text{CIO}} \le 40.0)$$
-(soglie temporanee: erano 68.0 / 32.0. Un veto non azzera lo score: il CIO lo riporta come "VETO RISK" / "VETO MACRO".)
+AGENTI
+- #1 Quant: Hurst, Z-Score, GARCH(1,1), stabilità di Koopman (log-prezzi centrati, soglia 1.02), limiti conformal,
+  traiettoria attesa. quant_score graduato: trend (H > 0.55, Z > 0.5) 70-90; mean reversion (H < 0.45, Z <= -2)
+  85-95; -15 con instabilità di Koopman.
+- #2 Microstruttura: OFI dal book L2 Alpaca (crypto) o stimato dalle candele (azioni), VPIN, iceberg (volume e
+  range relativi alle medie dell'asset), liquidity void, RVOL, lambda di Kyle.
+- #3 Risk: hard stop = max(1.2%, min(3.5%, 1.5 x ATR% giornaliero)), Target 1 = 2R, CVaR 99%, beta,
+  rischio 2% del capitale per trade, esposizione max 50%, max 4 posizioni, nessuna nuova crypto 22:00-08:00,
+  circuit breaker a -5% giornaliero (stesso limite del Drawdown Controller).
+- #4 Macro & News: VIX >= 28 = veto (panico); blackout trimestrali (giorno prima e giorno stesso); News Radar
+  (Finnhub, Polygon, RSS Yahoo, SEC 8-K) giudicato da Groq (impact -1..+1, novelty, catalizzatore, tesi);
+  notizie oltre 30 min = impact 0; veto per notizia negativa (impact <= -0.15) o per spinta quantitativa >= 70
+  senza notizia fresca/valida. Fear & Greed (alternative.me) solo per le crypto.
+- #5 CIO / Fusion Engine: Ensemble = Quant x 0.50 + News x 0.35 + OFI x 0.15. BUY con Ensemble >= 72;
+  SUPER_CONVICTION >= 90. Veti hard: Risk, Macro/News, Guardian.
+- #6 Guardian: hard stop sempre attivo; Target 2R -> vende il 50%, runner a breakeven + commissioni
+  (0.05% azioni, 0.55% crypto) con trailing ATR (1.5x azioni, 2x crypto). Uscite anticipate: Thesis Decay,
+  Orderbook Reversal (OFI L2 <= -0.5 confermato in 2 valutazioni), News Shock (VIX >= 28 o +20% dall'ingresso).
+  Nessun time-stop.
+- #7 CHOP: heartbeat, latenze, coda, RAM/CPU, timeout Groq 2 s per le notizie, auto-healing.
 
-2.3 Modello di Asset Swap (Capital Recycling):
-Un nuovo asset $A_{\text{new}}$ sostituisce l'asset meno performante in portafoglio $A_{\text{weak}}$ se:
-$$S_{\text{CIO}}(A_{\text{new}}) > S_{\text{CIO}}(A_{\text{weak}}) + \Delta_{\text{swap\_threshold}} \quad \text{con } \Delta_{\text{swap\_threshold}} = 20.0$$
+LEVEL 2: COMITATO RISCHI E CIO
+- Comitato Rischi: Technical & Liquidity (RVOL >= 1.2, RSI < 80, MTF >= 2/3, sopra il VWAP, ROC <= 15%; solo
+  informativo per le schede della pipeline tranne RSI estremo e movimento esteso), Sentiment & Compliance
+  (sentiment titoli >= -40, nessuna trimestrale entro 24h, F&G crypto >= 15), Risk & ATR (blocco notturno crypto,
+  drawdown, VIX > 25 con beta > 1.3, negoziabilità, mercato aperto), Quant Ensemble (BUY dello Stage 3).
+  Un veto -> REJECTED_BY_RISK e cooldown 60 min.
+- CIO: solo schede APPROVED_BY_RISK. Convinzione = Ensemble (il CIO non può alzarla). Allocazione:
+  72-79 -> 8-15%, 80-89 -> 15-25%, 90+ -> 35-50%; dimezzata in RISK-OFF; tetto max_allocation_pct;
+  rischio allo stop <= 2% del capitale. ROTATE solo per SUPER_CONVICTION e solo da posizioni con tesi degradata.
+  Nessun SELL discrezionale. Groq con timeout 15 s per chiamata e budget totale 30 s.
 
 ================================================================================
-3. PROTOCOLLI DI SICUREZZA E ISOLAMENTO API
+2. PROTOCOLLI DI SICUREZZA
 ================================================================================
-1. Single Execution Gate: Nessun agente all'infuori dell'Agente #5 (Python) possiede i token/chiavi API per inviare ordini.
-2. Read-Only Isolation: Gli LLM (Groq) e gli Scout lavorano esclusivamente in lettura dati.
-3. Idempotenza degli Ordini: Ogni operazione deve generare un client_order_id univoco con timestamp per prevenire esecuzioni doppie.
+1. Ordini solo da CIO (acquisti) e Guardian (uscite) + azioni manuali dalla dashboard; tutte le vendite
+   (CIO, Guardian, Rischio Zero, Vendi subito, PANIC) sotto lo stesso lock: mai due vendite in parallelo.
+2. Gli LLM (Groq/Gemini) e gli Scout non hanno credenziali di trading.
+3. Idempotenza: ogni acquisto ha un client_order_id univoco "brd-s<stop>-a<alloc>-c<conv>-<uuid>".
+4. Posizioni non leggibili da Alpaca = stato sconosciuto: nessun ordine, nessuna archiviazione.
+5. Primo ciclo dopo un deploy: nessun acquisto; acquisti pendenti del deploy precedente annullati.

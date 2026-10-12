@@ -2,8 +2,10 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 from scipy.signal import lfilter
-from scipy.stats import norm
 from typing import Dict, Any
+
+KOOPMAN_WINDOW = 40          # barre usate per l'operatore di Koopman
+KOOPMAN_UNSTABLE = 1.02      # oltre: deviazioni in amplificazione (calibrato: random walk 1%, trend 4%, accelerazioni 94%)
 
 class HyperQuantAgent:
     """
@@ -85,16 +87,22 @@ class HyperQuantAgent:
         next_var = omega + alpha * returns[-1] ** 2 + beta * last_var
         return float(np.sqrt(max(next_var, 0.0)))
 
-    def koopman_spectral_stability(self, series: pd.Series) -> float:
+    def koopman_spectral_stability(self, series: pd.Series, window: int = KOOPMAN_WINDOW) -> float:
         """
-        Approssimazione spettrale dell'Operatore di Koopman (Dynamic Mode Decomposition).
-        Ritorna il modulo dell'autovalore dominante (|lambda|).
-        |lambda| > 1.0 -> Shift di Regime Imminente / Instabilità
+        Approssimazione spettrale dell'Operatore di Koopman (Dynamic Mode Decomposition) sulle ultime `window`
+        barre: log-prezzi centrati sulla loro media, così l'operatore misura la dinamica delle deviazioni e non il
+        livello del prezzo (sui prezzi grezzi |lambda| vale sempre ~1.00 e la soglia non scattava mai).
+        |lambda| < 1 -> deviazioni che rientrano (random walk ~0.90, mean reversion ~0.75);
+        |lambda| > KOOPMAN_UNSTABLE (1.02) -> deviazioni che si amplificano: accelerazione o crollo, shift di regime.
         """
         if len(series) < 30:
             return 0.95
-        X1 = series.values[:-1].reshape(-1, 1)
-        X2 = series.values[1:].reshape(-1, 1)
+        values = np.log(np.asarray(series.values[-window:], dtype=float))
+        if not np.all(np.isfinite(values)):
+            return 1.0
+        values = values - values.mean()
+        X1 = values[:-1].reshape(-1, 1)
+        X2 = values[1:].reshape(-1, 1)
         try:
             # Minimi quadrati per trovare l'operatore di transizione A
             A = np.linalg.lstsq(X1, X2, rcond=None)[0]
@@ -197,22 +205,24 @@ class HyperQuantAgent:
         # 2. Logica di Punteggio Quantitativo (0 - 100)
         base_score = 50.0
         
+        # Punteggio graduato: la forza del segnale conta (prima i valori erano fissi a 75 / 85 e un trade di
+        # momentum non poteva mai arrivare alla classe SUPER_CONVICTION dell'Agente #5, Ensemble >= 90)
         # Regola Mean Reversion
         if hurst < 0.45:
-            if z_score <= -2.0:  # Ipervenduto statistico -> Bouncing Long
-                base_score += 35.0
+            if z_score <= -2.0:  # Ipervenduto statistico -> Bouncing Long: 85, fino a 95 con eccesso più profondo
+                base_score += 35.0 + min(10.0, (abs(z_score) - 2.0) * 10.0)
             elif z_score >= 2.0: # Ipercomprato statistico -> Short/Exit
                 base_score -= 30.0
 
         # Regola Momentum/Trending
         elif hurst > 0.55:
-            if z_score > 0.5:    # Trend rialzista confermato
-                base_score += 25.0
+            if z_score > 0.5:    # Trend rialzista confermato: 70, fino a 90 con trend più persistente e più esteso
+                base_score += 20.0 + min(15.0, (z_score - 0.5) * 7.5) + min(5.0, (hurst - 0.55) * 50.0)
             elif z_score < -0.5:
                 base_score -= 25.0
 
-        # Penale per Instabilità di Koopman (Cambio di Regime improvviso)
-        if koopman_lambda > 1.05:
+        # Penale per Instabilità di Koopman (deviazioni in amplificazione: accelerazione o crollo)
+        if koopman_lambda > KOOPMAN_UNSTABLE:
             base_score -= 15.0
 
         quant_score = float(np.clip(base_score, 0.0, 100.0))

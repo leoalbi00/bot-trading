@@ -70,31 +70,37 @@ class MicrostructureAgent:
             
         return float(np.clip(volume_imbalance / total_volume, 0.0, 1.0))
 
-    def detect_iceberg_orders(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def detect_iceberg_orders(self, df: pd.DataFrame, min_rel_volume: float = 1.5) -> Dict[str, Any]:
         """
         Rileva ordini nascosti (Iceberg Orders):
         Anomalia dove un volume enorme viene scambiato con uno spostamento di prezzo minimo.
+
+        Volume e range della candela sono confrontati con le MEDIE DELLO STESSO ASSET (ultime 20 candele):
+        volume relativo >= min_rel_volume e (volume relativo / range relativo) > iceberg_sensitivity.
+        Prima il range era in % assoluta del prezzo e la soglia fissa: su asset poco volatili (ETF obbligazionari,
+        large cap tranquille) quasi ogni candela con volume normale risultava un iceberg.
         """
         if len(df) < 10:
             return {"iceberg_detected": False, "side": "NONE", "intensity": 0.0}
-            
+
         recent = df.tail(5)
         vol_mean = df['volume'].tail(20).mean()
-        
+        range_pct = ((df['high'] - df['low']).abs() / df['close'].replace(0, np.nan)).tail(20)
+        range_mean = range_pct.mean()
+
         iceberg_buy = False
         iceberg_sell = False
         max_intensity = 0.0
-        
-        for idx, row in recent.iterrows():
-            price_range = abs(row['high'] - row['low'])
-            vol = row['volume']
-            
-            if vol_mean > 0 and price_range > 0:
-                # Ratio tra Volume e Volatilità/Range della candela
-                vol_to_range_ratio = (vol / vol_mean) / (price_range / row['close'])
-                
-                if vol_to_range_ratio > self.iceberg_sensitivity * 100:
-                    max_intensity = float(vol_to_range_ratio)
+
+        if vol_mean > 0 and range_mean and np.isfinite(range_mean) and range_mean > 0:
+            for idx, row in recent.iterrows():
+                if row['close'] <= 0:
+                    continue
+                rel_vol = row['volume'] / vol_mean
+                rel_range = max(abs(row['high'] - row['low']) / row['close'] / range_mean, 0.05)
+                ratio = rel_vol / rel_range
+                if rel_vol >= min_rel_volume and ratio > self.iceberg_sensitivity:
+                    max_intensity = max(max_intensity, float(ratio))
                     if row['close'] >= row['open']:
                         iceberg_buy = True  # Muro istituzionale in accumulo
                     else:
@@ -104,7 +110,7 @@ class MicrostructureAgent:
             return {"iceberg_detected": True, "side": "BUY_ACCUMULATION", "intensity": max_intensity}
         elif iceberg_sell:
             return {"iceberg_detected": True, "side": "SELL_DISTRIBUTION", "intensity": max_intensity}
-        
+
         return {"iceberg_detected": False, "side": "NONE", "intensity": 0.0}
 
     def detect_liquidity_void(self, df: pd.DataFrame) -> bool:

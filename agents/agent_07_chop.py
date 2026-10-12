@@ -13,7 +13,6 @@ Auto-healing:
 Ogni `audit_interval` secondi produce la riga
 `🐝 [CHOP SWARM AUDIT] N Scout Attivi | Backlog Code: X | Stage 1 Latency: Yms | RAM: ZMB`.
 """
-import os
 import resource
 import threading
 import time
@@ -206,12 +205,16 @@ class ChopWatchdog:
             line += f" | auto-healing: {snap['heals'][-1]}"
         return line
 
-    def maybe_audit(self, log: Callable[[str], Any], swarm=None, engine=None, force: bool = False) -> Optional[str]:
-        """Auto-healing + riga di audit, al massimo una volta ogni audit_interval secondi."""
+    def maybe_audit(self, log: Callable[[str], Any], swarm=None, engine=None, force: bool = False,
+                    heal_workers: bool = True) -> Optional[str]:
+        """Auto-healing + riga di audit, al massimo una volta ogni audit_interval secondi.
+
+        heal_workers=False: durante un ciclo della pipeline i Worker li scala già il consumatore della coda.
+        """
         if not force and time.time() - self._last_audit < self.audit_interval:
             return None
         self._last_audit = time.time()
-        self.check_and_heal(engine=engine, swarm=swarm)
+        self.check_and_heal(engine=engine if heal_workers else None, swarm=swarm)
         line = self.audit_line(self.snapshot(swarm=swarm, engine=engine))
         log(line)
         return line

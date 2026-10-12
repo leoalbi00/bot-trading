@@ -1,7 +1,7 @@
 #!/bin/bash
 # Avvia la dashboard e il desk di trading (app.py) in background.
-# NB: autonomous_market_scanner.py NON viene più avviato: era un secondo bot con una strategia diversa
-# che inviava ordini in conflitto con il CIO e il Guardian.
+# NB: il vecchio autonomous_market_scanner.py (secondo bot con una strategia diversa, rimosso dal repository)
+# inviava ordini in conflitto con il CIO e il Guardian.
 cd "$(dirname "$0")"
 if [ -f bot.pid ] && kill -0 "$(cat bot.pid)" 2>/dev/null; then
     echo "Bot già in esecuzione (PID: $(cat bot.pid))."

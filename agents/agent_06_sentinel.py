@@ -13,7 +13,8 @@ Due funzioni:
      che segue il picco a distanza mult x ATR%;
    - Uscite anticipate prima dello stop, e solo queste:
      1. Thesis Decay: l'Agente #4 rileva una smentita o il decadimento del catalizzatore (notizie fresche);
-     2. Orderbook Reversal: l'Agente #2 registra OFI <= -0.5;
+     2. Orderbook Reversal: l'Agente #2 registra OFI <= -0.5 sul book L2 reale, confermato da due valutazioni
+        consecutive (il desk non passa l'OFI stimato dalle candele, usato per le azioni);
      3. News Shock / Panico Macro: VIX >= 28 o VIX salito di oltre il 20% dall'ingresso.
 R = distanza dello stop iniziale. Scaling out e uscite anticipate rispettano, per le azioni, l'apertura del
 mercato (a mercato chiuso i dati sono fermi); gli stop (hard, breakeven, trailing) sono sempre attivi.
@@ -42,7 +43,7 @@ class PortfolioGuardianAgent:
         vix_panic: float = 28.0,
         vix_spike_pct: float = 20.0,
         ofi_reversal: float = -0.5,
-        fee_buffer_crypto_pct: float = 0.30,
+        fee_buffer_crypto_pct: float = 0.55,   # ordini a mercato = taker: ~0.25% per lato su Alpaca crypto + spread
         fee_buffer_stock_pct: float = 0.05,
         atr_mult_stock: float = 1.5,
         atr_mult_crypto: float = 2.0,
@@ -118,7 +119,7 @@ class PortfolioGuardianAgent:
 
         scaled_out: il Target 1 è già stato incassato (runner a breakeven, trailing ATR attivo).
         signals: letture fresche degli agenti per le uscite anticipate
-                 {"thesis_decay": str|None, "ofi": float, "vix": float, "vix_at_entry": float}
+                 {"thesis_decay": str|None, "ofi": float, "ofi_exit": float|None, "vix": float, "vix_at_entry": float}
                  (valori assenti = segnale non disponibile).
         """
         if entry <= 0 or price <= 0:
@@ -176,7 +177,8 @@ class PortfolioGuardianAgent:
         # Uscite anticipate: solo se la tesi è concretamente caduta
         if sig.get("thesis_decay"):
             return exit_("THESIS_DECAY", f"Agente #4: {sig['thesis_decay']}, uscita anticipata a PnL {pnl:+.2f}%")
-        ofi = sig.get("ofi")
+        # "ofi_exit" (se presente) è la lettura confermata dal desk; altrimenti si usa "ofi"
+        ofi = sig.get("ofi_exit") if "ofi_exit" in sig else sig.get("ofi")
         if ofi is not None and ofi <= self.ofi_reversal:
             return exit_("OFI_REVERSAL", f"Agente #2: inversione violenta del book (OFI {ofi:+.2f} ≤ {self.ofi_reversal:+.2f}), "
                                          f"uscita anticipata a PnL {pnl:+.2f}%")

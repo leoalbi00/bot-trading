@@ -13,7 +13,7 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from scouts.detectors import CATEGORIES, DETECTORS
 

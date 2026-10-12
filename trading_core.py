@@ -1,4 +1,4 @@
-"""Logica condivisa tra app.py e autonomous_market_scanner.py.
+"""Logica del desk di trading usata da app.py (dashboard, CIO, Guardian, sciame) e command_center.py.
 
 Contiene: conversione simboli Alpaca <-> yfinance, parsing robusto delle
 decisioni IA, chiamate a Gemini, notizie e invio ordini con controlli di
@@ -380,7 +380,6 @@ alpaca_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True) if ALPACA_K
 _gemini_client = None
 
 _DECISION_RE = re.compile(r"DECISIONE\s*[:=\-]?\s*[*_`\"']*\s*(BUY|SELL|HOLD)\b", re.IGNORECASE)
-_LEADING_DECISION_RE = re.compile(r"^\W*(BUY|SELL|HOLD)\b", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -437,24 +436,6 @@ def to_yf_symbol(alpaca_symbol, crypto=None):
 _SCORE_RE = re.compile(r"SCORE[\s*_`]*[:=][\s*_`\[]*(\d{1,3})", re.IGNORECASE)
 
 
-def parse_score(text):
-    """Estrae SCORE: 0-100 dalla risposta, oppure None."""
-    match = _SCORE_RE.search(text or "")
-    return max(0, min(100, int(match.group(1)))) if match else None
-
-
-def parse_decision(text, allowed=("BUY", "SELL", "HOLD")):
-    """Estrae la decisione dal testo dell'IA. In caso di dubbio restituisce HOLD."""
-    if not text:
-        return "HOLD"
-    match = _DECISION_RE.search(text) or _LEADING_DECISION_RE.search(text.strip())
-    if match:
-        decision = match.group(1).upper()
-        if decision in allowed:
-            return decision
-    return "HOLD"
-
-
 _warned_at = {}
 
 
@@ -494,55 +475,6 @@ def _no_ai_keys(log):
     return "quant"
 
 
-def query_ai_with_source(prompt, log=print, symbol=None):
-    """Restituisce (testo, motore) dove motore indica chi ha deciso (es. "Groq openai/gpt-oss-120b").
-
-    Interroga il motore scelto in config.json (gemini / groq / hybrid / quant).
-
-    - gemini / groq: se il motore scelto non risponde si prova l'altra IA.
-    - hybrid: si opera solo se Gemini e Groq sono d'accordo, altrimenti HOLD;
-      se uno dei due non risponde si usa l'altro.
-    - Se nessuna IA risponde (o non ci sono chiavi) e `symbol` è indicato,
-      si usa il motore quantitativo di riserva (RSI + SMA20).
-    """
-    provider = _resolve_provider(get_config()["ai_provider"], log)
-
-    if provider == "quant":
-        if not symbol:
-            return "DECISIONE: HOLD | MOTIVO: Nessun simbolo per l'analisi quantitativa", "Nessuno"
-        return quant_decision(symbol, log), "Quant"
-
-    if provider == "hybrid":
-        gemini_res = _ask_gemini(prompt, log)
-        groq_res = _ask_groq(prompt, log)
-        if gemini_res and groq_res:
-            d_gemini, d_groq = parse_decision(gemini_res), parse_decision(groq_res)
-            decision = d_gemini if d_gemini == d_groq else "HOLD"
-            return (f"DECISIONE: {decision} | IBRIDO (Gemini={d_gemini}, Groq={d_groq})\n"
-                    f"[Gemini] {gemini_res}\n[Groq] {groq_res}"), "Ibrido Gemini+Groq"
-        if gemini_res or groq_res:
-            working, failed = ("Gemini", "Groq") if gemini_res else ("Groq", "Gemini")
-            log(f"⚠️ Modalità Ibrida: {failed} non ha risposto, decisione basata solo su {working}.")
-            return gemini_res or groq_res, _last_model[working.lower()]
-        result = None
-    else:
-        # Motore scelto, poi l'altra IA (se ha la chiave) prima del motore quantitativo
-        ask = {"gemini": (_ask_gemini, "Gemini", GEMINI_KEY), "groq": (_ask_groq, "Groq", GROQ_KEY)}
-        primary_fn, primary_name, _ = ask[provider]
-        backup_fn, backup_name, backup_key = ask["groq" if provider == "gemini" else "gemini"]
-        result, source = primary_fn(prompt, log), primary_name
-        if not result and backup_key:
-            log(f"🔁 {primary_name} non ha risposto: provo {backup_name} come riserva.")
-            result, source = backup_fn(prompt, log), backup_name
-        if result:
-            return result, _last_model[source.lower()]
-
-    if symbol:
-        log("🧮 Nessuna IA disponibile: uso l'analisi quantitativa di riserva (RSI + SMA20).")
-        return quant_decision(symbol, log), "Quant"
-    return "DECISIONE: HOLD | MOTIVO: Nessun motore IA ha risposto", "Nessuno"
-
-
 # Ultimo modello che ha risposto per ciascun provider (per i log delle decisioni)
 _last_model = {"gemini": "Gemini", "groq": "Groq"}
 
@@ -564,7 +496,7 @@ _groq_client = None
 
 from agents.agent_07_chop import GROQ_TIMEOUT_S
 from agents.agent_03_risk import (MAX_EXPOSURE_PCT as RISK_MAX_EXPOSURE_PCT, MAX_POSITIONS as RISK_MAX_POSITIONS,
-                                  HARD_STOP_ATR_MULT, HARD_STOP_MAX_PCT, HARD_STOP_MIN_PCT, MAX_DAILY_DRAWDOWN_PCT,
+                                  HARD_STOP_ATR_MULT, MAX_DAILY_DRAWDOWN_PCT,
                                   MAX_RISK_PER_TRADE_PCT, clamp_stop_pct, crypto_night_blocked, hard_stop_pct)
 
 
@@ -599,10 +531,12 @@ def _has_decision(text):
     return bool(_DECISION_RE.search(text))
 
 
-def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024):
+def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024, timeout=None, deadline=None):
     """Prova i modelli Groq in sequenza; restituisce il testo o None. Gli errori vengono loggati.
 
     `validate` scarta le risposte nel formato sbagliato (es. rifiuti) e passa al modello successivo.
+    timeout: secondi per chiamata (default GROQ_TIMEOUT_S = 2 s del client, pensato per i giudizi brevi sulle
+    notizie); deadline (time.monotonic()): budget totale, oltre il quale non si provano altri modelli.
     """
     global _groq_client
     if not GROQ_KEY:
@@ -623,6 +557,15 @@ def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024)
         return None
 
     for model in models:
+        extra = {}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining < 1.0:
+                log("⚠️ Groq: budget di tempo esaurito, nessun altro modello provato.")
+                return None
+            extra["timeout"] = min(timeout or remaining, remaining)
+        elif timeout:
+            extra["timeout"] = timeout
         try:
             res = _groq_client.chat.completions.create(
                 model=model,
@@ -631,6 +574,7 @@ def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024)
                     {"role": "system", "content": system or AI_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
+                **extra,
             )
             text = res.choices[0].message.content if res.choices else None
             if text and validate(text):
@@ -775,8 +719,9 @@ def indicators_on_closed_bars(df):
     closed = completed_bars(df)
     if closed is None or len(closed) < 60:
         return None
-    # vol_ratio usa già la penultima candela: gli si passa la serie completa per non saltarne due
-    ind = compute_indicators(closed["Close"], volume=df["Volume"])
+    # vol_ratio sull'ultima candela CHIUSA: se yfinance non ha restituito una candela in formazione
+    # (completed_bars non ha tolto nulla) l'ultima è già chiusa e non va saltata
+    ind = compute_indicators(closed["Close"], volume=closed["Volume"], last_in_progress=False)
     ind["price"] = float(df["Close"].iloc[-1])
     return ind
 
@@ -793,11 +738,11 @@ def get_indicators(yf_symbol):
         return None
 
 
-def compute_indicators(close, volume=None):
+def compute_indicators(close, volume=None, last_in_progress=True):
     """Calcola gli indicatori da una serie di prezzi di chiusura (almeno 60 valori).
 
-    Con `volume` calcola anche vol_ratio: volume dell'ultima candela COMPLETA
-    (la più recente di yfinance è ancora in corso) diviso la media dei 20 periodi precedenti.
+    Con `volume` calcola anche vol_ratio: volume dell'ultima candela COMPLETA diviso la media di riferimento.
+    last_in_progress=True: l'ultima candela di `volume` è ancora in formazione e si usa la penultima.
     """
     macd = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
     hist = macd.macd_diff()
@@ -819,11 +764,11 @@ def compute_indicators(close, volume=None):
         "roc": round(float(ta.momentum.ROCIndicator(close, window=10).roc().iloc[-1]), 2),
         "sma20": float(ta.trend.SMAIndicator(close, window=20).sma_indicator().iloc[-1]),
         "sma50": float(ta.trend.SMAIndicator(close, window=50).sma_indicator().iloc[-1]),
-        "vol_ratio": _volume_ratio(volume),
+        "vol_ratio": _volume_ratio(volume, last_in_progress),
     }
 
 
-def _volume_ratio(volume):
+def _volume_ratio(volume, last_in_progress=True):
     """Volume dell'ultima candela completa rispetto alla media della STESSA ORA nei giorni precedenti.
 
     Il volume intraday ha un andamento a U (alto in apertura e chiusura): confrontarlo con la media
@@ -832,10 +777,11 @@ def _volume_ratio(volume):
     """
     if volume is None or len(volume) < 22:
         return None
-    last = float(volume.iloc[-2])
-    history = volume.iloc[:-2]
+    i = -2 if last_in_progress else -1
+    last = float(volume.iloc[i])
+    history = volume.iloc[:i]
     try:
-        same_hour = history[history.index.hour == volume.index[-2].hour].iloc[-20:]
+        same_hour = history[history.index.hour == volume.index[i].hour].iloc[-20:]
     except AttributeError:
         same_hour = history.iloc[:0]
     sample = same_hour if len(same_hour) >= 5 else history.iloc[-20:]
@@ -879,28 +825,6 @@ def wait_for_fill(order_id, timeout=20, log=print):
             log(f"Errore controllo ordine {order_id}: {e}")
         time.sleep(2)
     return None
-
-
-def quant_rule(rsi, price, sma20):
-    """Regole del motore quantitativo: (decisione, motivo)."""
-    if rsi < 30 and price > sma20:
-        return "BUY", f"RSI {rsi:.1f} < 30 (ipervenduto) e prezzo sopra SMA20"
-    if rsi > 70:
-        return "SELL", f"RSI {rsi:.1f} > 70 (ipercomprato)"
-    return "HOLD", f"RSI {rsi:.1f} neutrale"
-
-
-def quant_decision(yf_symbol, log=print):
-    """Analisi tecnica senza IA, nello stesso formato testuale delle risposte IA."""
-    ind = get_indicators(yf_symbol)
-    if not ind:
-        log(f"🧮 [Quant] {yf_symbol}: dati insufficienti, HOLD.")
-        return "DECISIONE: HOLD | MOTIVO: [Quant] dati di mercato insufficienti"
-    decision, reason = quant_rule(ind["rsi"], ind["price"], ind["sma20"])
-    detail = f"prezzo ${ind['price']:.2f}, SMA20 ${ind['sma20']:.2f}"
-    score = ta_score(ind)
-    log(f"🧮 [Quant] {yf_symbol}: {decision} ({reason}; {detail}; score {score})")
-    return f"DECISIONE: {decision} | SCORE: {score} | MOTIVO: [Quant] {reason}; {detail}"
 
 
 # ---------------------------------------------------------------------------
@@ -959,7 +883,7 @@ def close_position(alpaca_symbol):
 def allocation_pct_for_score(score, cfg):
     """Percentuale del capitale per ordine in base alla confidenza (score 0-100).
 
-    - score < 85 (BUY standard): base_allocation_pct (default 15%)
+    - score < 85 (BUY standard): base_allocation_pct (default 5%, config.json)
     - score 85-100 (STRONG BUY): da 25% a 30% in proporzione allo score,
       senza superare max_allocation_pct
     """
@@ -1150,8 +1074,6 @@ BOARDROOM_STATE_PATH = os.path.join(DATA_DIR, "boardroom_state.json")
 SENTIMENT_VETO = -40
 ATR_MULT_STOCK = 1.5            # Chandelier Exit del runner: distanza dal picco = mult x ATR% giornaliero
 ATR_MULT_CRYPTO = 2.0
-STOP_TIGHTEST_PCT = -HARD_STOP_MIN_PCT   # Hard Stop Loss non negoziabile (Agente #3): tra -1.2% ...
-STOP_WIDEST_PCT = -HARD_STOP_MAX_PCT     # ... e -3.5% (1.5 x ATR%)
 DAILY_DRAWDOWN_LIMIT = -MAX_DAILY_DRAWDOWN_PCT   # -5%: stesso limite del circuit breaker dell'Agente #3
 DRAWDOWN_BLOCK_HOURS = 24
 AUDIT_MIN_TRADES = 3
@@ -1287,7 +1209,7 @@ GUARDIAN_ENTRY_MATCH_PCT = 0.5   # prezzo medio cambiato oltre lo 0.5%: nuova po
 GUARDIAN_CLOSED_MAX = 30         # chiusure recenti (con exit_reason) conservate in guardian_positions.json
 THESIS_NEWS_DROP = 0.3           # rotazione: tesi degradata se l'impact delle notizie fresche scende di 0.3 dall'ingresso
 GUARDIAN_STATE_PATH = os.path.join(DATA_DIR, "guardian_positions.json")
-_guardian_cache = {"atr": {}, "peak": {}}
+_guardian_cache = {"atr": {}, "peak": {}, "ofi": {}}
 _guardian_cache_lock = threading.RLock()
 
 
@@ -1378,8 +1300,13 @@ def _fallback_thesis(yf_symbol):
     return f"{yf_symbol}: posizione senza scheda di ingresso registrata (aperta prima del Fusion Engine o fuori dal bot)"
 
 
-def guardian_position_state(p, vix=None):
-    """Stato persistente della posizione per l'Agente #6 (creato al primo giro, tesi registrata all'acquisto)."""
+def guardian_position_state(p, vix=None, scaled_hint=None):
+    """Stato persistente della posizione per l'Agente #6 (creato al primo giro, tesi registrata all'acquisto).
+
+    scaled_hint: vendita parziale già avvenuta secondo lo storico ordini di Alpaca (sync_ledger). Serve quando lo
+    stato locale manca (es. deploy su un disco non persistente): senza, il runner tornerebbe allo hard stop e il
+    Guardian rivenderebbe un altro 50% al Target 2R.
+    """
     key, entry = normalize_symbol(p["symbol"]), p.get("avg_entry_price") or p["current_price"]
     with _guardian_cache_lock:
         data = _gstate_read()
@@ -1387,7 +1314,7 @@ def guardian_position_state(p, vix=None):
         if st and st.get("entry") and abs(entry / st["entry"] - 1) * 100 > GUARDIAN_ENTRY_MATCH_PCT:
             st = None                      # nuova posizione sullo stesso simbolo: memoria azzerata
         if not st:
-            st = data["positions"][key] = {"entry": entry, "vix0": vix, "scaled": False, "scale_out": None,
+            st = data["positions"][key] = {"entry": entry, "vix0": vix, "scaled": bool(scaled_hint), "scale_out": None,
                                            "exit_reason": None, **_thesis_fields(quant_rationale(p["yf_symbol"], max_age_sec=3600))}
             changed = True
         elif not st.get("entry"):
@@ -1471,12 +1398,38 @@ def _save_hold_rationales(evals):
             _gstate_write(data, force=False)
 
 
-def guardian_signals(q, vix, vix0, entry_impact=None):
-    """Letture degli Agenti #2 e #4 per le uscite anticipate (solo VIX se la valutazione è troppo vecchia)."""
+OFI_EXIT_CONFIRMATIONS = 2       # Orderbook Reversal: OFI L2 sotto soglia in 2 valutazioni consecutive (non un singolo snapshot)
+
+
+def _ofi_exit_signal(key, q):
+    """OFI valido per l'uscita Orderbook Reversal, oppure None.
+
+    Solo l'OFI del book L2 reale (crypto) e solo se resta sotto la soglia in OFI_EXIT_CONFIRMATIONS valutazioni
+    distinte consecutive. L'OFI stimato dalle candele (azioni: Alpaca non fornisce L2) va sotto -0.5 in un normale
+    ritracciamento e un singolo snapshot del book è rumore: entrambi generavano uscite anticipate spurie.
+    """
+    micro = q.get("agent_02_micro") or {}
+    ofi, source = micro.get("ofi"), micro.get("ofi_source")
+    threshold = portfolio_guardian().ofi_reversal
+    with _guardian_cache_lock:
+        c = _guardian_cache["ofi"].setdefault(key, {"eval": None, "count": 0, "ts": time.time()})
+        if c["eval"] != q["evaluated_at"]:
+            below = source == "L2_BOOK" and ofi is not None and ofi <= threshold
+            c.update(eval=q["evaluated_at"], count=c["count"] + 1 if below else 0, ts=time.time())
+        confirmed = c["count"] >= OFI_EXIT_CONFIRMATIONS
+    return ofi if confirmed else None
+
+
+def guardian_signals(q, vix, vix0, entry_impact=None, key=None):
+    """Letture degli Agenti #2 e #4 per le uscite anticipate (solo VIX se la valutazione è troppo vecchia).
+
+    "ofi" è la lettura mostrata nella scheda; "ofi_exit" quella che può chiudere la posizione (L2 confermato).
+    """
     sig = {"vix": vix, "vix_at_entry": vix0}
     if q and time.time() - q["evaluated_at"] <= GUARDIAN_SIGNAL_MAX_AGE_SEC:
         news = q["agent_04_macro"].get("news") or {}
         sig.update(ofi=q["agent_02_micro"]["ofi"], news=news,
+                   ofi_exit=_ofi_exit_signal(key or "?", q),
                    thesis_decay=quant_engine().agent_macro.thesis_decay(entry_impact, news))
     return sig
 
@@ -1484,15 +1437,16 @@ def guardian_signals(q, vix, vix0, entry_impact=None):
 def thesis_degraded(yf_symbol):
     """(degradata, motivo) per la Rotazione Intelligente del Capitale: SOLO tesi concretamente degradate.
 
-    Degradata = OFI diventato negativo o notizie fresche con impact negativo / sceso di THESIS_NEWS_DROP
+    Degradata = OFI del book L2 diventato negativo o notizie fresche con impact negativo / sceso di THESIS_NEWS_DROP
     dall'ingresso. Senza una valutazione recente la tesi resta intatta: nessuna vendita "al buio".
     """
     q = quant_rationale(yf_symbol, max_age_sec=GUARDIAN_SIGNAL_MAX_AGE_SEC)
     if not q:
         return False, "nessuna valutazione recente: tesi considerata intatta"
     ofi = q["agent_02_micro"].get("ofi")
-    if ofi is not None and ofi < 0:
-        return True, f"OFI diventato negativo ({ofi:+.2f})"
+    # Solo il book L2 reale (crypto): l'OFI stimato dalle candele delle azioni è negativo a ogni ritracciamento
+    if ofi is not None and ofi < 0 and q["agent_02_micro"].get("ofi_source") == "L2_BOOK":
+        return True, f"OFI del book diventato negativo ({ofi:+.2f})"
     news = q["agent_04_macro"].get("news") or {}
     if news.get("status") == "OK":
         impact = float(news.get("impact_score") or 0)
@@ -1577,8 +1531,8 @@ def guardian_evaluate(p, info, stop, atr, market_open, now=None, stop_basis=None
     peak = max(guardian_peak(p["yf_symbol"], opened, price), price, entry)
     q = quant_rationale(p["yf_symbol"], max_age_sec=3600)
     vix = (latest_channels().get("macro") or {}).get("vix")
-    st = guardian_position_state(p, vix)
-    sig = guardian_signals(q, vix, st.get("vix0"), st.get("entry_news_impact"))
+    st = guardian_position_state(p, vix, scaled_hint=info.get("scaled_out"))
+    sig = guardian_signals(q, vix, st.get("vix0"), st.get("entry_news_impact"), key=normalize_symbol(p["symbol"]))
     agent = portfolio_guardian()
     g = agent.evaluate_position(entry=entry, price=price, peak=peak, stop_pct=clamp_stop_pct(stop), atr_pct=atr,
                                 is_crypto=p["is_crypto"], market_open=market_open, scaled_out=bool(st.get("scaled")),
@@ -1696,7 +1650,8 @@ def drawdown_controller(account, state, log=print):
 def sync_ledger(days=90, log=print):
     """Ricostruisce dagli ordini Alpaca eseguiti (FIFO) i trade chiusi e le posizioni aperte.
 
-    Restituisce {"trades": [...], "open": {simbolo: {"opened_at", "stop_pct"}}} oppure None se Alpaca
+    Restituisce {"trades": [...], "open": {simbolo: {"opened_at", "stop_pct", "allocation_pct", "conviction",
+    "scaled_out"}}} oppure None se Alpaca
     non risponde. I trade vengono salvati in trade_history.json (solo come copia: la fonte è Alpaca).
     """
     if not alpaca_client:
@@ -1722,6 +1677,7 @@ def sync_ledger(days=90, log=print):
     orders.sort(key=lambda o: o.filled_at or o.submitted_at)
 
     lots, trades = {}, []
+    partial = {}    # simbolo -> vendita parziale dopo l'apertura (Target 2R, Rischio Zero o rotazione parziale)
     for o in orders:
         qty = float(o.filled_qty or 0)
         price = float(o.filled_avg_price or 0)
@@ -1735,6 +1691,8 @@ def sync_ledger(days=90, log=print):
             stop = -int(m.group(1)) / 100 if m and int(m.group(1)) > 0 else None
             alloc = int(m.group(2)) / 10 if m and m.group(2) else None
             conv = int(m.group(3)) if m and m.group(3) else None
+            if not lots.get(key):
+                partial[key] = False          # nuova posizione: nessuna parte ancora incassata
             lots.setdefault(key, []).append([qty, price, filled_at, stop, alloc, conv])
             continue
         remaining, cost, matched, held_min_weighted = qty, 0.0, 0.0, 0.0
@@ -1754,11 +1712,14 @@ def sync_ledger(days=90, log=print):
         if queue and sum(lot[0] for lot in queue) <= qty * 0.01:
             queue.clear()
         if matched > 0:
+            partial[key] = bool(queue)        # vendita con posizione ancora aperta = vendita parziale
+        if matched > 0:
             entry = cost / matched
             trades.append({
                 "symbol": o.symbol, "qty": round(matched, 8), "entry": round(entry, 6), "exit": round(price, 6),
                 "pnl": round((price - entry) * matched, 2), "pnl_pct": round((price / entry - 1) * 100, 2),
                 "closed_at": filled_at.strftime("%Y-%m-%d %H:%M:%S") if filled_at else str(o.filled_at)[:19],
+                "closed_ts": round(filled_at.timestamp(), 3) if filled_at else None,
                 "held_min": round(held_min_weighted / matched, 1),
             })
     open_info = {}
@@ -1769,7 +1730,9 @@ def sync_ledger(days=90, log=print):
             convs = [lot[5] for lot in queue if lot[5] is not None]
             open_info[key] = {"opened_at": queue[0][2], "stop_pct": stops[-1] if stops else None,
                               "allocation_pct": round(sum(allocs), 1) if allocs else None,
-                              "conviction": convs[-1] if convs else None}
+                              "conviction": convs[-1] if convs else None,
+                              # metà già incassata: ricostruita da Alpaca se guardian_positions.json è andato perso
+                              "scaled_out": bool(partial.get(key))}
     write_json_file(TRADE_HISTORY_PATH, trades)
     return {"trades": trades, "open": open_info}
 
@@ -1838,7 +1801,7 @@ def startup_system_sync(log=print):
 #   Tier 1  Micro-Scout paralleli (pool di SCOUT_MAX_WORKERS thread, calcoli puramente matematici)
 #   Tier 2  Chief of Staff / Orchestrator (coda, TTL 15 min, cooldown 60 min, stati atomici)
 #   Tier 3  Comitato Rischi: 3 gatekeeper in parallelo con potere di veto
-#   Tier 4  CIO Portfolio Manager (Groq) con convinzione 0-100 e sizing dinamico 5%-35%
+#   Tier 4  CIO Portfolio Manager (Groq) con convinzione 0-100 e sizing dinamico 8%-50% (CONVICTION_BANDS)
 #   Tier 5  Execution Desk + Post-Trade Auditor (vedi app.py / sync_ledger / performance_stats)
 # Dati: 5 canali di intelligence (macro & VIX, multi-timeframe, order flow, sentiment, correlazioni).
 # I thread di scansione NON inviano ordini: gli ordini partono solo dal CIO.
@@ -2642,6 +2605,7 @@ def prune_runtime_caches():
         _prune_cache(_guardian_cache["atr"], GUARDIAN_ATR_TTL_SEC)
         # Il picco delle posizioni aperte viene riletto ogni 15 minuti (ts aggiornato): restano solo quelle vive
         _prune_cache(_guardian_cache["peak"], 6 * 3600, ts=lambda v: v["ts"])
+        _prune_cache(_guardian_cache["ofi"], 6 * 3600, ts=lambda v: v["ts"])
 
 
 def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotate=False, exposure_usd=None,
@@ -2903,7 +2867,7 @@ def latest_channels():
 
 
 def conviction_band(conviction):
-    """(min %, max %) del capitale per la convinzione indicata, oppure None se < 70."""
+    """(min %, max %) del capitale per la convinzione indicata, oppure None se < MIN_CONVICTION (72)."""
     for floor, lo, hi in CONVICTION_BANDS:
         if conviction is not None and conviction >= floor:
             return lo, hi
@@ -2982,20 +2946,32 @@ def parse_desk_decision(text):
     return base
 
 
+CIO_LLM_TIMEOUT_S = 15     # per chiamata: il mandato del CIO è un JSON con ragionamento, non un giudizio da 2 s
+CIO_LLM_BUDGET_S = 30      # budget totale del CIO su tutti i modelli (il ciclo tiene il lock delle vendite)
+
+
 def ask_desk_cio(prompt, log=print):
-    """Interroga il CIO (provider da configurazione, Groq di default). (decisione, motore) o (None, None)."""
+    """Interroga il CIO (provider da configurazione, Groq di default). (decisione, motore) o (None, None).
+
+    Groq con timeout di CIO_LLM_TIMEOUT_S per chiamata e budget totale CIO_LLM_BUDGET_S: il limite di 2 s
+    dell'Agente #7 vale per le notizie e faceva cadere quasi sempre il CIO sul motore quantitativo di riserva.
+    """
     provider = _resolve_provider(get_config()["ai_provider"], log)
     if provider == "quant":
         return None, None
     validate = lambda t: parse_desk_decision(t) is not None
     order = [_ask_groq, _ask_gemini] if provider in ("groq", "hybrid") else [_ask_gemini, _ask_groq]
     keys = {_ask_gemini: GEMINI_KEY, _ask_groq: GROQ_KEY}
+    deadline = time.monotonic() + CIO_LLM_BUDGET_S
     for i, fn in enumerate(order):
         if not keys[fn]:
             continue
+        if deadline - time.monotonic() < 5:
+            log("⚠️ CIO: budget di tempo dell'IA esaurito, decide il motore quantitativo.")
+            break
         kwargs = {"system": DESK_CIO_SYSTEM_PROMPT, "validate": validate}
         if fn is _ask_groq:
-            kwargs["max_tokens"] = 2048
+            kwargs.update(max_tokens=2048, timeout=CIO_LLM_TIMEOUT_S, deadline=deadline)
         text = fn(prompt, log, **kwargs)
         if text:
             return parse_desk_decision(text), _last_model["groq" if fn is _ask_groq else "gemini"]
@@ -3221,8 +3197,10 @@ def audit_board(held_symbols=(), stage=None, limit=300):
     for e in executed:
         e["in_portfolio"] = normalize_symbol(e["symbol"]) in held
     # Posizioni aperte prima del registro di audit: report dal registro operazioni (executions.db)
-    for key in held - {normalize_symbol(e["symbol"]) for e in executed}:
-        entry = next((x for x in list_executions(limit=500) if x["side"] == "BUY" and normalize_symbol(x["symbol"]) == key), None)
+    missing = held - {normalize_symbol(e["symbol"]) for e in executed}
+    journal = list_executions(limit=500) if missing else []   # una sola lettura del registro, non una per posizione
+    for key in missing:
+        entry = next((x for x in journal if x["side"] == "BUY" and normalize_symbol(x["symbol"]) == key), None)
         if entry:
             r = entry.get("rationale") or {}
             executed.append({"symbol": entry["symbol"], "ts": 0, "time": entry["timestamp"], "in_portfolio": True,
@@ -3362,7 +3340,8 @@ def run_closed_market_pulse(log=print, force=False):
 #   Il piano dell'Agente #5 è consultivo: gli ordini restano al CIO del desk (run_trading_cycle),
 #   che usa la valutazione dei 5 agenti come rationale delle operazioni.
 # ===========================================================================
-_quant_lock = threading.Lock()
+_quant_lock = threading.Lock()        # un solo ciclo della pipeline a 3 Stage alla volta
+_quant_init_lock = threading.Lock()   # solo per la creazione dell'orchestratore: mai tenuto durante un ciclo
 _quant_engine_ref = {"core": None}
 _balance_cache = {"ts": 0.0, "value": None}
 
@@ -3374,8 +3353,15 @@ _news_cache = {}
 
 
 def quant_engine():
-    """Istanza unica dell'orchestratore (100 Scout, 7 agenti, CHOP); import pigro: scipy solo quando serve."""
-    with _quant_lock:
+    """Istanza unica dell'orchestratore (100 Scout, 7 agenti, CHOP); import pigro: scipy solo quando serve.
+
+    Usa un lock dedicato alla creazione: prima prendeva _quant_lock, tenuto per tutto il ciclo dello sciame, e il
+    Guardian (che chiama quant_engine() a ogni giro) restava bloccato anche per decine di secondi.
+    """
+    core = _quant_engine_ref["core"]
+    if core is not None:
+        return core
+    with _quant_init_lock:
         if _quant_engine_ref["core"] is None:
             from quant_core import QuantitativeTradingCore
             from agents.agent_04_macro import NewsRadar
@@ -3399,7 +3385,9 @@ def events_for_agents(yf_symbol):
     events = []
     earnings = earnings_within(yf_symbol)
     if earnings:
-        events.append({"timestamp": f"{earnings}T13:30:00", "event_name": f"Trimestrale {yf_symbol}"})
+        # Yahoo fornisce solo il giorno (le trimestrali escono prima dell'apertura o dopo la chiusura):
+        # evento di giornata, blackout dal giorno prima al giorno stesso come il veto del Comitato Rischi
+        events.append({"date": earnings, "all_day": True, "event_name": f"Trimestrale {yf_symbol}"})
     _news_cache[yf_symbol] = (time.time(), events)
     return events
 
@@ -3444,12 +3432,14 @@ def crypto_order_books(yf_symbols, depth=10):
 
 
 def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, order_books=None, force=(),
-                            pending=(), exposure_usd=None, positions_count=None, scout_meta=None):
+                            pending=(), exposure_usd=None, positions_count=None, scout_meta=None, blocking=True):
     """Sciame di 100 Scout -> asyncio.Queue -> pipeline a 3 Stage (7 agenti). Restituisce il piano dell'Agente #5.
 
     scout_frames: [(scout_id, yf_symbol, DataFrame 1h di yfinance), ...] (si usano solo le candele chiuse)
     force: simboli da portare comunque fino allo Stage 3 (posizioni aperte e schede proposte dallo sciame classico)
     order_books: snapshot L2 già pronti (None = richiesta ad Alpaca per le crypto).
+    blocking=False: se un altro ciclo della pipeline è in corso si rinuncia subito (restituisce None) invece di
+    attenderlo; quel ciclo valuta comunque le posizioni aperte (forzate fino allo Stage 3).
     """
     import asyncio
     from quant_core import build_scout_payload
@@ -3483,8 +3473,10 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
     dd_pct, dd_blocked = current_drawdown()
     daily_drawdown = max(-dd_pct, MAX_DAILY_DRAWDOWN_PCT if dd_blocked else 0.0) / 100
 
+    if not _quant_lock.acquire(blocking=blocking):
+        return None
     cycle_start = time.time()
-    with _quant_lock:
+    try:
         # Agente #6 e slot dell'Agente #5 riflettono le posizioni reali su Alpaca
         engine.portfolio_context = {"held": held, "pending": {normalize_symbol(x) for x in pending},
                                     "exposure_pct": exposure_pct, "daily_drawdown": daily_drawdown,
@@ -3496,6 +3488,8 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
         before = dict(engine.watchdog.stage_counts)
         plan = asyncio.run(engine.run_swarm_cycle(payloads))
         after = dict(engine.watchdog.stage_counts)
+    finally:
+        _quant_lock.release()
     got = {k: after[k] - before.get(k, 0) for k in after}
     agent_say("Pipeline", f"{len(payloads)} ticker · {engine.swarm.active_last_cycle} Scout al lavoro → Stage 1 passano "
                           f"{got['stage1_pass']}/{got['received']} → Stage 2 passano {got['stage2_pass']} → "
@@ -3554,14 +3548,18 @@ def _audit_stages(engine, sym, frame, cycle_start, meta):
 
 
 def refresh_held_evaluations(held_yf, log=print):
-    """Valuta subito con i 7 agenti le posizioni aperte (uscite anticipate dell'Agente #6 e tesi degradate), senza filtri di Stage."""
+    """Valuta subito con i 7 agenti le posizioni aperte (uscite anticipate dell'Agente #6 e tesi degradate), senza filtri di Stage.
+
+    Non attende mai lo sciame: se un ciclo della pipeline è in corso lo salta, perché quel ciclo valuta già le
+    posizioni aperte (forzate fino allo Stage 3). Così Guardian e CIO non restano bloccati.
+    """
     held_yf = list(dict.fromkeys(held_yf))
-    if not held_yf:
+    if not held_yf or _quant_lock.locked():
         return
     frames = _download(held_yf, "3mo", "1h")
     try:
         stream_scouts_to_agents([(0, s, frames.get(s)) for s in held_yf], latest_channels().get("macro") or {},
-                                crypto_fear_greed(), held_keys=held_yf, log=log, force=held_yf)
+                                crypto_fear_greed(), held_keys=held_yf, log=log, force=held_yf, blocking=False)
     except Exception as e:
         log(f"⚠️ [Agente #6] Valutazione delle posizioni aperte non riuscita: {type(e).__name__}: {e}")
 
@@ -3569,7 +3567,8 @@ def refresh_held_evaluations(held_yf, log=print):
 def chop_audit(log=print, force=False):
     """Agente #7: auto-healing e riga di audit dello sciame (al massimo ogni 30 secondi)."""
     engine = quant_engine()
-    return engine.watchdog.maybe_audit(log, swarm=engine.swarm, engine=engine, force=force)
+    return engine.watchdog.maybe_audit(log, swarm=engine.swarm, engine=engine, force=force,
+                                       heal_workers=not _quant_lock.locked())
 
 
 def quant_rationale(symbol, max_age_sec=1800):
@@ -3587,6 +3586,7 @@ def quant_rationale(symbol, max_age_sec=1800):
 import sqlite3
 
 EXECUTIONS_DB_PATH = os.path.join(DATA_DIR, "executions.db")
+_db_ready = {"path": None}   # tabella già creata per questo file: niente CREATE TABLE a ogni connessione
 USER_OFFLINE_AFTER_SEC = 120   # la dashboard interroga /api/data ogni secondo: 2 minuti senza richieste = offline
 _presence = {"last_seen": 0.0}
 _db_lock = threading.Lock()
@@ -3604,6 +3604,8 @@ def _db():
     os.makedirs(os.path.dirname(EXECUTIONS_DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(EXECUTIONS_DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    if _db_ready["path"] == EXECUTIONS_DB_PATH and os.path.exists(EXECUTIONS_DB_PATH):
+        return conn
     conn.execute("""CREATE TABLE IF NOT EXISTS executions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,
@@ -3619,6 +3621,7 @@ def _db():
         order_id TEXT,
         source TEXT,
         note TEXT)""")
+    _db_ready["path"] = EXECUTIONS_DB_PATH
     return conn
 
 

@@ -206,7 +206,7 @@ def execute_sell(pos, label, reason, auto_trade, pending, market_open, pct=100, 
 
     action: causa per la scheda di uscita (STOP_LOSS, SCALE_OUT, TRAILING_STOP, THESIS_DECAY, ...); stop_price: livello toccato.
     """
-    sym, qty = pos["symbol"], pos["qty"]
+    sym = pos["symbol"]
     part = "" if pct >= 100 else f" ({pct:.0f}%)"
     if not auto_trade:
         log_message(f"🧭 [Advisor] Suggerita VENDITA{part} ({label}) di {sym}: ordine non inviato.")
@@ -261,27 +261,34 @@ def execute_buy(sym, amount, auto_trade, pending, label="ACQUISTO", stop_pct=Non
 
 def rotate_capital(pos, sell_pct, target, amount, cfg, auto_trade, pending, stop_pct=None, allocation_pct=None, conviction=None,
                    rationale=None, price=None):
-    """Rotazione asimmetrica: vende il sell_pct% di pos e reinveste su target entro il limite di esposizione."""
+    """Rotazione asimmetrica: vende il sell_pct% di pos e reinveste su target entro il limite di esposizione.
+
+    Restituisce True solo se l'acquisto del target è stato inviato (la scheda diventa EXECUTED solo in quel caso).
+    """
     if not auto_trade:
         log_message(f"🧭 [Advisor] Rotazione suggerita: vendi {sell_pct:.0f}% di {pos['symbol']} → ${amount:,.2f} di {target}.")
-        return
+        return False
     order = execute_sell(pos, "ROTAZIONE", f"tesi degradata, capitale riallocato sul SUPER_CONVICTION {target}", auto_trade,
                          pending, True, pct=sell_pct, operation="ASSET SWAP", action="ROTATION")
     if not order:
-        return
+        return False
     filled = core.wait_for_fill(order.id, timeout=30, log=log_message)
     if not filled:
         log_message(f"🔄 Vendita di {pos['symbol']} non ancora eseguita: l'acquisto di {target} è rimandato.")
-        return
-    exposure_after = sum(abs(p["market_value"]) for p in get_open_positions())
+        return False
+    positions_after = fetch_open_positions()
+    if positions_after is None:
+        log_message(f"🔄 Posizioni non leggibili da Alpaca dopo la vendita: acquisto di {target} rimandato.")
+        return False
+    exposure_after = sum(abs(p["market_value"]) for p in positions_after)
     funds, _ = core.buy_budget(get_account_summary(), exposure_after, cfg, crypto=core.is_crypto(target), pct=100)
     final_amount = min(amount, funds)
     if final_amount < core.MIN_ORDER_USD:
         log_message(f"🔄 Nessun reinvestimento in {target}: fondi entro il limite di esposizione ${funds:,.2f}.")
-        return
-    execute_buy(target, final_amount, auto_trade, pending, label=f"ACQUISTO DA ROTAZIONE {allocation_pct}%",
-                stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction,
-                operation="ASSET SWAP", rationale=rationale, price=price)
+        return False
+    return bool(execute_buy(target, final_amount, auto_trade, pending, label=f"ACQUISTO DA ROTAZIONE {allocation_pct}%",
+                            stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction,
+                            operation="ASSET SWAP", rationale=rationale, price=price))
 
 def describe_decision(d):
     if d["action"] == "ROTATE":
@@ -296,10 +303,11 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
     """Tier 4-5: difesa del portafoglio, decisione del CIO sulle schede APPROVED_BY_RISK ed esecuzione.
 
     Con boot=True (primo ciclo dopo avvio/deploy) non esegue acquisti né rotazioni.
+    Restituisce True se il ciclo è stato eseguito, False se il lock era occupato.
     """
     if not scan_lock.acquire(blocking=False):
         log_message("⚠️ Ciclo del CIO già in corso.")
-        return
+        return False
 
     try:
         bot_state["status"] = "Scansione & Valutazione in corso..."
@@ -318,7 +326,11 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
             log_message("⚠️ Stato ordini pendenti sconosciuto: nessun ordine in questo ciclo.")
             pending = set()
         market_open = core.is_market_open(log=log_message)
-        positions = get_open_positions()
+        positions = fetch_open_positions()
+        if positions is None:
+            # "Alpaca non risponde" non è "nessuna posizione": con esposizione e slot sconosciuti non si compra
+            log_message("⚠️ Posizioni non leggibili da Alpaca: nessun ordine in questo ciclo.")
+            positions, orders_allowed = [], False
         acc = get_account_summary()
         state = core.load_state()
 
@@ -445,10 +457,9 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         elif orders_allowed and final["action"] == "ROTATE":
             # validate_desk_decision non restituisce mai SELL: le uscite sono solo quelle del Guardian
             pos = next(p for p in positions if core.normalize_symbol(p["yf_symbol"]) == core.normalize_symbol(final["sell_symbol"]))
-            rotate_capital(pos, final["sell_pct"], final["buy_symbol"], final["buy_amount"], cfg, auto_trade, pending,
-                           stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
-                           conviction=final["conviction_score"], rationale=entry_rationale, price=entry_price)
-            executed = auto_trade
+            executed = rotate_capital(pos, final["sell_pct"], final["buy_symbol"], final["buy_amount"], cfg, auto_trade,
+                                      pending, stop_pct=final["dynamic_stop_loss_pct"], allocation_pct=final["allocation_pct"],
+                                      conviction=final["conviction_score"], rationale=entry_rationale, price=entry_price)
         if inbox:
             core.record_cio_outcome(final.get("buy_symbol") or None, executed, describe_decision(final),
                                     details={**((entry_rationale or {}).get("desk_cio") or {}),
@@ -476,6 +487,7 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
 
         bot_state["status"] = "Attivo (In attesa ciclo)" if bot_state["active"] else "In pausa"
         log_message("=== CICLO CIO COMPLETATO ===")
+        return True
 
     finally:
         if bot_state["status"].startswith("Scansione"):
@@ -523,9 +535,14 @@ def background_loop():
                 cio_trigger.update(reason="", urgent=False)
             last_run = now
             try:
-                run_trading_cycle(boot=boot, trigger=trigger)
-                boot = False
+                # Il ciclo di avvio (niente acquisti) conta come fatto solo se è stato eseguito davvero:
+                # se il lock era occupato (es. Rischio Zero dalla dashboard) si riprova al giro successivo
+                if run_trading_cycle(boot=boot, trigger=trigger):
+                    boot = False
+                else:
+                    last_run = 0.0
             except Exception as e:
+                boot = False
                 log_message(f"Errore ciclo CIO: {e}")
         # Attesa: se c'è un evento in coda ma non è ancora passato l'intervallo minimo, pausa breve
         if cio_wake.is_set():
@@ -543,7 +560,9 @@ def radar_loop():
         started = time.time()
         if bot_state["active"]:
             try:
-                positions = get_open_positions()
+                positions = fetch_open_positions()
+                if positions is None:
+                    raise RuntimeError("posizioni non leggibili da Alpaca: giro dello sciame saltato")
                 held = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
                 pending = core.get_pending_order_symbols(log=lambda m: None) or set()
                 # Agenti #1 #2 #4 in pausa dal Centro di Comando: niente nuove schede (gli stop restano controllati)
@@ -620,7 +639,7 @@ def guardian_tick():
     # Stesso lock del ciclo del CIO: mai due vendite della stessa posizione in parallelo
     if not scan_lock.acquire(blocking=False):
         log_message(f"🧿 [Agente #6 Guardian] Uscite rilevate ({', '.join(p['symbol'] for p, _ in hits)}): "
-                    "ciclo del CIO in corso, le esegue il CIO.")
+                    f"ciclo del CIO in corso, riprovo al prossimo giro ({core.GUARDIAN_INTERVAL_SEC}s).")
         return
     try:
         pending = core.get_pending_order_symbols(log=log_message)
@@ -1130,7 +1149,6 @@ def _chat_context():
     """Stato reale del sistema per l'assistente: conto, posizioni (con Guardian), VIX, sciame, bocciature e log."""
     radar = core.radar_snapshot()
     acc = cached("account_pnl", account_with_pnl)
-    dd = (core.load_state().get("drawdown") or {})
     macro = (radar.get("channels") or {}).get("macro") or {}
     with state_lock:
         logs = list(bot_state["logs"])[-60:]
@@ -1141,8 +1159,7 @@ def _chat_context():
         rejected = []
     return {"account": acc, "positions": positions_with_allocation(), "radar": radar, "macro": macro,
             "vix": macro.get("vix"),
-            "drawdown_blocked": time.time() < float(dd.get("block_until", 0) or 0)
-                                or (acc.get("daily_pnl_pct") or 0) <= core.DAILY_DRAWDOWN_LIMIT,
+            "drawdown_blocked": core.current_drawdown()[1],   # stessa formula del Drawdown Controller
             "config": core.get_config(), "market_open": core.is_us_market_open(),
             "bot_active": bot_state["active"], "bot_status": bot_state["status"], "last_scan": bot_state["last_scan"],
             "cio": cio, "logs": logs, "rejected": rejected}

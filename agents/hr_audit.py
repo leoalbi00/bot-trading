@@ -19,6 +19,8 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 RETENTION_SEC = 5 * 3600
+EXECUTED_MAX = 1000       # schede eseguite conservate (il file viene riscritto a ogni flush: niente crescita infinita)
+EXITS_MAX = 2000          # uscite conservate per la pagella dell'Agente #6
 FLUSH_EVERY_SEC = 15
 TARGET_R = 2.0            # target = 2 volte la distanza dello stop (come il pacchetto del Comitato Rischi)
 QUANT_BULLISH = 60.0      # Agente #1: segnale tecnico rialzista
@@ -123,6 +125,7 @@ class PitchAuditRegister:
         """Scheda approvata ed eseguita: storico permanente con i voti dei 7 Agenti."""
         with self._lock:
             self.executed.append({"symbol": symbol, "ts": time.time(), "time": self.clock(), **details})
+            del self.executed[:-EXECUTED_MAX]
             for k in [k for k in self.reviews if k.startswith(_key(symbol) + "|")]:
                 self.reviews.pop(k)     # comprata: le bocciature precedenti non sono più attuali
             self._dirty = True
@@ -133,6 +136,7 @@ class PitchAuditRegister:
             self.exits.append({"symbol": symbol, "operation": operation, "reason": reason or "",
                                "realized_pnl": _num(realized_pnl), "price": _num(price), "ts": time.time(),
                                "time": self.clock()})
+            del self.exits[:-EXITS_MAX]
             self._dirty = True
         self.flush(force=True)
 
@@ -210,10 +214,14 @@ class PitchAuditRegister:
         for t in trades or []:
             if not isinstance(t, dict) or t.get("pnl") is None:
                 continue
-            try:
-                closed_ts = time.mktime(time.strptime(str(t.get("closed_at", ""))[:19], "%Y-%m-%d %H:%M:%S"))
-            except ValueError:
-                closed_ts = time.time()
+            # closed_ts (epoch) da sync_ledger; closed_at è nell'ora del bot (Europe/Rome) e mktime lo leggerebbe
+            # nel fuso del server (UTC su Render), sbagliando di 1-2 ore l'abbinamento con i voti d'ingresso
+            closed_ts = _num(t.get("closed_ts"))
+            if closed_ts is None:
+                try:
+                    closed_ts = time.mktime(time.strptime(str(t.get("closed_at", ""))[:19], "%Y-%m-%d %H:%M:%S"))
+                except ValueError:
+                    closed_ts = time.time()
             opened_ts = closed_ts - float(t.get("held_min") or 0) * 60
             entry = self.entry_votes(t["symbol"], opened_ts)
             agents = (entry or {}).get("agents") or (fallback_votes(t["symbol"], opened_ts) if fallback_votes else None)

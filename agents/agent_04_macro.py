@@ -308,12 +308,28 @@ class MacroSentimentAgent:
             return {"signal": "CONTRARIAN_BULLISH_WARNING", "bias": 0.3, "reason": "EXTREME_RETAIL_PANIC"}
         return {"signal": "NEUTRAL", "bias": 0.0, "reason": "BALANCED"}
 
-    def check_event_blackout(self, upcoming_events: List[Dict[str, Any]], window_minutes: int = 30) -> Dict[str, Any]:
-        """Verifica se il mercato è in prossimità di rilasci macro o trimestrali."""
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+    def check_event_blackout(self, upcoming_events: List[Dict[str, Any]], window_minutes: int = 30,
+                             all_day_days: int = 1) -> Dict[str, Any]:
+        """Verifica se il mercato è in prossimità di rilasci macro o trimestrali.
+
+        - eventi con orario ("timestamp" ISO, con o senza fuso; senza fuso = UTC): blackout da 15 minuti prima
+          dell'evento fino a window_minutes dopo;
+        - eventi di giornata ("date" + "all_day": True, es. trimestrali di cui Yahoo fornisce solo il giorno, che
+          escono prima dell'apertura o dopo la chiusura): blackout dal giorno prima al giorno stesso (entro 24h),
+          come il veto trimestrali del Comitato Rischi.
+        """
+        now = datetime.now(timezone.utc)
         for event in upcoming_events:
             try:
-                event_time = datetime.fromisoformat(event.get("timestamp", ""))
+                if event.get("all_day"):
+                    days = (datetime.fromisoformat(str(event["date"])[:10]).date() - now.date()).days
+                    if 0 <= days <= all_day_days:
+                        return {"is_blackout": True, "event_name": event.get("event_name", "HIGH_IMPACT_EVENT"),
+                                "minutes_to_event": round(days * 1440.0, 1)}
+                    continue
+                event_time = datetime.fromisoformat(str(event.get("timestamp", "")).replace("Z", "+00:00"))
+                if event_time.tzinfo is None:
+                    event_time = event_time.replace(tzinfo=timezone.utc)
                 time_diff_minutes = (event_time - now).total_seconds() / 60.0
                 if -15 <= time_diff_minutes <= window_minutes:
                     return {
