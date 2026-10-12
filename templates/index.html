@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quant Desk</title>
+    <title>J.A.R.V.I.S. · Quant Desk</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
 
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -23,46 +23,41 @@
             }
         }
     </script>
-    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/jarvis.css') }}">
     <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
-
-    <style>
-        [x-cloak] { display: none !important; }
-        body { background-color: #090d16; }
-        .num { font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
-        details > summary { list-style: none; }
-        details > summary::-webkit-details-marker { display: none; }
-        .scroll-thin::-webkit-scrollbar { width: 6px; height: 6px; }
-        .scroll-thin::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.2); border-radius: 3px; }
-    </style>
+    <script>
+        // Token degli endpoint di controllo, inserito dal server dopo il login
+        const API_TOKEN = {{ api_token|tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 </head>
-<body class="min-h-screen text-slate-200 font-sans antialiased" x-data="dashboard()" x-init="init()">
+<body class="min-h-screen font-sans antialiased" x-data="dashboard()" x-init="init()">
+<div class="app-layer">
 
-    <!-- ============ BARRA SUPERIORE ============ -->
-    <header class="border-b border-slate-800 bg-[#090d16]/95 backdrop-blur sticky top-0 z-40">
-        <div class="max-w-[1500px] mx-auto px-4 sm:px-6 h-12 flex items-center justify-between gap-4">
+    <!-- ============ BARRA DI COMANDO ============ -->
+    <header class="sticky top-0 z-40 border-b border-sky-400/10 bg-[#090d16]/80 backdrop-blur-xl">
+        <div class="max-w-[1500px] mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-3">
             <div class="flex items-center gap-3 min-w-0">
-                <span class="h-2 w-2 rounded-full shrink-0" :class="!connected ? 'bg-amber-500' : (bot.active ? 'bg-emerald-500' : 'bg-slate-500')"></span>
-                <span class="text-sm font-semibold tracking-tight text-slate-100 truncate">Quant Desk</span>
-                <span class="hidden sm:inline text-xs text-slate-500" x-text="!connected ? 'Connessione…' : (bot.active ? (settings.auto_execute_trades ? 'Auto-Trading' : 'Advisor') : 'In pausa')"></span>
-                <span class="hidden md:inline text-xs text-slate-600 num" x-text="bot.status || ''"></span>
+                <div class="hud-ring" :class="(!connected || !bot.active) && 'off'"></div>
+                <div class="min-w-0">
+                    <div class="hud-font text-[13px] font-bold text-cyan-100 truncate">J.A.R.V.I.S.</div>
+                    <div class="text-[10.5px] text-slate-400 truncate num"
+                         x-text="!connected ? 'Connessione…' : (bot.active ? (settings.auto_execute_trades ? 'Auto-Trading' : 'Advisor · solo suggerimenti') : 'In pausa') + ' · ' + (bot.status || '')"></div>
+                </div>
             </div>
-            <nav class="flex items-center gap-1.5 text-xs shrink-0">
-                <button @click="forceCio()" title="Forza il CIO a valutare subito le schede in coda"
-                        class="h-7 px-2.5 rounded border border-amber-800/70 text-amber-300 hover:bg-amber-950/50 whitespace-nowrap">⚡ Forza CIO</button>
-                <button @click="toggleBot()" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200"
-                        x-text="bot.active ? 'Pausa' : 'Riprendi'"></button>
-                <button @click="showSettings = true" class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 inline-flex items-center gap-1.5">
-                    <i data-lucide="settings-2" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">Impostazioni Bot</span>
-                </button>
-                <button @click="openHistory()" title="Operazioni eseguite dal bot mentre la dashboard era chiusa"
-                        class="h-7 px-2.5 rounded border border-slate-700 hover:bg-slate-800 text-slate-200 whitespace-nowrap">📜 <span class="hidden sm:inline">Storico Offline</span></button>
-                <button @click="liquidate()" title="Annulla gli ordini, chiude tutte le posizioni e mette il bot in pausa"
-                        class="h-7 px-2.5 rounded bg-rose-700 hover:bg-rose-600 text-white font-medium whitespace-nowrap">🚨 <span class="hidden sm:inline">PANIC - CHIUDI TUTTO</span></button>
+            <nav class="flex items-center gap-1.5 shrink-0">
+                <button @click="forceCio()" title="Forza il CIO a valutare subito le proposte in coda" class="btn btn-amber">
+                    <i data-lucide="zap" class="w-3.5 h-3.5"></i><span class="hidden md:inline">Forza CIO</span></button>
+                <button @click="toggleBot()" class="btn" :class="bot.active ? '' : 'btn-emerald'" :title="bot.active ? 'Metti in pausa tutto il sistema' : 'Riattiva il sistema'">
+                    <span x-text="bot.active ? '❚❚' : '▶'"></span>
+                    <span class="hidden sm:inline" x-text="bot.active ? 'Pausa' : 'Riprendi'"></span></button>
+                <button @click="showSettings = true" class="btn" title="Impostazioni"><i data-lucide="settings-2" class="w-3.5 h-3.5"></i><span class="hidden lg:inline">Impostazioni</span></button>
+                <button @click="openHistory()" class="btn" title="Operazioni eseguite mentre la dashboard era chiusa"><i data-lucide="history" class="w-3.5 h-3.5"></i><span class="hidden lg:inline">Storico</span></button>
+                <button @click="liquidate()" title="Annulla gli ordini, chiude tutte le posizioni e mette il bot in pausa" class="btn btn-rose">
+                    <i data-lucide="siren" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">PANIC</span></button>
                 <form method="post" action="/logout">
-                    <button type="submit" title="Esci" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center">
-                        <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
-                    </button>
+                    <button type="submit" title="Esci" class="btn w-8 px-0"><i data-lucide="log-out" class="w-3.5 h-3.5"></i></button>
                 </form>
             </nav>
         </div>
@@ -70,71 +65,234 @@
 
     <main class="max-w-[1500px] mx-auto px-4 sm:px-6 py-6 space-y-6">
 
-        <!-- ============ INTESTAZIONE FINANZIARIA ============ -->
-        <section class="grid grid-cols-2 lg:grid-cols-5 border border-slate-800 rounded-lg bg-slate-900/40 divide-x divide-y lg:divide-y-0 divide-slate-800">
-            <div class="p-4">
-                <div class="text-[11px] uppercase tracking-wider text-slate-500">Capitale totale</div>
-                <div class="mt-1.5 text-xl num text-slate-100" x-text="usd(account.portfolio)"></div>
-                <div class="mt-1 text-[11px] text-slate-500 num" x-text="account.initial_capital ? 'Iniziale ' + usd(account.initial_capital) : ''"></div>
+        <!-- ============ HEADER STATO: 4 indicatori per tutti ============ -->
+        <section class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+            <div class="glass hud-corners kpi" title="Valore complessivo del conto: liquidità + investimenti">
+                <div class="scan"></div>
+                <div class="kpi-label">Saldo totale</div>
+                <div class="kpi-value num text-cyan-50" x-text="usd(account.portfolio)"></div>
+                <div class="kpi-sub num flex items-center gap-1.5">
+                    <span :class="glow(account.net_pnl_usd)" x-text="arrow(account.net_pnl_usd) + ' ' + pct(account.net_pnl_pct)"></span>
+                    <span x-text="account.initial_capital ? 'da inizio (' + usd(account.initial_capital) + ')' : 'crescita totale'"></span>
+                </div>
             </div>
-            <div class="p-4">
-                <div class="text-[11px] uppercase tracking-wider text-slate-500">Plusvalenza / Minusvalenza netta</div>
-                <div class="mt-1.5 text-xl num" :class="tone(account.net_pnl_usd)" x-text="usd(account.net_pnl_usd, true)"></div>
-                <div class="mt-1 text-[11px] num" :class="tone(account.net_pnl_pct)" x-text="pct(account.net_pnl_pct)"></div>
+            <div class="glass hud-corners kpi" title="Guadagno o perdita di oggi">
+                <div class="scan"></div>
+                <div class="kpi-label">Profitto di oggi</div>
+                <div class="kpi-value num" :class="glow(account.daily_pnl_usd)" x-text="usd(account.daily_pnl_usd, true)"></div>
+                <div class="kpi-sub num"><span class="font-semibold" :class="glow(account.daily_pnl_pct)" x-text="pct(account.daily_pnl_pct)"></span>
+                    <span x-text="Number(account.daily_pnl_usd) >= 0 ? ' rispetto a ieri sera' : ' rispetto a ieri sera · protezioni attive'"></span></div>
             </div>
-            <div class="p-4">
-                <div class="text-[11px] uppercase tracking-wider text-slate-500">P&amp;L di oggi</div>
-                <div class="mt-1.5 text-xl num" :class="tone(account.daily_pnl_usd)" x-text="usd(account.daily_pnl_usd, true)"></div>
-                <div class="mt-1 text-[11px] num" :class="tone(account.daily_pnl_pct)" x-text="pct(account.daily_pnl_pct)"></div>
+            <div class="glass hud-corners kpi" title="Salute del sistema in una parola">
+                <div class="scan"></div>
+                <div class="kpi-label">Stato di salute</div>
+                <div class="mt-2.5"><span class="hud-badge" :class="health().tone"><span class="core"></span><span x-text="health().label"></span></span></div>
+                <div class="kpi-sub" x-text="health().hint"></div>
             </div>
-            <div class="p-4">
-                <div class="text-[11px] uppercase tracking-wider text-slate-500">Cash disponibile</div>
-                <div class="mt-1.5 text-xl num text-slate-100" x-text="usd(account.cash)"></div>
-                <div class="mt-1 text-[11px] text-slate-500 num" x-text="'Buying power ' + usd(account.buying_power)"></div>
-            </div>
-            <div class="p-4 col-span-2 lg:col-span-1">
-                <div class="text-[11px] uppercase tracking-wider text-slate-500">Esposizione</div>
-                <div class="mt-1.5 text-xl num text-slate-100" x-text="exposurePct()"></div>
-                <div class="mt-1 text-[11px] text-slate-500 num" x-text="'Ultimo ciclo ' + (bot.last_scan || '—')"></div>
+            <div class="glass hud-corners kpi" title="Quanta parte del capitale è investita e quanta è al sicuro in cassa">
+                <div class="scan"></div>
+                <div class="kpi-label">Rischio portafoglio</div>
+                <div class="mt-1.5 text-[13px] font-bold hud-font text-cyan-100" x-text="safetyLabel()"></div>
+                <div class="mt-1 num text-[12.5px]">
+                    <span class="text-cyan-300" x-text="investedPct() === null ? '—' : investedPct().toFixed(0) + '% INVESTITO'"></span>
+                    <span class="text-slate-500"> / </span>
+                    <span class="text-emerald-300" x-text="investedPct() === null ? '—' : (100 - investedPct()).toFixed(0) + '% CASSA PROTETTA'"></span>
+                </div>
+                <div class="risk-bar mt-2.5"><span :style="'width:' + (investedPct() ?? 0) + '%'"></span></div>
             </div>
         </section>
 
-        <!-- ============ PERFORMANCE (Post-Trade Auditor) ============ -->
-        <section class="flex flex-wrap gap-x-8 gap-y-2 px-1 text-xs text-slate-500">
-            <span>Trade chiusi (90gg) <span class="num text-slate-200" x-text="perf.trades ?? '—'"></span></span>
-            <span>Win rate <span class="num text-slate-200" x-text="perf.win_rate != null ? perf.win_rate + '%' : '—'"></span></span>
-            <span>PnL realizzato <span class="num" :class="tone(perf.pnl)" x-text="usd(perf.pnl, true)"></span></span>
-            <span>Permanenza media <span class="num text-slate-200" x-text="duration(perf.avg_held_min)"></span></span>
-            <span x-show="perf.best">Migliore <span class="num text-emerald-400" x-text="perf.best ? perf.best.symbol + ' ' + usd(perf.best.pnl, true) : ''"></span></span>
-            <span x-show="perf.worst">Peggiore <span class="num text-rose-400" x-text="perf.worst ? perf.worst.symbol + ' ' + usd(perf.worst.pnl, true) : ''"></span></span>
-        </section>
+        <!-- ============ SCHEDE ============ -->
+        <nav class="glass tabbar scroll-thin">
+            <template x-for="t in tabs" :key="t.id">
+                <button class="tab" :class="tab === t.id && 'active'" @click="tab = t.id">
+                    <i :data-lucide="t.icon" class="w-4 h-4"></i><span x-text="t.label"></span>
+                </button>
+            </template>
+        </nav>
 
-        <!-- ============ AGENT STREAM (telemetria live) ============ -->
-        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
-            <div class="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between">
-                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                    <span class="h-1.5 w-1.5 rounded-full" :class="streamAlive() ? 'bg-emerald-500' : 'bg-slate-600'"></span>
-                    Agent stream
-                </h2>
-                <span class="text-[11px] text-slate-500 num" x-text="dialogue.length + ' messaggi · aggiornamento 1s'"></span>
-            </div>
-            <div x-ref="stream" @scroll="streamPinned = $refs.stream.scrollHeight - $refs.stream.scrollTop - $refs.stream.clientHeight < 30"
-                 class="h-56 overflow-y-auto scroll-thin px-4 py-2 num text-[11px] leading-relaxed">
-                <template x-for="d in dialogue" :key="d.id">
-                    <div class="flex gap-2 whitespace-nowrap">
-                        <span class="text-slate-600 shrink-0" x-text="d.time"></span>
-                        <span class="shrink-0 w-40 truncate" :class="agentColor(d.agent)" x-text="d.agent"></span>
-                        <span class="truncate" :class="levelColor(d.level)" :title="d.text" x-text="d.text"></span>
+        <!-- ================================================================ CENTRO DI COMANDO -->
+        <div x-show="tab === 'command'" class="tab-panel space-y-6">
+
+            <!-- AGENT MATRIX -->
+            <section class="glass hud-corners">
+                <div class="panel-head">
+                    <h2 class="panel-title">Agent Matrix · i 7 agenti al lavoro</h2>
+                    <div class="flex flex-wrap items-center gap-3 text-[11px] text-slate-400">
+                        <span class="flex items-center gap-1.5"><span class="status-led tone-emerald"></span>Attivo</span>
+                        <span class="flex items-center gap-1.5"><span class="status-led blink tone-cyan"></span>Elaborazione</span>
+                        <span class="flex items-center gap-1.5"><span class="status-led tone-amber"></span>In pausa</span>
                     </div>
-                </template>
-                <div x-show="!dialogue.length" class="text-slate-500 font-sans">In attesa della telemetria degli agenti…</div>
-            </div>
-        </section>
+                </div>
+                <div x-show="blockChips().length" x-transition class="px-4 pt-3 flex flex-wrap items-center gap-2 text-[11px]">
+                    <span class="text-amber-300/90 flex items-center gap-1"><i data-lucide="ban" class="w-3.5 h-3.5"></i>Acquisti bloccati dal Comandante:</span>
+                    <template x-for="b in blockChips()" :key="b.kind + b.value">
+                        <button class="chip !border-amber-400/40 !text-amber-200" @click="removeBlock(b.kind, b.value)" :title="'Rimuovi il blocco su ' + b.label" x-text="b.label + '  ✕'"></button>
+                    </template>
+                    <button class="text-slate-500 hover:text-slate-200 underline" @click="removeBlock()">rimuovi tutti</button>
+                </div>
+                <div class="p-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                    <template x-if="!agents.length">
+                        <div class="text-sm text-slate-500 col-span-full">Collegamento con gli agenti…</div>
+                    </template>
+                    <template x-for="(a, i) in agents" :key="a.id">
+                        <article class="glow-card" :class="'st-' + a.status" :style="'animation-delay:' + (i * 60) + 'ms'">
+                            <div class="inner">
+                                <div class="flex items-start gap-3">
+                                    <div class="agent-icon"><i :data-lucide="a.icon" class="w-5 h-5"></i></div>
+                                    <div class="min-w-0 flex-1">
+                                        <div class="text-[10px] text-slate-500 num" x-text="'AGENTE #' + Number(a.id)"></div>
+                                        <div class="text-sm font-semibold text-slate-100 leading-tight" x-text="a.title.split('· ')[1] || a.name"></div>
+                                    </div>
+                                    <span class="flex items-center gap-1.5 text-[10px] font-semibold tracking-wider" :class="statusTone(a.status)">
+                                        <span class="status-led" :class="a.status === 'PROCESSING' && 'blink'"></span>
+                                        <span x-text="statusText(a.status)"></span>
+                                    </span>
+                                </div>
+                                <p class="text-[11.5px] text-slate-400 leading-snug" x-text="a.role"></p>
+                                <div class="rounded-lg bg-slate-950/50 border border-sky-400/10 px-2.5 py-2 min-h-[58px]">
+                                    <div class="text-[10px] uppercase tracking-wider text-cyan-300/70 flex items-center gap-1.5">Azione corrente
+                                        <span x-show="a.status === 'PROCESSING'" class="thinking-dots text-cyan-300"><span></span><span></span><span></span></span>
+                                        <span class="ml-auto normal-case tracking-normal text-slate-600 num" x-text="ago(a.last_ts)"></span></div>
+                                    <div class="mt-1 text-[12px] text-slate-200 leading-snug line-clamp-3" :title="a.summary" x-text="a.summary"></div>
+                                </div>
+                                <div class="flex items-center justify-between text-[10.5px] text-slate-500">
+                                    <span x-text="a.tunable ? 'Sensibilità: ' + a.sensitivity_label : (a.pausable ? 'Parametri di sicurezza fissi' : 'Sempre attivo · cancello di sicurezza')"></span>
+                                </div>
+                                <div class="mt-auto space-y-2">
+                                    <button class="btn btn-cyan w-full" @click="openBrain(a)"><i data-lucide="brain-circuit" class="w-3.5 h-3.5"></i>ISPEZIONA CERVELLO</button>
+                                    <div class="grid grid-cols-2 gap-2">
+                                        <button class="btn btn-sm" :class="a.paused ? 'btn-emerald' : 'btn-amber'" :disabled="!a.pausable || agentBusy === a.id"
+                                                :title="a.pausable ? '' : 'Il Risk Manager non può essere sospeso'"
+                                                @click="togglePause(a)" x-text="a.paused ? '▶ ATTIVA' : '❚❚ PAUSA AGENTE'"></button>
+                                        <button class="btn btn-sm" :disabled="!a.tunable" :title="a.tunable ? '' : 'Sensibilità non regolabile per questo agente'"
+                                                @click="tuning = tuning === a.id ? null : a.id">⚙ SENSIBILITÀ</button>
+                                    </div>
+                                    <div x-show="tuning === a.id" x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" class="space-y-1.5">
+                                        <div class="seg">
+                                            <template x-for="lv in [0, 1, 2]" :key="lv">
+                                                <button :class="a.sensitivity === lv && 'on'" :disabled="agentBusy === a.id"
+                                                        @click="controlAgent(a, { sensitivity: lv })" x-text="['Standard', 'Selettivo', 'Rigoroso'][lv]"></button>
+                                            </template>
+                                        </div>
+                                        <div class="text-[10.5px] text-slate-500 leading-snug">Più alta la sensibilità, più forte deve essere il voto di questo agente perché il CIO investa.</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </article>
+                    </template>
+                </div>
+            </section>
 
+            <div class="grid grid-cols-1 xl:grid-cols-5 gap-6 items-stretch">
+                <!-- STANZA DEI DIPENDENTI AI -->
+                <section class="glass hud-corners xl:col-span-3 flex flex-col min-h-[560px]">
+                    <div class="panel-head">
+                        <h2 class="panel-title">Stanza dei Dipendenti AI</h2>
+                        <span class="text-[11px] text-slate-500">Dai un ordine: il dirigente valuta, applica o ti spiega perché no</span>
+                    </div>
+                    <div class="p-3 grid grid-cols-2 gap-2 border-b border-sky-400/10">
+                        <template x-for="(p, key) in personas" :key="key">
+                            <button class="persona" :class="persona === key && 'on'" @click="persona = key; scrollChat()">
+                                <span class="avatar" :class="key === 'risk' && 'risk'" x-text="p.initials"></span>
+                                <span class="min-w-0"><span class="block text-[13px] font-semibold text-slate-100 truncate" x-text="p.name"></span>
+                                    <span class="block text-[11px] text-slate-500 truncate" x-text="p.tagline"></span></span>
+                            </button>
+                        </template>
+                    </div>
+                    <div x-ref="chat" class="chat-scroll scroll-thin flex-1 p-4 space-y-3 max-h-[440px]">
+                        <template x-if="!personaMessages().length">
+                            <div class="bubble ai">
+                                <div class="text-[11px] text-cyan-300/80 mb-1" x-text="personas[persona].name"></div>
+                                <span x-text="persona === 'coo'
+                                    ? 'Buongiorno Comandante. Sono il Capo delle Operazioni: posso mettere in pausa gli agenti, bloccare un mercato, cambiare l\'aggressività o darle un rapporto. Ogni ordine viene verificato sui dati in tempo reale.'
+                                    : 'Comandante, sono il Risk Manager. Il mio compito è proteggere il capitale: valuto ogni sua richiesta e la applico solo se il rischio è sotto controllo.'"></span>
+                            </div>
+                        </template>
+                        <template x-for="m in personaMessages()" :key="m.id">
+                            <div :class="m.role === 'user' ? 'flex justify-end' : 'flex items-end gap-2'">
+                                <span x-show="m.role !== 'user'" class="avatar !w-7 !h-7 !text-[10px]" :class="persona === 'risk' && 'risk'" x-text="personas[persona].initials"></span>
+                                <div class="bubble" :class="m.role === 'user' ? 'me' : 'ai v-' + (m.verdict || '')">
+                                    <div class="flex items-center gap-2 mb-1 text-[10.5px]" x-show="m.role !== 'user'">
+                                        <span class="text-cyan-300/80" x-text="m.author"></span>
+                                        <span x-show="m.verdict" class="verdict" :class="verdictTone(m.verdict)" x-text="m.verdict"></span>
+                                        <span class="ml-auto text-slate-600 num" x-text="m.time || ''"></span>
+                                    </div>
+                                    <div x-text="m.text"></div>
+                                </div>
+                            </div>
+                        </template>
+                        <div x-show="chatSending" class="flex items-end gap-2">
+                            <span class="avatar !w-7 !h-7 !text-[10px]" :class="persona === 'risk' && 'risk'" x-text="personas[persona].initials"></span>
+                            <div class="bubble ai text-cyan-300 text-[12px] flex items-center gap-2">Sto valutando la fattibilità <span class="thinking-dots"><span></span><span></span><span></span></span></div>
+                        </div>
+                    </div>
+                    <div class="p-3 border-t border-sky-400/10 space-y-2.5">
+                        <div class="flex gap-2 overflow-x-auto scroll-thin pb-1">
+                            <template x-for="s in chatSuggestions" :key="s">
+                                <button class="chip" @click="sendChat(s)" :disabled="chatSending" x-text="s"></button>
+                            </template>
+                        </div>
+                        <form @submit.prevent="sendChat()" class="chat-input flex items-center gap-2 pl-3 pr-1.5 py-1.5">
+                            <i data-lucide="terminal" class="w-4 h-4 text-cyan-400/70 shrink-0"></i>
+                            <input x-model="chatInput" maxlength="800" :placeholder="'Scrivi un ordine al ' + (persona === 'coo' ? 'COO' : 'Risk Manager') + '…'"
+                                   class="flex-1 min-w-0 bg-transparent text-sm text-slate-100 placeholder-slate-500 focus:outline-none h-8">
+                            <button type="submit" class="btn btn-cyan" :disabled="chatSending || !chatInput.trim()"><i data-lucide="send" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">Invia</span></button>
+                        </form>
+                    </div>
+                </section>
+
+                <!-- FEED OLOGRAFICO -->
+                <section class="glass hud-corners xl:col-span-2 flex flex-col min-h-[560px]">
+                    <div class="panel-head">
+                        <h2 class="panel-title">Telemetria olografica</h2>
+                        <span class="flex items-center gap-1.5 text-[11px] text-slate-500 num">
+                            <span class="status-led" :class="streamAlive() ? 'tone-emerald blink' : 'tone-slate'"></span>
+                            <span x-text="dialogue.length + ' segnali · live'"></span></span>
+                    </div>
+                    <div class="holo-feed scroll-thin flex-1 p-3 max-h-[560px]">
+                        <template x-for="d in feed()" :key="d.id">
+                            <div class="holo-card" :class="'lv-' + (d.level || 'info')">
+                                <div class="flex items-center gap-2 text-[10.5px]">
+                                    <span class="font-semibold truncate" :class="agentColor(d.agent)" x-text="d.agent"></span>
+                                    <span class="ml-auto text-slate-600 num shrink-0" x-text="d.time"></span>
+                                </div>
+                                <div class="mt-0.5 text-[12px] text-slate-200 leading-snug break-words" x-text="d.text"></div>
+                            </div>
+                        </template>
+                        <div x-show="!dialogue.length" class="text-sm text-slate-500 p-2">In attesa dei segnali degli agenti…</div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Mandato del CIO in linguaggio semplice -->
+            <section class="glass hud-corners">
+                <div class="panel-head">
+                    <h2 class="panel-title">Ultima decisione del direttore (CIO)</h2>
+                    <span class="text-[11px] text-slate-500 num" x-text="cio.source ? cio.source + ' · ' + (cio.timestamp || '') : ''"></span>
+                </div>
+                <div class="p-4 flex flex-wrap items-start gap-4">
+                    <template x-if="!cio.action"><div class="text-sm text-slate-500">In attesa del primo ciclo del CIO.</div></template>
+                    <template x-if="cio.action">
+                        <div class="flex flex-wrap items-start gap-4 w-full">
+                            <span class="hud-badge" :class="cio.action === 'BUY' ? 'tone-emerald' : cio.action === 'SELL' ? 'tone-rose' : cio.action === 'ROTATE' ? 'tone-cyan' : 'tone-slate'">
+                                <span class="core"></span><span x-text="{ BUY: 'COMPRA', SELL: 'VENDI', ROTATE: 'SPOSTA CAPITALE', HOLD: 'ATTENDE' }[cio.action] || cio.action"></span></span>
+                            <div class="flex-1 min-w-[240px]">
+                                <div class="num text-slate-100" x-text="cioTarget()"></div>
+                                <p class="mt-1 text-sm text-slate-300 leading-relaxed" x-text="cio.reason"></p>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </section>
+        </div>
+
+        <!-- ================================================================ MERCATI -->
+        <div x-show="tab === 'markets'" x-cloak class="tab-panel space-y-6">
         <!-- ============ 5 CANALI DI INTELLIGENCE ============ -->
-        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
-            <div class="px-4 py-3 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
-                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Canali di intelligence</h2>
+        <section class="glass hud-corners">
+            <div class="px-4 py-3 border-b border-sky-400/10 flex flex-wrap items-center justify-between gap-2">
+                <h2 class="panel-title">Canali di intelligence</h2>
                 <span class="text-[11px] text-slate-500 num" x-text="channels.timestamp ? shortTime(channels.timestamp) + ' · ' + channels.scouts + ' micro-scout (' + channels.workers + ' worker) · dati ' + channels.download_s + 's · calcoli ' + channels.scouts_ms + 'ms · prossima scansione ' + mmss(radar.next_scan_in) : 'In attesa della prima scansione dello sciame'"></span>
             </div>
             <div class="grid grid-cols-1 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-800">
@@ -183,7 +341,7 @@
                         </tr></thead>
                         <tbody>
                             <template x-for="t in (channels.top || [])" :key="t.symbol">
-                                <tr class="border-t border-slate-800/60">
+                                <tr class="border-t border-sky-400/10/60">
                                     <td class="py-1 pr-3 text-slate-200" x-text="t.symbol"></td>
                                     <td class="py-1 pr-3 text-right text-slate-200" x-text="t.score"></td>
                                     <td class="py-1 pr-3 text-right" :class="t.mtf >= 2 ? 'text-emerald-400' : 'text-slate-500'" x-text="t.mtf + '/3'"></td>
@@ -201,9 +359,9 @@
 
         <section class="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
             <!-- Tier 2-3: coda delle schede e Comitato Rischi -->
-            <div class="xl:col-span-2 border border-slate-800 rounded-lg bg-slate-900/40">
-                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Trade pitches · Chief of Staff &amp; Comitato Rischi</h2>
+            <div class="xl:col-span-2 glass hud-corners">
+                <div class="px-4 py-3 border-b border-sky-400/10 flex items-center justify-between">
+                    <h2 class="panel-title">Trade pitches · Chief of Staff &amp; Comitato Rischi</h2>
                     <span class="text-[11px] text-slate-500" x-text="'TTL ' + (radar.ttl_minutes || 15) + ' min · cooldown 60 min'"></span>
                 </div>
                 <div class="p-4 space-y-2">
@@ -211,7 +369,7 @@
                         <div class="text-xs text-slate-500">Nessuna scheda attiva in coda.</div>
                     </template>
                     <template x-for="q in (radar.queue || [])" :key="q.symbol + q.discovered_at">
-                        <div class="rounded border border-slate-800 px-3 py-2.5 text-xs">
+                        <div class="rounded border border-sky-400/10 px-3 py-2.5 text-xs">
                             <div class="flex flex-wrap items-center justify-between gap-2">
                                 <span class="flex items-center gap-2">
                                     <span class="num text-slate-100" x-text="q.symbol"></span>
@@ -228,7 +386,7 @@
                                  x-text="q.package ? 'Target ' + usd(q.package.target_price) + ' · stop ATR ' + q.package.stop_pct + '%' : ''"></div>
                             <div class="mt-1.5 grid grid-cols-1 sm:grid-cols-3 gap-1.5" x-show="(q.gates || []).length">
                                 <template x-for="g in (q.gates || [])" :key="g.agent">
-                                    <div class="rounded bg-slate-950/60 px-2 py-1 text-[11px]">
+                                    <div class="rounded-lg bg-slate-950/50 border border-sky-400/10 px-2 py-1 text-[11px]">
                                         <span :class="g.veto ? 'text-rose-400' : 'text-emerald-400'" x-text="(g.veto ? '✕ ' : '✓ ') + g.agent"></span>
                                         <div class="text-slate-500 num truncate" :title="g.detail" x-text="g.detail"></div>
                                     </div>
@@ -265,9 +423,9 @@
             </div>
 
             <!-- Tier 4: mandato del CIO -->
-            <div class="border border-slate-800 rounded-lg bg-slate-900/40">
-                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                    <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Mandato CIO</h2>
+            <div class="glass hud-corners">
+                <div class="px-4 py-3 border-b border-sky-400/10 flex items-center justify-between">
+                    <h2 class="panel-title">Mandato CIO</h2>
                     <span class="text-[11px] text-slate-500 num" x-text="cio.source ? cio.source + ' · ' + (cio.timestamp || '') : ''"></span>
                 </div>
                 <div class="p-4">
@@ -298,15 +456,107 @@
                 </div>
             </div>
         </section>
+        </div>
 
+        <!-- ================================================================ PORTAFOGLIO -->
+        <div x-show="tab === 'portfolio'" x-cloak class="tab-panel space-y-6">
+        <section class="flex flex-wrap gap-x-8 gap-y-2 px-1 text-xs text-slate-500">
+            <span>Trade chiusi (90gg) <span class="num text-slate-200" x-text="perf.trades ?? '—'"></span></span>
+            <span>Win rate <span class="num text-slate-200" x-text="perf.win_rate != null ? perf.win_rate + '%' : '—'"></span></span>
+            <span>PnL realizzato <span class="num" :class="tone(perf.pnl)" x-text="usd(perf.pnl, true)"></span></span>
+            <span>Permanenza media <span class="num text-slate-200" x-text="duration(perf.avg_held_min)"></span></span>
+            <span>Cash <span class="num text-slate-200" x-text="usd(account.cash)"></span></span>
+            <span x-show="perf.best">Migliore <span class="num text-emerald-400" x-text="perf.best ? perf.best.symbol + ' ' + usd(perf.best.pnl, true) : ''"></span></span>
+            <span x-show="perf.worst">Peggiore <span class="num text-rose-400" x-text="perf.worst ? perf.worst.symbol + ' ' + usd(perf.worst.pnl, true) : ''"></span></span>
+        </section>
+        <!-- ============ POSIZIONI ============ -->
+        <section class="glass hud-corners">
+            <div class="px-4 py-3 border-b border-sky-400/10 flex items-center justify-between">
+                <h2 class="panel-title">Posizioni aperte</h2>
+                <span class="text-[11px] text-slate-500 num" x-text="positions.length + ' posizioni'"></span>
+            </div>
+            <div class="overflow-x-auto scroll-thin">
+                <table class="w-full text-xs">
+                    <thead>
+                        <tr class="border-b border-sky-400/10 text-slate-500 text-left">
+                            <th class="font-medium px-4 py-2.5">Asset</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Quantità</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Allocazione CIO</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Convinzione</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Stop</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Prezzo medio</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Prezzo</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Valore</th>
+                            <th class="font-medium px-4 py-2.5 text-right">P&amp;L</th>
+                            <th class="font-medium px-4 py-2.5 text-right">%</th>
+                        </tr>
+                    </thead>
+                    <tbody class="num" x-show="!positions.length">
+                        <tr><td colspan="10" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
+                    </tbody>
+                    <template x-for="p in positions" :key="p.symbol">
+                        <tbody class="num border-b border-sky-400/10/70">
+                            <tr class="table-row cursor-pointer" @click="openPosition(p)" title="Apri la scheda della posizione">
+                                <td class="px-4 py-2.5 text-slate-100">
+                                    <span x-text="p.symbol"></span>
+                                    <span x-show="p.trade_class === 'SUPER_CONVICTION'" class="ml-1 text-[10px] font-sans px-1 rounded bg-amber-500/15 text-amber-300">SUPER</span>
+                                    <span x-show="p.horizon" class="ml-1 text-[10px] font-sans text-slate-500" x-text="p.horizon === 'SWING_CATALYST' ? 'swing' : 'intraday'"></span>
+                                    <span x-show="p.scaled_out" class="ml-1 text-[10px] font-sans text-emerald-400">runner</span>
+                                </td>
+                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="qty(p.qty)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.conviction ?? '—'"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="usd(p.avg_entry_price)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.current_price)"></td>
+                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.market_value)"></td>
+                                <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></td>
+                                <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></td>
+                            </tr>
+                            <tr class="font-sans">
+                                <td colspan="10" class="px-4 pb-2.5 pt-0">
+                                    <dl class="grid grid-cols-1 lg:grid-cols-3 gap-x-4 gap-y-1 text-[11px] leading-snug">
+                                        <div class="min-w-0"><dt class="inline text-sky-400">buy_thesis · </dt><dd class="inline text-slate-300" x-text="p.buy_thesis || '—'"></dd></div>
+                                        <div class="min-w-0"><dt class="inline text-amber-300">hold_rationale · </dt><dd class="inline text-slate-300" x-text="p.hold_rationale || '—'"></dd></div>
+                                        <div class="min-w-0"><dt class="inline text-rose-300">exit_reason · </dt><dd class="inline text-slate-300" x-text="p.exit_reason || 'nessuna uscita (posizione intera)'"></dd></div>
+                                    </dl>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </template>
+                </table>
+            </div>
+        </section>
+
+        <!-- ============ ULTIME CHIUSURE (exit_reason del Guardian) ============ -->
+        <section class="glass hud-corners" x-show="closedPositions.length">
+            <div class="px-4 py-3 border-b border-sky-400/10 flex items-center justify-between">
+                <h2 class="panel-title">Ultime chiusure</h2>
+                <span class="text-[11px] text-slate-500 num" x-text="closedPositions.length + ' recenti'"></span>
+            </div>
+            <ul class="divide-y divide-slate-800/70 text-[11px]">
+                <template x-for="c in closedPositions" :key="c.symbol + c.closed_at">
+                    <li class="px-4 py-2 space-y-0.5">
+                        <div class="flex items-center gap-2"><span class="text-slate-100 num" x-text="c.symbol"></span>
+                            <span class="text-slate-500 num" x-text="dateTime(c.closed_at)"></span></div>
+                        <div><span class="text-rose-300">exit_reason · </span><span class="text-slate-300" x-text="c.exit_reason"></span></div>
+                        <div x-show="c.buy_thesis"><span class="text-sky-400">buy_thesis · </span><span class="text-slate-400" x-text="c.buy_thesis"></span></div>
+                    </li>
+                </template>
+            </ul>
+        </section>
+        </div>
+
+        <!-- ================================================================ AUDIT -->
+        <div x-show="tab === 'audit'" x-cloak class="tab-panel space-y-6">
         <!-- ============ AUDIT AGENTI & REVISIONI ============ -->
-        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
-            <div class="px-4 py-3 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
-                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">📜 Audit agenti &amp; revisioni (ultime 5h)</h2>
+        <section class="glass hud-corners">
+            <div class="px-4 py-3 border-b border-sky-400/10 flex flex-wrap items-center justify-between gap-2">
+                <h2 class="panel-title">📜 Audit agenti &amp; revisioni (ultime 5h)</h2>
                 <div class="flex flex-wrap gap-1 text-[11px]">
                     <template x-for="t in auditTabs" :key="t.id">
                         <button @click="auditTab = t.id" class="px-2.5 py-1 rounded border"
-                                :class="auditTab === t.id ? 'border-sky-500/60 bg-sky-500/10 text-sky-300' : 'border-slate-800 text-slate-400 hover:text-slate-200'"
+                                :class="auditTab === t.id ? 'border-sky-500/60 bg-sky-500/10 text-sky-300' : 'border-sky-400/10 text-slate-400 hover:text-slate-200'"
                                 x-text="t.label + (t.id === 'rejected' ? ' · ' + (audit.rejected?.total ?? 0) : t.id === 'executed' ? ' · ' + (audit.executed || []).length : '')"></button>
                     </template>
                 </div>
@@ -316,10 +566,10 @@
             <div x-show="auditTab === 'rejected'" class="p-4 space-y-3">
                 <div class="flex flex-wrap gap-1 text-[11px]">
                     <button @click="auditStage = ''" class="px-2 py-0.5 rounded border"
-                            :class="auditStage === '' ? 'border-slate-500 text-slate-200' : 'border-slate-800 text-slate-500'">Tutte</button>
+                            :class="auditStage === '' ? 'border-slate-500 text-slate-200' : 'border-sky-400/10 text-slate-500'">Tutte</button>
                     <template x-for="[st, n] in Object.entries(audit.rejected?.by_stage || {})" :key="st">
                         <button @click="auditStage = st" class="px-2 py-0.5 rounded border num"
-                                :class="auditStage === st ? 'border-slate-500 text-slate-200' : 'border-slate-800 text-slate-500'"
+                                :class="auditStage === st ? 'border-slate-500 text-slate-200' : 'border-sky-400/10 text-slate-500'"
                                 x-text="st + ' ' + n"></button>
                     </template>
                 </div>
@@ -363,7 +613,7 @@
                     <div class="text-xs text-slate-500">Nessuna scheda approvata ed eseguita registrata.</div>
                 </template>
                 <template x-for="e in (audit.executed || [])" :key="e.symbol + e.time">
-                    <div class="rounded border px-3 py-2.5 text-xs" :class="e.in_portfolio ? 'border-emerald-500/40' : 'border-slate-800'">
+                    <div class="rounded border px-3 py-2.5 text-xs" :class="e.in_portfolio ? 'border-emerald-500/40' : 'border-sky-400/10'">
                         <div class="flex flex-wrap items-center justify-between gap-2">
                             <span class="flex items-center gap-2">
                                 <span class="num text-slate-100" x-text="e.symbol"></span>
@@ -380,7 +630,7 @@
                         <div x-show="(e.anomalies || []).length" class="mt-1 text-[11px] text-slate-500" x-text="'Anomalie Scout: ' + (e.anomalies || []).join(', ') + (e.score != null ? ' · score ' + e.score : '')"></div>
                         <div class="mt-2 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-1.5">
                             <template x-for="v in agentVotes(e.agents)" :key="v.name">
-                                <div class="rounded bg-slate-950/60 px-2 py-1 text-[11px]">
+                                <div class="rounded-lg bg-slate-950/50 border border-sky-400/10 px-2 py-1 text-[11px]">
                                     <div class="text-slate-500" x-text="v.name"></div>
                                     <div class="num" :class="v.cls" x-text="v.value"></div>
                                 </div>
@@ -425,94 +675,18 @@
                      x-text="(audit.scorecard?.closed_trades ?? 0) + ' trade chiusi analizzati, ' + (audit.scorecard?.voted_trades ?? 0) + ' con i voti degli agenti all\'ingresso'"></div>
             </div>
         </section>
+        </div>
 
-        <!-- ============ POSIZIONI ============ -->
-        <section class="border border-slate-800 rounded-lg bg-slate-900/40">
-            <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Posizioni aperte</h2>
-                <span class="text-[11px] text-slate-500 num" x-text="positions.length + ' posizioni'"></span>
-            </div>
-            <div class="overflow-x-auto scroll-thin">
-                <table class="w-full text-xs">
-                    <thead>
-                        <tr class="border-b border-slate-800 text-slate-500 text-left">
-                            <th class="font-medium px-4 py-2.5">Asset</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Quantità</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Allocazione CIO</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Convinzione</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Stop</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Prezzo medio</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Prezzo</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Valore</th>
-                            <th class="font-medium px-4 py-2.5 text-right">P&amp;L</th>
-                            <th class="font-medium px-4 py-2.5 text-right">%</th>
-                        </tr>
-                    </thead>
-                    <tbody class="num" x-show="!positions.length">
-                        <tr><td colspan="10" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
-                    </tbody>
-                    <template x-for="p in positions" :key="p.symbol">
-                        <tbody class="num border-b border-slate-800/70">
-                            <tr class="hover:bg-slate-800/30 cursor-pointer" @click="openPosition(p)" title="Apri la scheda della posizione">
-                                <td class="px-4 py-2.5 text-slate-100">
-                                    <span x-text="p.symbol"></span>
-                                    <span x-show="p.trade_class === 'SUPER_CONVICTION'" class="ml-1 text-[10px] font-sans px-1 rounded bg-amber-500/15 text-amber-300">SUPER</span>
-                                    <span x-show="p.horizon" class="ml-1 text-[10px] font-sans text-slate-500" x-text="p.horizon === 'SWING_CATALYST' ? 'swing' : 'intraday'"></span>
-                                    <span x-show="p.scaled_out" class="ml-1 text-[10px] font-sans text-emerald-400">runner</span>
-                                </td>
-                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="qty(p.qty)"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.conviction ?? '—'"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="usd(p.avg_entry_price)"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.current_price)"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.market_value)"></td>
-                                <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></td>
-                                <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></td>
-                            </tr>
-                            <tr class="font-sans">
-                                <td colspan="10" class="px-4 pb-2.5 pt-0">
-                                    <dl class="grid grid-cols-1 lg:grid-cols-3 gap-x-4 gap-y-1 text-[11px] leading-snug">
-                                        <div class="min-w-0"><dt class="inline text-sky-400">buy_thesis · </dt><dd class="inline text-slate-300" x-text="p.buy_thesis || '—'"></dd></div>
-                                        <div class="min-w-0"><dt class="inline text-amber-300">hold_rationale · </dt><dd class="inline text-slate-300" x-text="p.hold_rationale || '—'"></dd></div>
-                                        <div class="min-w-0"><dt class="inline text-rose-300">exit_reason · </dt><dd class="inline text-slate-300" x-text="p.exit_reason || 'nessuna uscita (posizione intera)'"></dd></div>
-                                    </dl>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </template>
-                </table>
-            </div>
-        </section>
-
-        <!-- ============ ULTIME CHIUSURE (exit_reason del Guardian) ============ -->
-        <section class="border border-slate-800 rounded-lg bg-slate-900/40" x-show="closedPositions.length">
-            <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
-                <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Ultime chiusure</h2>
-                <span class="text-[11px] text-slate-500 num" x-text="closedPositions.length + ' recenti'"></span>
-            </div>
-            <ul class="divide-y divide-slate-800/70 text-[11px]">
-                <template x-for="c in closedPositions" :key="c.symbol + c.closed_at">
-                    <li class="px-4 py-2 space-y-0.5">
-                        <div class="flex items-center gap-2"><span class="text-slate-100 num" x-text="c.symbol"></span>
-                            <span class="text-slate-500 num" x-text="dateTime(c.closed_at)"></span></div>
-                        <div><span class="text-rose-300">exit_reason · </span><span class="text-slate-300" x-text="c.exit_reason"></span></div>
-                        <div x-show="c.buy_thesis"><span class="text-sky-400">buy_thesis · </span><span class="text-slate-400" x-text="c.buy_thesis"></span></div>
-                    </li>
-                </template>
-            </ul>
-        </section>
-
-        <!-- ============ LOG DI SISTEMA (chiusi di default) ============ -->
-        <details class="border border-slate-800 rounded-lg bg-slate-900/40 group">
+        <!-- ================================================================ LOG TECNICI -->
+        <details x-show="tab === 'audit'" class="glass hud-corners group">
             <summary class="px-4 py-3 flex items-center justify-between cursor-pointer select-none">
-                <span class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                <span class="panel-title">
                     <i data-lucide="chevron-right" class="w-3.5 h-3.5 transition-transform group-open:rotate-90"></i>
-                    Log di sistema
+                    Log tecnici (per sviluppatori)
                 </span>
                 <span class="text-[11px] text-slate-500 num" x-text="visibleLogs().length + ' righe'"></span>
             </summary>
-            <div class="border-t border-slate-800">
+            <div class="border-t border-sky-400/10">
                 <div class="flex justify-end px-4 pt-2">
                     <button @click="clearLogs()" class="text-[11px] text-slate-500 hover:text-slate-300">Pulisci</button>
                 </div>
@@ -525,12 +699,69 @@
         </details>
     </main>
 
+    <!-- ============ ISPEZIONA CERVELLO (drawer laterale) ============ -->
+    <div x-cloak @keydown.escape.window="closeBrain()">
+        <div class="drawer-backdrop" @click="closeBrain()"
+             x-show="brainOpen" x-transition:enter="t-enter" x-transition:enter-start="t-fade-from" x-transition:enter-end="t-to"
+             x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-fade-from"></div>
+        <aside class="drawer" x-show="brainOpen"
+               x-transition:enter="t-enter" x-transition:enter-start="t-drawer-from" x-transition:enter-end="t-to"
+               x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-drawer-from">
+            <div class="px-5 py-4 border-b border-sky-400/15 flex items-start gap-3">
+                <div class="hud-ring" :class="brain?.agent?.paused && 'off'"></div>
+                <div class="min-w-0 flex-1">
+                    <div class="text-[10px] tracking-[0.2em] uppercase text-cyan-300/80">Ispezione cervello</div>
+                    <div class="text-base font-semibold text-slate-100" x-text="brain?.agent?.title || ''"></div>
+                    <div class="mt-1 text-[12px] text-slate-400 leading-snug" x-text="brain?.agent?.role || ''"></div>
+                </div>
+                <button @click="closeBrain()" class="btn w-8 px-0" title="Chiudi">✕</button>
+            </div>
+            <div class="px-5 py-3 border-b border-sky-400/10 flex flex-wrap items-center gap-2 text-[11px]">
+                <span class="flex items-center gap-1.5 font-semibold tracking-wider" :class="statusTone(brain?.agent?.status)">
+                    <span class="status-led" :class="brain?.agent?.status === 'PROCESSING' && 'blink'"></span>
+                    <span x-text="statusText(brain?.agent?.status)"></span></span>
+                <span class="text-slate-500" x-show="brain?.agent?.tunable" x-text="'· sensibilità ' + (brain?.agent?.sensitivity_label || '')"></span>
+                <span class="ml-auto flex gap-1.5">
+                    <button class="btn btn-sm" :class="brain?.agent?.paused ? 'btn-emerald' : 'btn-amber'" :disabled="!brain?.agent?.pausable"
+                            @click="togglePause(brain.agent)" x-text="brain?.agent?.paused ? '▶ ATTIVA' : '❚❚ PAUSA'"></button>
+                </span>
+            </div>
+            <div class="px-5 pt-3 text-[10px] uppercase tracking-[0.18em] text-cyan-300/70 flex items-center gap-2">
+                Flusso di pensiero <span class="thinking-dots text-cyan-300"><span></span><span></span><span></span></span>
+                <span class="ml-auto normal-case tracking-normal text-slate-600">aggiornato ogni 2s</span>
+            </div>
+            <div class="flex-1 overflow-y-auto scroll-thin px-5 py-3">
+                <template x-if="brain && brain.thoughts && !brain.thoughts.length">
+                    <div class="text-sm text-slate-500">Nessun pensiero registrato di recente: l'agente è in ascolto.</div>
+                </template>
+                <template x-if="!brain || !brain.thoughts"><div class="text-sm text-slate-500">Collegamento neurale…</div></template>
+                <template x-for="(t, i) in (brain?.thoughts || [])" :key="t.ts + ':' + i">
+                    <div class="thought" :class="'lv-' + (t.level || (/❌|Errore|VETO|🚨|🛑/.test(t.text) ? 'veto' : /✅|APPROVED|BUY/.test(t.text) ? 'ok' : 'info'))">
+                        <div class="flex items-center gap-2 text-[10.5px] text-slate-500 num">
+                            <span x-text="new Date(t.ts * 1000).toLocaleTimeString('it-IT')"></span>
+                            <span x-show="t.agent" class="text-cyan-300/70" x-text="t.agent"></span>
+                            <span class="ml-auto" x-text="ago(t.ts)"></span>
+                        </div>
+                        <div class="mt-0.5 text-[12.5px] text-slate-200 leading-snug break-words" x-text="t.text"></div>
+                    </div>
+                </template>
+            </div>
+        </aside>
+    </div>
+
+    <!-- ============ NOTIFICHE ============ -->
+    <div class="fixed bottom-4 right-4 z-[70] space-y-2 w-[min(360px,calc(100vw-2rem))]">
+        <template x-for="t in toasts" :key="t.id">
+            <div class="glass glass-strong px-4 py-3 text-[13px] bubble" :class="t.error ? '!border-rose-400/50 text-rose-200' : '!border-cyan-400/40 text-cyan-100'" x-text="t.text"></div>
+        </template>
+    </div>
+
     <!-- ============ IMPOSTAZIONI (nascoste di default) ============ -->
-    <div x-cloak x-show="showSettings" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
+    <div x-cloak x-show="showSettings" x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-fade-from" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
          @keydown.escape.window="showSettings = false">
-        <div class="absolute inset-0 bg-black/60" @click="showSettings = false"></div>
-        <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin border border-slate-800 rounded-lg bg-[#0d1220] shadow-xl">
-            <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between sticky top-0 bg-[#0d1220]">
+        <div class="modal-backdrop" @click="showSettings = false"></div>
+        <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin modal">
+            <div class="px-5 py-3 border-b border-sky-400/15 flex items-center justify-between sticky top-0 bg-[#0a101e]">
                 <h2 class="text-sm font-semibold text-slate-100">Impostazioni Bot</h2>
                 <button @click="showSettings = false" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
             </div>
@@ -548,8 +779,8 @@
                     </div>
                     <form @submit.prevent="addTicker()" class="flex gap-2">
                         <input x-model="tickerInput" :disabled="locked('watchlist')" maxlength="15" placeholder="Es. GOOGL o DOGE-USD"
-                               class="flex-1 min-w-0 h-8 bg-slate-950 border border-slate-800 rounded px-2 num uppercase text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
-                        <button type="submit" :disabled="locked('watchlist')" class="h-8 px-3 rounded border border-slate-700 hover:bg-slate-800 disabled:opacity-50">Aggiungi</button>
+                               class="flex-1 min-w-0 h-8 field num uppercase text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                        <button type="submit" :disabled="locked('watchlist')" class="btn">Aggiungi</button>
                     </form>
                 </div>
 
@@ -558,20 +789,20 @@
                         <label class="block" :title="lockTitle(f.key)">
                             <span class="text-[11px] uppercase tracking-wider text-slate-500" x-text="f.label"></span>
                             <input type="number" :step="f.step" :min="f.min" :max="f.max" x-model.number="settings[f.key]" :disabled="locked(f.key)"
-                                   class="mt-1 w-full h-8 bg-slate-950 border border-slate-800 rounded px-2 num text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                                   class="mt-1 w-full h-8 field num text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
                         </label>
                     </template>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-slate-800" :title="lockTitle('auto_execute_trades')">
+                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-sky-400/15" :title="lockTitle('auto_execute_trades')">
                         <span>
                             <span class="text-slate-200">Auto-Trading</span>
                             <span class="block text-[11px] text-slate-500" x-text="settings.auto_execute_trades ? 'Esegue gli ordini' : 'Advisor: solo suggerimenti'"></span>
                         </span>
                         <input type="checkbox" x-model="settings.auto_execute_trades" :disabled="locked('auto_execute_trades')" class="h-4 w-4 accent-emerald-500">
                     </label>
-                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-slate-800" :title="lockTitle('keep_alive_enabled')">
+                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-sky-400/15" :title="lockTitle('keep_alive_enabled')">
                         <span>
                             <span class="text-slate-200">Anti-Sleep</span>
                             <span class="block text-[11px] text-slate-500">Self-ping ogni 10 minuti</span>
@@ -583,7 +814,7 @@
                 <label class="block" :title="lockTitle('ai_provider')">
                     <span class="text-[11px] uppercase tracking-wider text-slate-500">Motore IA</span>
                     <select x-model="settings.ai_provider" :disabled="locked('ai_provider')"
-                            class="mt-1 w-full h-8 bg-slate-950 border border-slate-800 rounded px-2 text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                            class="mt-1 w-full h-8 field text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
                         <option value="gemini">Gemini Flash</option>
                         <option value="groq">Groq</option>
                         <option value="hybrid">Ibrido Gemini + Groq</option>
@@ -596,22 +827,22 @@
                 </p>
             </div>
 
-            <div class="px-5 py-3 border-t border-slate-800 flex items-center justify-between gap-3 sticky bottom-0 bg-[#0d1220]">
+            <div class="px-5 py-3 border-t border-sky-400/15 flex items-center justify-between gap-3 sticky bottom-0 bg-[#0a101e]">
                 <span class="text-[11px] num" :class="noticeError ? 'text-rose-400' : 'text-emerald-400'" x-text="notice"></span>
                 <div class="flex gap-2">
-                    <button @click="showSettings = false" class="h-8 px-3 rounded border border-slate-700 hover:bg-slate-800 text-xs">Chiudi</button>
-                    <button @click="saveSettings()" :disabled="saving" class="h-8 px-3 rounded bg-slate-100 text-slate-900 hover:bg-white text-xs font-medium disabled:opacity-50">Salva impostazioni</button>
+                    <button @click="showSettings = false" class="btn">Chiudi</button>
+                    <button @click="saveSettings()" :disabled="saving" class="btn btn-cyan">Salva impostazioni</button>
                 </div>
             </div>
         </div>
     </div>
 
     <!-- ============ SCHEDA POSIZIONE (click su una riga) ============ -->
-    <div x-cloak x-show="showPosition" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
+    <div x-cloak x-show="showPosition" x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-fade-from" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
          @keydown.escape.window="showPosition = false">
-        <div class="absolute inset-0 bg-black/60" @click="showPosition = false"></div>
-        <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin border border-slate-800 rounded-lg bg-[#0d1220] shadow-xl">
-            <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between sticky top-0 bg-[#0d1220]">
+        <div class="modal-backdrop" @click="showPosition = false"></div>
+        <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin modal">
+            <div class="px-5 py-3 border-b border-sky-400/15 flex items-center justify-between sticky top-0 bg-[#0a101e]">
                 <h2 class="text-sm font-semibold text-slate-100" x-text="'Posizione ' + (posDetail?.position?.symbol || posSymbol)"></h2>
                 <button @click="showPosition = false" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
             </div>
@@ -636,12 +867,12 @@
                         </div>
 
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 num">
-                            <div class="border border-slate-800 rounded p-3">
+                            <div class="border border-sky-400/15 rounded p-3">
                                 <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Stop Loss</div>
                                 <div class="text-rose-300" x-text="price(posDetail.stop_loss.price) + ' (' + posDetail.stop_loss.pct + '%)'"></div>
                                 <div class="text-[11px] text-slate-500 font-sans" x-text="posDetail.stop_loss.source + (posDetail.stop_loss.effective_pct != null && posDetail.stop_loss.effective_pct !== posDetail.stop_loss.pct ? ' · stop effettivo del Guardian ' + posDetail.stop_loss.effective_pct + '%' : '')"></div>
                             </div>
-                            <div class="border border-slate-800 rounded p-3">
+                            <div class="border border-sky-400/15 rounded p-3">
                                 <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Target 1 (2R)</div>
                                 <div class="text-emerald-300" x-text="posDetail.take_profit.price ? price(posDetail.take_profit.price) + (posDetail.take_profit.pct != null ? ' (+' + posDetail.take_profit.pct + '%)' : '') : '—'"></div>
                                 <div class="text-[11px] text-slate-500 font-sans" x-text="posDetail.take_profit.label || 'target del Comitato Rischi / Agente #3'"></div>
@@ -687,22 +918,22 @@
                     </div>
                 </template>
             </div>
-            <div class="px-5 py-3 border-t border-slate-800 flex items-center justify-between gap-3 sticky bottom-0 bg-[#0d1220]">
+            <div class="px-5 py-3 border-t border-sky-400/15 flex items-center justify-between gap-3 sticky bottom-0 bg-[#0a101e]">
                 <span class="text-[11px] num" :class="posNoticeError ? 'text-rose-400' : 'text-emerald-400'" x-text="posNotice"></span>
                 <div class="flex gap-2">
-                    <button @click="showPosition = false" class="h-8 px-3 rounded border border-slate-700 hover:bg-slate-800 text-xs">Chiudi</button>
-                    <button @click="sellNow()" :disabled="selling || !posDetail" class="h-8 px-3 rounded bg-rose-600 hover:bg-rose-500 text-white text-xs font-medium disabled:opacity-50">🔴 VENDI SUBITO</button>
+                    <button @click="showPosition = false" class="btn">Chiudi</button>
+                    <button @click="sellNow()" :disabled="selling || !posDetail" class="btn btn-rose">🔴 VENDI SUBITO</button>
                 </div>
             </div>
         </div>
     </div>
 
     <!-- ============ STORICO OFFLINE ============ -->
-    <div x-cloak x-show="showHistory" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
+    <div x-cloak x-show="showHistory" x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-fade-from" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
          @keydown.escape.window="showHistory = false">
-        <div class="absolute inset-0 bg-black/60" @click="showHistory = false"></div>
-        <div class="relative w-full max-w-5xl max-h-[85vh] overflow-y-auto scroll-thin border border-slate-800 rounded-lg bg-[#0d1220] shadow-xl">
-            <div class="px-5 py-3 border-b border-slate-800 flex items-center justify-between gap-3 sticky top-0 bg-[#0d1220]">
+        <div class="modal-backdrop" @click="showHistory = false"></div>
+        <div class="relative w-full max-w-5xl max-h-[85vh] overflow-y-auto scroll-thin modal">
+            <div class="px-5 py-3 border-b border-sky-400/15 flex items-center justify-between gap-3 sticky top-0 bg-[#0a101e]">
                 <h2 class="text-sm font-semibold text-slate-100">📜 Storico Offline</h2>
                 <div class="flex items-center gap-3 text-xs">
                     <label class="flex items-center gap-1.5 text-slate-400">
@@ -716,7 +947,7 @@
                 <div class="overflow-x-auto scroll-thin">
                     <table class="w-full">
                         <thead>
-                            <tr class="border-b border-slate-800 text-slate-500 text-left">
+                            <tr class="border-b border-sky-400/15 text-slate-500 text-left">
                                 <th class="font-medium py-2 pr-3">Data</th><th class="font-medium py-2 pr-3">Simbolo</th>
                                 <th class="font-medium py-2 pr-3">Operazione</th><th class="font-medium py-2 pr-3 text-right">Prezzo</th>
                                 <th class="font-medium py-2 pr-3 text-right">Quantità</th><th class="font-medium py-2 pr-3 text-right">PnL realizzato</th>
@@ -745,386 +976,6 @@
             </div>
         </div>
     </div>
-
-    <script>
-        // Token degli endpoint di controllo, inserito dal server dopo il login
-        const API_TOKEN = {{ api_token|tojson }};
-
-        function dashboard() {
-            return {
-                connected: true,
-                account: {}, positions: [], closedPositions: [], bot: { logs: [] },
-                radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
-                settings: { watchlist: [] }, envLocked: {},
-                showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
-                showPosition: false, posSymbol: '', posDetail: null, posLoading: false, posError: '', posNotice: '', posNoticeError: false, selling: false,
-                showHistory: false, historyRows: [], historyOffline: true, historyLoading: false,
-                audit: {}, auditTab: 'rejected', auditStage: '',
-                auditTabs: [{ id: 'rejected', label: 'Bocciate (5h)' }, { id: 'executed', label: 'Approvate & Storico' }, { id: 'scorecard', label: 'Pagella Agenti' }],
-                localLogs: [], clearedId: 0, clearedTs: 0,
-                logs: [], lastLogId: 0, dialogue: [], lastDialogueId: 0, fetching: false, streamPinned: true,
-                numberFields: [
-                    { key: 'stop_loss_pct', label: 'Stop di riserva % (se manca ATR)', step: 0.5, min: -50, max: -0.5 },
-                    { key: 'scan_interval_min', label: 'Intervallo di scansione (min)', step: 1, min: 1, max: 1440 },
-                    { key: 'max_allocation_pct', label: 'Soffitto per operazione % (8-25%, fino a 50% solo SUPER_CONVICTION)', step: 0.5, min: 0.5, max: 100 },
-                    { key: 'max_exposure_pct', label: 'Esposizione massima % (tetto Safety Net 50)', step: 5, min: 10, max: 50 },
-                ],
-
-                init() {
-                    this.fetchStatus();
-                    this.loadSettings();
-                    setInterval(() => this.fetchStatus(), 1000);
-                    this.loadAudit();
-                    setInterval(() => this.loadAudit(), 15000);
-                    this.$nextTick(() => window.lucide && lucide.createIcons());
-                },
-
-                // ---------- formattazione ----------
-                usd(v, signed = false) {
-                    if (v === null || v === undefined || isNaN(v)) return '—';
-                    const n = Number(v);
-                    const s = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                    return (signed ? (n > 0 ? '+' : n < 0 ? '−' : '') : (n < 0 ? '−' : '')) + '$' + s;
-                },
-                pct(v) {
-                    if (v === null || v === undefined || isNaN(v)) return '—';
-                    const n = Number(v);
-                    return (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n).toFixed(2) + '%';
-                },
-                qty(v) { return Number(v).toLocaleString('en-US', { maximumFractionDigits: 6 }); },
-                tone(v) {
-                    if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return 'text-slate-300';
-                    return Number(v) > 0 ? 'text-emerald-400' : 'text-rose-400';
-                },
-                exposurePct() {
-                    const eq = Number(this.account.portfolio);
-                    if (!eq || this.account.exposure === undefined) return '—';
-                    return (this.account.exposure / eq * 100).toFixed(1) + '%';
-                },
-                duration(min) {
-                    if (min === null || min === undefined) return '—';
-                    if (min < 60) return Math.round(min) + ' min';
-                    if (min < 1440) return (min / 60).toFixed(1) + ' h';
-                    return (min / 1440).toFixed(1) + ' g';
-                },
-                weight(p) {
-                    const eq = Number(this.account.portfolio);
-                    return eq ? (p.market_value / eq * 100).toFixed(1) + '% (peso)' : '—';
-                },
-                vetoes() { return (this.radar.recent || []).filter(r => r.status === 'REJECTED_BY_RISK').slice(0, 8); },
-                otherRecent() { return (this.radar.recent || []).filter(r => r.status !== 'REJECTED_BY_RISK').slice(0, 5); },
-                shortTime(iso) {
-                    return iso ? String(iso).replace('T', ' ').slice(11, 19) : '';
-                },
-                mmss(sec) {
-                    if (sec === null || sec === undefined) return '';
-                    const s = Math.max(0, Math.floor(sec));
-                    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
-                },
-                statusLabel(st) {
-                    return { SUBMITTED_PITCH: 'PITCH', UNDER_REVIEW: 'IN REVISIONE', APPROVED_BY_RISK: 'APPROVATA',
-                             REJECTED_BY_RISK: 'VETO', EXPIRED: 'SCADUTA', EXECUTED: 'ESEGUITA' }[st] || st;
-                },
-                statusStyle(st, textOnly = false) {
-                    const map = {
-                        APPROVED_BY_RISK: ['border-emerald-800 text-emerald-400', 'text-emerald-400'],
-                        EXECUTED: ['border-sky-800 text-sky-400', 'text-sky-400'],
-                        REJECTED_BY_RISK: ['border-rose-900 text-rose-400', 'text-rose-400'],
-                        EXPIRED: ['border-slate-700 text-slate-500', 'text-slate-500'],
-                    };
-                    const v = map[st] || ['border-amber-800 text-amber-400', 'text-amber-400'];
-                    return textOnly ? v[1] : v[0];
-                },
-                actionStyle(a) {
-                    return {
-                        BUY: 'border-emerald-800 text-emerald-400 bg-emerald-950/40',
-                        SELL: 'border-rose-800 text-rose-400 bg-rose-950/40',
-                        ROTATE: 'border-sky-800 text-sky-400 bg-sky-950/40',
-                    }[a] || 'border-slate-700 text-slate-300 bg-slate-800/40';
-                },
-                verdictStyle(v) {
-                    return v === 'APPROVATO' ? 'text-emerald-400' : v === 'RESPINTO' ? 'text-rose-400' : 'text-slate-500';
-                },
-                cioTarget() {
-                    const c = this.cio;
-                    if (c.action === 'ROTATE') return `${c.sell_pct || 100}% ${c.sell_symbol} → ${c.buy_symbol}`;
-                    if (c.action === 'SELL') return `${c.sell_pct || 100}% ${c.sell_symbol}`;
-                    return c.buy_symbol || c.sell_symbol || '—';
-                },
-                cioDescription() {
-                    const c = this.cio;
-                    if (c.action === 'ROTATE') return `ROTATE ${c.sell_pct || 100}% ${c.sell_symbol} → ${c.buy_symbol}`;
-                    if (c.action === 'BUY') return `BUY ${c.buy_symbol}`;
-                    if (c.action === 'SELL') return `SELL ${c.sell_pct || 100}% ${c.sell_symbol}`;
-                    return 'HOLD';
-                },
-
-                // ---------- log ----------
-                logClass(text) {
-                    if (/❌|Errore|🚨|🛑|VETO|BLOCCATI/.test(text)) return 'text-rose-300/90';
-                    if (/✅|ORDINE ACQUISTO/.test(text)) return 'text-emerald-300/90';
-                    if (/⚠️|⛔|🌅|🧭/.test(text)) return 'text-amber-300/80';
-                    if (/━━━|===/.test(text)) return 'text-slate-500';
-                    return 'text-slate-400';
-                },
-                visibleLogs() {
-                    const server = this.logs
-                        .filter(l => l && l.id > this.clearedId)
-                        .map(l => ({ key: 's' + l.id, ts: l.ts, text: l.text, cls: this.logClass(l.text) }));
-                    const local = this.localLogs.filter(l => l.ts > this.clearedTs);
-                    return server.concat(local).sort((a, b) => a.ts - b.ts);
-                },
-                addLog(message, error = false) {
-                    const ts = Date.now() / 1000;
-                    const time = new Date().toLocaleTimeString('it-IT');
-                    this.localLogs.push({ key: 'l' + ts, ts, text: `[${time}] ${message}`, cls: error ? 'text-rose-300/90' : 'text-sky-300/90' });
-                    if (this.localLogs.length > 30) this.localLogs.shift();
-                },
-                clearLogs() {
-                    this.clearedId = this.lastLogId;
-                    this.clearedTs = Date.now() / 1000;
-                    this.localLogs = [];
-                },
-
-                // ---------- API ----------
-                async api(url, method = 'POST', body) {
-                    const headers = { 'X-API-Key': API_TOKEN };
-                    if (body !== undefined) headers['Content-Type'] = 'application/json';
-                    const res = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
-                    if (res.status === 401) { window.location.href = '/login'; }
-                    const data = await res.json().catch(() => ({}));
-                    return { res, data };
-                },
-                async fetchStatus() {
-                    if (this.fetching) return;   // niente richieste sovrapposte con il polling a 1s
-                    this.fetching = true;
-                    try {
-                        const res = await fetch(`/api/data?since_log=${this.lastLogId}&since_dialogue=${this.lastDialogueId}`);
-                        if (res.status === 401) { window.location.href = '/login'; return; }
-                        if (!res.ok) throw new Error(res.status);
-                        const data = await res.json();
-                        this.account = data.account || {};
-                        this.positions = Array.isArray(data.positions) ? data.positions : [];
-                        this.closedPositions = Array.isArray(data.closed_positions) ? data.closed_positions : [];
-                        this.bot = data.bot || { logs: [] };
-                        this.radar = data.radar || {};
-                        this.channels = this.radar.channels || {};
-                        this.macro = this.channels.macro || {};
-                        this.perf = this.bot.performance || {};
-                        this.cio = this.bot.cio || {};
-                        // Log e dialoghi arrivano in modo incrementale; riallineamento dopo un riavvio del server
-                        if ((data.log_head || 0) < this.lastLogId) { this.logs = []; this.lastLogId = 0; this.clearedId = 0; }
-                        if ((data.dialogue_head || 0) < this.lastDialogueId) { this.dialogue = []; this.lastDialogueId = 0; }
-                        const newLogs = this.bot.logs || [];
-                        if (newLogs.length) {
-                            this.logs = this.logs.concat(newLogs).slice(-300);
-                            this.lastLogId = newLogs[newLogs.length - 1].id;
-                        }
-                        const newDialogue = data.agent_dialogue || [];
-                        if (newDialogue.length) {
-                            this.dialogue = this.dialogue.concat(newDialogue).slice(-100);
-                            this.lastDialogueId = newDialogue[newDialogue.length - 1].id;
-                            if (this.streamPinned) this.$nextTick(() => { const b = this.$refs.stream; if (b) b.scrollTop = b.scrollHeight; });
-                        }
-                        this.connected = true;
-                    } catch (e) {
-                        this.connected = false;
-                    } finally {
-                        this.fetching = false;
-                    }
-                },
-                streamAlive() {
-                    const last = this.dialogue[this.dialogue.length - 1];
-                    return last && (Date.now() / 1000 - last.ts) < 30;
-                },
-                agentColor(agent) {
-                    if (agent.startsWith('Scout')) return 'text-slate-400';
-                    return { 'Chief of Staff': 'text-sky-400', 'Technical & Liquidity': 'text-violet-400',
-                             'Sentiment & Compliance': 'text-violet-400', 'Risk & ATR': 'text-violet-400', 'Quant Ensemble': 'text-violet-400', 'Pipeline': 'text-cyan-400', 'CHOP': 'text-yellow-300',
-                             'CIO': 'text-amber-300', 'Agente #5 CIO': 'text-amber-300', 'Execution Desk': 'text-emerald-400' }[agent] || 'text-slate-300';
-                },
-                levelColor(level) {
-                    return { alert: 'text-amber-300', veto: 'text-rose-400', ok: 'text-emerald-400', muted: 'text-slate-600' }[level] || 'text-slate-300';
-                },
-                async loadSettings() {
-                    try {
-                        const res = await fetch('/api/settings');
-                        if (res.status === 401) { window.location.href = '/login'; return; }
-                        const cfg = await res.json();
-                        this.envLocked = cfg.env_locked || {};
-                        delete cfg.env_locked;
-                        this.settings = cfg;
-                    } catch (e) { /* riprova alla prossima apertura */ }
-                },
-                locked(key) { return Boolean(this.envLocked[key]); },
-                lockTitle(key) { return this.envLocked[key] ? `Fissato dalla variabile d'ambiente ${this.envLocked[key]} su Render` : ''; },
-                addTicker() {
-                    const t = this.tickerInput.trim().toUpperCase();
-                    if (!/^[A-Z0-9.\-]{1,15}$/.test(t)) { this.flash('Ticker non valido', true); return; }
-                    if (!this.settings.watchlist.includes(t)) this.settings.watchlist.push(t);
-                    this.tickerInput = '';
-                },
-                removeTicker(t) { this.settings.watchlist = this.settings.watchlist.filter(x => x !== t); },
-                flash(message, error = false) {
-                    this.notice = message; this.noticeError = error;
-                    clearTimeout(this._noticeTimer);
-                    this._noticeTimer = setTimeout(() => this.notice = '', 4000);
-                },
-                async saveSettings() {
-                    const payload = JSON.parse(JSON.stringify(this.settings));
-                    for (const key of Object.keys(this.envLocked)) delete payload[key];
-                    this.saving = true;
-                    try {
-                        const { res, data } = await this.api('/api/settings', 'POST', payload);
-                        if (res.ok && data.settings) {
-                            this.envLocked = data.settings.env_locked || {};
-                            delete data.settings.env_locked;
-                            this.settings = data.settings;
-                            this.flash('Impostazioni salvate');
-                        } else {
-                            this.flash(data.message || 'Errore nel salvataggio', true);
-                        }
-                    } catch (e) {
-                        this.flash('Errore nel salvataggio: ' + e.message, true);
-                    } finally {
-                        this.saving = false;
-                    }
-                },
-                async forceCio() {
-                    this.addLog('⚡ Forza CIO richiesto');
-                    const { res, data } = await this.api('/api/scan');
-                    this.addLog(data.message || (res.ok ? 'CIO attivato' : 'Errore'), !res.ok || data.status === 'warning');
-                },
-                async toggleBot() {
-                    const { res, data } = await this.api('/api/toggle');
-                    if (res.ok) { this.bot.active = Boolean(data.active); this.addLog(data.active ? 'Bot riattivato' : 'Bot in pausa'); }
-                },
-                // ---------- scheda posizione ----------
-                price(v) {
-                    if (v === null || v === undefined || isNaN(v)) return '—';
-                    const n = Number(v);
-                    return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: Math.abs(n) < 10 ? 6 : 2 });
-                },
-                dateTime(v) {
-                    if (!v) return '—';
-                    const d = new Date(v);
-                    return isNaN(d) ? String(v) : d.toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'medium' });
-                },
-                agentRows(a) {
-                    const f = (v, d = 4) => (v === null || v === undefined) ? 'N/D' : Number(v).toFixed(d);
-                    const q = a.agent_01_quant || {}, m = a.agent_02_micro || {}, r = a.agent_03_risk || {}, mc = a.agent_04_macro || {}, c = a.agent_05_cio || {};
-                    const qm = q.metrics || {};
-                    const g = a.agent_06_guardian || {}, ch = a.agent_07_chop || {};
-                    const lat = ch.latency_ms || {};
-                    const chopTxt = ((ch.scouts || []).join(' · ') || 'nessuno Scout attivato')
-                        + (lat.stage1 != null ? ` · latenze S1 ${lat.stage1}ms / S2 ${lat.stage2}ms / S3 ${lat.stage3}ms` : '');
-                    return [
-                        { name: '#1 Quant', score: q.score ?? '—', detail: `Hurst ${f(qm.hurst_exponent)} · GARCH ${f(qm.garch_vol_pct)}% · Z ${f(qm.z_score, 2)} · ${q.signal || ''}` },
-                        { name: '#2 Micro', score: m.score ?? '—', detail: `VPIN ${f(m.vpin)} · OFI ${f(m.ofi)} · ${m.signal || ''}` },
-                        { name: '#3 Risk', score: r.score ?? '—', detail: `${r.approved ? 'Approvato' : 'Respinto'} · ${r.reason || ''}` },
-                        { name: '#4 Macro', score: mc.score ?? '—', detail: `Stress ${mc.stress_level || 'N/D'} · ${mc.approved ? 'Approvato' : 'Respinto'}` },
-                        { name: '#5 CIO', score: c.score ?? '—', detail: `${c.decision || ''} · ${c.reason || ''}` },
-                        { name: '#6 Guardian', score: g.approved == null ? '—' : (g.approved ? 'OK' : 'VETO'), detail: g.reason || '' },
-                        { name: '#7 CHOP', score: (ch.scouts || []).length + ' scout', detail: chopTxt },
-                    ];
-                },
-                async openPosition(p) {
-                    this.posSymbol = p.symbol; this.posDetail = null; this.posError = ''; this.posNotice = '';
-                    this.showPosition = true; this.posLoading = true;
-                    try {
-                        const res = await fetch('/api/positions/' + encodeURIComponent(p.symbol));
-                        if (res.status === 401) { window.location.href = '/login'; return; }
-                        const data = await res.json().catch(() => ({}));
-                        if (!res.ok) { this.posError = data.message || ('Errore ' + res.status); return; }
-                        this.posDetail = data;
-                    } catch (e) {
-                        this.posError = 'Errore di rete: ' + e.message;
-                    } finally {
-                        this.posLoading = false;
-                    }
-                },
-                async sellNow() {
-                    const sym = this.posDetail?.position?.symbol || this.posSymbol;
-                    if (!sym || !confirm(`Vendere SUBITO l'intera posizione ${sym} a mercato?`)) return;
-                    this.selling = true;
-                    try {
-                        const { res, data } = await this.api('/api/positions/' + encodeURIComponent(sym) + '/close');
-                        this.posNotice = data.message || (res.ok ? 'Vendita inviata' : 'Errore'); this.posNoticeError = !res.ok;
-                        this.addLog(this.posNotice, !res.ok);
-                        if (res.ok) { this.fetchStatus(); setTimeout(() => { this.showPosition = false; }, 1200); }
-                    } finally {
-                        this.selling = false;
-                    }
-                },
-
-                // ---------- audit agenti & revisioni ----------
-                async loadAudit() {
-                    try {
-                        const res = await fetch('/api/audit');
-                        if (res.ok) this.audit = await res.json();
-                    } catch (e) { /* riprova al prossimo giro */ }
-                },
-                auditRejected() {
-                    const rows = this.audit.rejected?.rows || [];
-                    return this.auditStage ? rows.filter(r => r.stage === this.auditStage) : rows;
-                },
-                agentVotes(a) {
-                    a = a || {};
-                    const sc = (x, ok = 60) => x?.score == null ? { value: '—', cls: 'text-slate-500' }
-                        : { value: Number(x.score).toFixed(1), cls: x.score >= ok ? 'text-emerald-400' : 'text-slate-300' };
-                    const ap = (x) => x?.approved == null ? { value: '—', cls: 'text-slate-500' }
-                        : { value: x.approved ? 'OK' : 'VETO', cls: x.approved ? 'text-emerald-400' : 'text-rose-400' };
-                    const risk = a.agent_03_risk;
-                    return [
-                        { name: '#1 Quant', ...sc(a.agent_01_quant) },
-                        { name: '#2 Micro', ...sc(a.agent_02_micro, 50) },
-                        { name: '#3 Risk', ...(risk ? { value: (risk.approved ? 'OK ' : 'VETO ') + (risk.score != null ? Number(risk.score).toFixed(0) : ''), cls: risk.approved ? 'text-emerald-400' : 'text-rose-400' } : ap(risk)) },
-                        { name: '#4 Macro', ...sc(a.agent_04_macro, 50) },
-                        { name: '#5 CIO', value: a.agent_05_cio ? (a.agent_05_cio.decision + ' ' + (a.agent_05_cio.score ?? '')) : '—', cls: a.agent_05_cio?.decision === 'BUY' ? 'text-emerald-400' : 'text-slate-300' },
-                        { name: '#6 Guardian', ...ap(a.agent_06_guardian) },
-                        { name: '#7 CHOP', value: a.agent_07_chop ? ((a.agent_07_chop.scouts || []).length + ' scout' + (a.agent_07_chop.latency_ms ? ' · ' + a.agent_07_chop.latency_ms.stage3 + 'ms' : '')) : '—', cls: 'text-slate-300' },
-                    ];
-                },
-
-                // ---------- storico offline ----------
-                openHistory() { this.showHistory = true; this.loadHistory(); },
-                async loadHistory() {
-                    this.historyLoading = true;
-                    try {
-                        const res = await fetch('/api/history?offline=' + (this.historyOffline ? '1' : '0'));
-                        if (res.status === 401) { window.location.href = '/login'; return; }
-                        const data = await res.json().catch(() => ({}));
-                        this.historyRows = Array.isArray(data.executions) ? data.executions : [];
-                    } catch (e) {
-                        this.historyRows = [];
-                    } finally {
-                        this.historyLoading = false;
-                    }
-                },
-                historySummary() {
-                    const rows = this.historyRows;
-                    const pnl = rows.reduce((s, h) => s + (Number(h.realized_pnl) || 0), 0);
-                    return `${rows.length} operazioni${this.historyOffline ? ' eseguite in tua assenza' : ''} · PnL realizzato ${this.usd(pnl, true)}`;
-                },
-                rationaleText(h) {
-                    const r = h.rationale || {};
-                    const a = r.agents || r.agents_at_exit;
-                    const parts = [];
-                    if (a) parts.push(`Q ${a.agent_01_quant?.score ?? '—'} · M ${a.agent_02_micro?.score ?? '—'} · R ${a.agent_03_risk?.score ?? '—'} · Macro ${a.agent_04_macro?.score ?? '—'} · CIO ${a.agent_05_cio?.score ?? '—'}`
-                        + (a.agent_06_guardian?.approved != null ? ` · Guardian ${a.agent_06_guardian.approved ? 'OK' : 'VETO'}` : '')
-                        + (a.agent_07_chop?.scouts?.length ? ` · ${a.agent_07_chop.scouts.length} scout` : ''));
-                    if (r.desk_cio) parts.push(`convinzione ${r.desk_cio.conviction}: ${r.desk_cio.reason || ''}`);
-                    if (r.exit_reason) parts.push(r.exit_reason);
-                    return parts.join(' — ') || h.note || '—';
-                },
-                async liquidate() {
-                    if (!confirm('🚨 PANIC: annullare gli ordini, chiudere TUTTE le posizioni a mercato e mettere il bot in pausa?')) return;
-                    const { res, data } = await this.api('/api/liquidate');
-                    this.addLog(data.message || 'Liquidazione inviata', !res.ok);
-                    this.fetchStatus();
-                },
-            };
-        }
-    </script>
+</div>
 </body>
 </html>

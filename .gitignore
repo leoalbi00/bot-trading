@@ -18,3 +18,4 @@ quant_agents.log*
 universe_cache.json
 data/pitch_audit_log.json*
 guardian_positions.json
+command_center.json

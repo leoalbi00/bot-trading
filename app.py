@@ -11,6 +11,7 @@ from flask import Flask, jsonify, redirect, render_template, request, session, u
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import trading_core as core
+import command_center as cc
 from trading_core import alpaca_client
 
 KEEP_ALIVE_INTERVAL = 600  # secondi tra un self-ping e l'altro
@@ -350,6 +351,10 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         channels = core.latest_channels()
         held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
         inbox = [p for p in core.cio_inbox() if core.normalize_symbol(p["symbol"]) not in held_keys | pending]
+        # Centro di Comando: CIO in pausa, blocchi del Comandante e sensibilità degli agenti
+        inbox, excluded = cc.filter_inbox(inbox)
+        for note in excluded:
+            log_message(f"🎛️ [Comando] {note}")
         core.agent_say("CIO", f"Ciclo ({'manuale' if manual else trigger}): {len(inbox)} schede APPROVED_BY_RISK da valutare")
         log_message("📥 [CIO] Schede APPROVED_BY_RISK: " + (", ".join(
             f"{p['symbol']} (score {p['score']}, scade tra {max(0, int((p['expires_epoch'] - time.time()) / 60))} min)"
@@ -526,12 +531,15 @@ def radar_loop():
                 positions = get_open_positions()
                 held = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
                 pending = core.get_pending_order_symbols(log=lambda m: None) or set()
-                core.run_scout_swarm(held_keys=held, pending=pending, log=log_message, rotate=True,
-                                     exposure_usd=sum(abs(p["market_value"]) for p in positions), positions_count=len(positions),
-                                     on_approved=lambda: request_cio("schede approvate dal Comitato Rischi"))
-                core.release_memory()   # i dati del blocco appena scansionato non servono più
-                # Mercato USA chiuso: pulse silenzioso dei panieri azionari (si autolimita a 1 volta ogni 15 min)
-                core.run_closed_market_pulse(log=log_message)
+                # Agenti #1 #2 #4 in pausa dal Centro di Comando: niente nuove schede (gli stop restano controllati)
+                if not cc.swarm_paused():
+                    core.run_scout_swarm(held_keys=held, pending=pending, log=log_message, rotate=True,
+                                         exposure_usd=sum(abs(p["market_value"]) for p in positions),
+                                         positions_count=len(positions),
+                                         on_approved=lambda: request_cio("schede approvate dal Comitato Rischi"))
+                    core.release_memory()   # i dati del blocco appena scansionato non servono più
+                    # Mercato USA chiuso: pulse silenzioso dei panieri azionari (si autolimita a 1 volta ogni 15 min)
+                    core.run_closed_market_pulse(log=log_message)
                 # Controllo rapido degli stop (stop del CIO salvato nell'ordine, altrimenti quello di riserva)
                 stops = bot_state.get("ledger_open", {})
                 fallback = core.get_config()["stop_loss_pct"]
@@ -629,7 +637,7 @@ def guardian_loop():
     time.sleep(core.STARTUP_GRACE_SECONDS + 15)
     while True:
         started = time.time()
-        if bot_state["active"] and bot_state.get("ledger_synced"):
+        if bot_state["active"] and bot_state.get("ledger_synced") and not cc.is_paused("06"):
             try:
                 guardian_tick()
             except Exception as e:
@@ -640,6 +648,9 @@ def chop_loop():
     """Agente #7 (CHOP Watchdog): auto-healing e audit dello sciame ogni 30 secondi."""
     time.sleep(core.STARTUP_GRACE_SECONDS + 30)
     while True:
+        if cc.is_paused("07"):
+            time.sleep(5)
+            continue
         try:
             line = core.chop_audit(log=log_message)
             if line:
@@ -950,16 +961,113 @@ def api_trigger():
     threading.Thread(target=run_trading_cycle, kwargs={"manual": True, "trigger": "⚡ Forza CIO"}, daemon=True).start()
     return jsonify({"status": "success", "message": "CIO attivato: valutazione delle schede in coda"})
 
-@app.route("/api/toggle", methods=["POST"])
-@require_token
-def api_toggle():
-    bot_state["active"] = not bot_state["active"]
+def set_bot_active(active):
+    bot_state["active"] = bool(active)
     if bot_state["active"]:
         wake_event.set()  # riparte subito senza attendere l'intervallo
     elif not scan_lock.locked():
         bot_state["status"] = "In pausa"
     log_message(f"Stato Bot impostato a: Active={bot_state['active']}")
+
+@app.route("/api/toggle", methods=["POST"])
+@require_token
+def api_toggle():
+    set_bot_active(not bot_state["active"])
     return jsonify({"active": bot_state["active"], "is_running": bot_state["active"]})
+
+# ============ CENTRO DI COMANDO: Agent Matrix e Stanza dei Dipendenti AI ============
+
+def _agent_feeds():
+    with state_lock:
+        logs = list(bot_state["logs"])
+    return logs, core.dialogue_since(0)
+
+@app.route("/api/agents")
+@require_login
+def api_agents():
+    """Agent Matrix: stato (attivo / in pausa / elaborazione), azione corrente e controlli dei 7 agenti."""
+    logs, dialogue = _agent_feeds()
+    return jsonify(cc.agents_snapshot(bot_state["active"], scan_lock.locked(), logs, dialogue))
+
+@app.route("/api/agents/<aid>/brain")
+@require_login
+def api_agent_brain(aid):
+    """ISPEZIONA CERVELLO: flusso di pensiero dettagliato di un agente (log e dialoghi che lo riguardano)."""
+    if aid not in cc.AGENTS:
+        return jsonify({"status": "error", "message": f"Agente {aid} inesistente"}), 404
+    logs, dialogue = _agent_feeds()
+    snap = next(a for a in cc.agents_snapshot(bot_state["active"], scan_lock.locked(), logs, dialogue)["agents"]
+                if a["id"] == aid)
+    return jsonify({"agent": snap, "thoughts": cc.thoughts_for(aid, logs, dialogue, limit=80)})
+
+@app.route("/api/agents/<aid>/control", methods=["POST"])
+@require_token
+def api_agent_control(aid):
+    """Azioni rapide: {"paused": true|false} e/o {"sensitivity": 0|1|2}."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "Corpo JSON non valido"}), 400
+    sens = data.get("sensitivity")
+    try:
+        state = cc.set_agent(aid, paused=data.get("paused"), sensitivity=int(sens) if sens is not None else None)
+    except (TypeError, ValueError) as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    title = cc.AGENTS[aid]["title"]
+    what = ("in pausa" if state["paused"] else "attivo") if "paused" in data else \
+        f"sensibilità {cc.SENSITIVITY_LABELS[state['sensitivity']]}"
+    log_message(f"🎛️ [Comando] {title}: {what} (dashboard)")
+    core.agent_say("Centro di Comando", f"{title} → {what}", "alert")
+    return jsonify({"status": "success", "message": f"{title}: {what}", "agent": state})
+
+@app.route("/api/controls/blocks", methods=["POST"])
+@require_token
+def api_blocks():
+    """Rimuove un blocco del Comandante ({"kind", "value"}) o tutti ({"clear": true})."""
+    data = request.get_json(silent=True) or {}
+    if data.get("clear"):
+        cc.clear_blocks()
+    elif data.get("kind") in ("asset", "sector", "symbol") and data.get("value"):
+        cc.set_block(data["kind"], str(data["value"]), blocked=False)
+    else:
+        return jsonify({"status": "error", "message": "Specificare clear oppure kind e value"}), 400
+    log_message("🎛️ [Comando] Blocchi sugli acquisti aggiornati dalla dashboard.")
+    return jsonify({"status": "success", "blocks": cc.snapshot_state()["blocks"]})
+
+def _chat_context():
+    radar = core.radar_snapshot()
+    acc = cached("account_pnl", account_with_pnl)
+    dd = (core.load_state().get("drawdown") or {})
+    return {"account": acc, "positions": cached("positions", get_open_positions), "radar": radar,
+            "vix": ((radar.get("channels") or {}).get("macro") or {}).get("vix"),
+            "drawdown_blocked": time.time() < float(dd.get("block_until", 0) or 0)
+                                or (acc.get("daily_pnl_pct") or 0) <= core.DAILY_DRAWDOWN_LIMIT}
+
+@app.route("/api/chat", methods=["GET"])
+@require_login
+def api_chat_history():
+    return jsonify({"messages": cc.chat_history(request.args.get("persona") or None),
+                    "personas": {k: v["name"] for k, v in cc.PERSONAS.items()}})
+
+@app.route("/api/chat", methods=["POST"])
+@require_token
+def api_chat():
+    """Stanza dei Dipendenti AI: ordine al COO o al Risk Manager, valutato sui dati live e applicato se vantaggioso."""
+    data = request.get_json(silent=True) or {}
+    message = str(data.get("message") or "").strip()
+    if not message:
+        return jsonify({"status": "error", "message": "Messaggio vuoto"}), 400
+    try:
+        ctx = _chat_context()
+    except Exception as e:
+        log_message(f"💬 [Chat] Contesto non disponibile: {e}")
+        ctx = {"account": {}, "positions": [], "radar": {}, "vix": None, "drawdown_blocked": False}
+    reply = cc.chat(data.get("persona", "coo"), message, ctx, set_bot_active)
+    log_message(f"💬 [{cc.PERSONAS[reply['persona']]['short']}] {reply['verdict']}: {reply['text']}")
+    if reply.get("change"):
+        core.agent_say(cc.PERSONAS[reply["persona"]]["short"], f"Ordine applicato: {reply['text']}", "alert")
+        with _cache_lock:
+            _cache.clear()
+    return jsonify({"status": "success", "reply": reply})
 
 @app.route("/api/liquidate", methods=["POST"])
 @require_token
