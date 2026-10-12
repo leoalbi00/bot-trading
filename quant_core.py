@@ -410,7 +410,8 @@ class QuantitativeTradingCore:
         t3 = time.perf_counter()
         res_risk = self._run_agent("AGENTE #3 RISK", symbol,
                                    lambda: self.agent_risk.analyze(df_ohlcv, account_balance=account_balance,
-                                                                   is_crypto=is_crypto, portfolio=self.portfolio_context),
+                                                                   is_crypto=is_crypto, portfolio=self.portfolio_context,
+                                                                   atr_pct=(candidate_data.get("scout_meta") or {}).get("atr_pct")),
                                    {"agent_id": self.agent_risk.agent_id, "risk_approved": False, "risk_score": 0.0})
         stop = res_risk.get("position_parameters", {}).get("stop_loss_price", "N/D")
         logger.info(f"[AGENTE #3 RISK] 🛡️ {symbol} -> ATR Stop: {_fmt(stop)}, "

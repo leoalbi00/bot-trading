@@ -2786,7 +2786,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             macro, fng, held_keys=held_keys, log=log, pending=pending, exposure_usd=exposure_usd,
             positions_count=positions_count,
             force=[r["symbol"] for r in results if r["pitch"] or normalize_symbol(r["symbol"]) in held_keys],
-            scout_meta={r["symbol"]: {"rvol": r["rvol"], "score": r["score"]} for r in results})
+            scout_meta={r["symbol"]: {"rvol": r["rvol"], "score": r["score"], "atr_pct": r.get("atr_pct")} for r in results})
         for r in results:
             if r["pitch"] or not (market_open or is_crypto(r["symbol"])) or not r.get("tradable", True):
                 continue
@@ -3495,9 +3495,14 @@ def stream_scouts_to_agents(scout_frames, macro, fng, held_keys=(), log=print, o
     books = crypto_order_books([sym for _, sym, _ in scout_frames]) if order_books is None else order_books
     balance = account_balance_for_agents()
     forced = {normalize_symbol(f) for f in force}
+    # Agente #3: stop e sizing sull'ATR GIORNALIERO, lo stesso del gate Risk & ATR e del Guardian (cache 1 ora)
+    scout_meta = {sym: dict((scout_meta or {}).get(sym) or {}) for _, sym, _ in scout_frames}
+    for _, sym, _ in scout_frames:
+        if not scout_meta[sym].get("atr_pct"):
+            scout_meta[sym]["atr_pct"] = guardian_atr(sym)
     payloads = [build_scout_payload(sym, frame, order_book=books.get(sym), macro_inputs=macro_inputs,
                                     account_balance=balance, scout_id=f"{scout_id:02d}",
-                                    force_full=normalize_symbol(sym) in forced, scout_meta=(scout_meta or {}).get(sym),
+                                    force_full=normalize_symbol(sym) in forced, scout_meta=scout_meta.get(sym),
                                     is_crypto=is_crypto(sym))
                 for scout_id, sym, frame in scout_frames]
     held = {normalize_symbol(h) for h in held_keys}

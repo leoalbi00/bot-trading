@@ -176,10 +176,14 @@ class InstitutionalRiskAgent:
         is_crypto: bool = False,
         portfolio: Optional[Dict[str, Any]] = None,
         now: Optional[datetime] = None,
+        atr_pct: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Pipeline Esecutiva completa dell'Agente #3.
         portfolio: {"exposure_pct", "positions"} per i limiti di esposizione (50%) e posizioni (4).
+        atr_pct: ATR(14) GIORNALIERO in % del prezzo, lo stesso del gate Risk & ATR e del Guardian: stop e sizing
+                 coincidono con lo stop reale dell'ordine. Senza, ATR delle barre di df (orarie) riportato su base
+                 giornaliera (x radice delle ore di contrattazione), come la riserva del Guardian.
         """
         net = self.safety_net(is_crypto, portfolio, now)
         if df.empty or len(df) < 15 or account_balance <= 0:
@@ -215,8 +219,12 @@ class InstitutionalRiskAgent:
         current_price = df['close'].iloc[-1]
         returns = df['close'].pct_change().dropna()
         
-        # 2. Calcolo Metriche di Rischio
-        atr = self.calculate_atr(df)
+        # 2. Calcolo Metriche di Rischio (ATR giornaliero in unità di prezzo)
+        if atr_pct and np.isfinite(atr_pct) and atr_pct > 0:
+            atr, atr_source = current_price * atr_pct / 100, "giornaliero"
+        else:
+            atr = self.calculate_atr(df) * np.sqrt(24.0 if is_crypto else 6.5)
+            atr_source = "orario riportato al giorno"
         cvar_99 = self.calculate_cvar(returns)
         
         beta = 1.0
@@ -243,7 +251,8 @@ class InstitutionalRiskAgent:
         elif not risk_approved:
             reason = f"RISK_SCORE_TOO_LOW ({risk_score:.0f} < 50: CVaR99 {cvar_99:.2%}, beta {beta:.2f})"
         else:
-            reason = (f"OK (risk score {risk_score:.0f}, CVaR99 {cvar_99:.2%}, hard stop {sizing_info['stop_loss_pct']:.2f}%, "
+            reason = (f"OK (risk score {risk_score:.0f}, CVaR99 {cvar_99:.2%}, hard stop {sizing_info['stop_loss_pct']:.2f}% "
+                      f"(1.5x ATR {atr_source} {atr / current_price * 100:.2f}%), "
                       f"esposizione {net['exposure_pct']:.0f}%/{net['max_exposure_pct']:.0f}%, "
                       f"{net['positions']}/{net['max_positions']} posizioni)")
 
@@ -254,6 +263,8 @@ class InstitutionalRiskAgent:
             "risk_score": round(risk_score, 2),
             "metrics": {
                 "atr": round(atr, 4),
+                "atr_pct": round(atr / current_price * 100, 4) if current_price else None,
+                "atr_source": atr_source,
                 "cvar_99_tail_risk": round(cvar_99, 4),
                 "benchmark_beta": round(beta, 2),
                 "current_daily_drawdown_pct": round(current_daily_drawdown_pct, 4)
