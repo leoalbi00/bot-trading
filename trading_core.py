@@ -3171,6 +3171,117 @@ def radar_snapshot():
 _PROCESS_START = time.time()
 
 
+def _reason_key(reason):
+    """Motivo di bocciatura raggruppabile: senza il prefisso dello stadio e con i numeri sostituiti da #."""
+    r = re.sub(r"^(Scartata dallo Stage \d \([^)]*\)|Bocciata da .*? per|Agente #5)\s*:\s*", "", str(reason or ""))
+    return re.sub(r"[-+]?\d+(?:[.,]\d+)?", "#", r).strip()[:110]
+
+
+def _ago(epoch, now):
+    if not epoch:
+        return None
+    m = int((now - epoch) / 60)
+    return f"{m} min fa" if m < 120 else f"{m // 60} h {m % 60:02d} min fa"
+
+
+def pipeline_diagnosis(window_sec=5 * 3600, eval_window_sec=3600):
+    """Perché al CIO arrivano (o non arrivano) schede: imbuto della pipeline, motivi di scarto, collo di bottiglia.
+
+    Solo dati già in memoria (registro, audit, ultime valutazioni): nessuna chiamata di rete, risposta immediata.
+    """
+    now = time.time()
+    reg = _registry_view()
+    radar = reg.get("radar") or {}
+    out = {"last_scan": _ago(float(radar.get("last_scan_epoch") or 0), now)}
+
+    # Ultima scheda arrivata al CIO (APPROVED_BY_RISK, eseguita o scaduta dopo l'approvazione)
+    to_cio = [p for p in list(reg.get("queue") or []) + list(reg.get("recent") or [])
+              if p.get("status") in (APPROVED_BY_RISK, EXECUTED) or (p.get("status") == EXPIRED and p.get("package"))]
+    last = max(to_cio, key=lambda p: p.get("updated_at") or "", default=None)
+    out["last_to_cio"] = (f"{last['symbol']} {last['status']} alle {str(last.get('updated_at'))[11:16]} "
+                          f"del {str(last.get('updated_at'))[:10]}") if last else None
+    out["waiting_cio"] = [p["symbol"] for p in reg.get("queue") or [] if p.get("status") == APPROVED_BY_RISK]
+    hist = [h for h in reg.get("history") or []]
+    out["scans_recent"] = len(hist)
+    out["pitches_recent"] = sum(len(h.get("pitches") or []) for h in hist)
+
+    # Bocciature delle ultime 5 ore per stadio, con i motivi più frequenti
+    stages, total = {}, 0
+    try:
+        rows = pitch_audit().rejected(limit=5000)["rows"]
+    except Exception:
+        rows = []
+    for r in rows:
+        if now - float(r.get("ts") or 0) > window_sec:
+            continue
+        st = stages.setdefault(r["stage"], {"count": 0, "reasons": {}})
+        st["count"] += 1
+        # Raggruppati per tipo di motivo (numeri esclusi); come etichetta un esempio reale, il più recente
+        k = _reason_key(r.get("reason"))
+        n, example = st["reasons"].get(k, (0, None))
+        st["reasons"][k] = (n + 1, example or re.sub(r"^(Scartata dallo Stage \d \([^)]*\)|Bocciata da .*? per)\s*:\s*",
+                                                     "", str(r.get("reason") or ""))[:110])
+        total += 1
+    out["rejected_total"] = total
+    out["rejected_by_stage"] = {k: {"count": v["count"],
+                                    "top": [(ex, n) for n, ex in sorted(v["reasons"].values(), key=lambda x: -x[0])[:3]]}
+                                for k, v in stages.items()}
+
+    # Esiti dello Stage 3 nell'ultima ora (posizioni aperte escluse) e stato delle notizie
+    core = _quant_engine_ref["core"]
+    decisions, news_status, best = {}, {}, []
+    if core is not None:
+        held = set((core.portfolio_context or {}).get("held") or ())
+        with core._eval_lock:
+            evals = list(core.latest_evaluations.items())
+        for key, ev in evals:
+            if now - ev["evaluated_at"] > eval_window_sec or key in held:
+                continue
+            cio = ev["cio_result"]
+            d = str(cio.get("veto") or cio.get("final_decision") or "?")
+            decisions[d] = decisions.get(d, 0) + 1
+            ns = (ev.get("stage_info", {}).get("news") or {}).get("status") or "N/D"
+            news_status[ns] = news_status.get(ns, 0) + 1
+            best.append((cio.get("cio_ensemble_score") or 0, ev["symbol"], d))
+        wd = core.watchdog
+        with wd._lock:
+            out["funnel_since_start"] = dict(wd.stage_counts)
+            out["groq_news"] = dict(wd.llm_stats)
+    out["stage3_decisions_1h"] = decisions
+    out["news_status_1h"] = news_status
+    out["best_ensemble_1h"] = [f"{sym} {sc:.1f} ({d})" for sc, sym, d in sorted(best, reverse=True)[:5]]
+
+    # Collo di bottiglia: il primo stadio dove il flusso si ferma
+    buys = decisions.get("BUY", 0)
+    rej = {k: v["count"] for k, v in out["rejected_by_stage"].items()}
+    bottleneck = []
+    if out["waiting_cio"]:
+        bottleneck.append(f"ci sono schede già approvate in attesa del CIO: {', '.join(out['waiting_cio'])}")
+    elif not out["last_scan"]:
+        bottleneck.append("lo sciame non ha ancora completato una scansione (bot appena avviato o in pausa)")
+    elif buys == 0:
+        top = out["best_ensemble_1h"][0] if out["best_ensemble_1h"] else None
+        bottleneck.append(f"nell'ultima ora nessun ticker ha ottenuto BUY dallo Stage 3 (serve Ensemble >= "
+                          f"{PIPELINE_BUY_SCORE:.0f})" + (f"; il migliore è stato {top}" if top else
+                                                          "; nessun ticker è arrivato allo Stage 3"))
+        for stage in ("Stage 2", "Stage 3"):
+            if rej.get(stage):
+                reason, n = out["rejected_by_stage"][stage]["top"][0]
+                bottleneck.append(f"{stage}: {rej[stage]} scarti in 5h, soprattutto '{reason}' ({n})")
+    elif rej.get("Comitato Rischi"):
+        reason, n = out["rejected_by_stage"]["Comitato Rischi"]["top"][0]
+        bottleneck.append(f"lo Stage 3 dà BUY ({buys} nell'ultima ora) ma il Comitato Rischi le boccia: "
+                          f"soprattutto '{reason}' ({n})")
+    elif rej.get("Stage 1"):
+        bottleneck.append("lo Stage 3 dà BUY ma le schede non vengono promosse (score tecnico basso o cooldown)")
+    news_bad = sum(v for k, v in news_status.items() if k in ("NO_NEWS", "STALE"))
+    if decisions and news_bad >= max(1, sum(news_status.values()) // 2):
+        bottleneck.append(f"{news_bad} valutazioni su {sum(news_status.values())} senza notizie fresche (< 30 min): "
+                          "con spinta quantitativa >= 70 l'Agente #4 mette il veto e senza notizie l'Ensemble resta basso")
+    out["bottleneck"] = bottleneck
+    return out
+
+
 def _chop_health():
     """Telemetria dell'Agente #7 per la pagella (senza azzerare i contatori della riga di audit)."""
     core = _quant_engine_ref["core"]

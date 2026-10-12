@@ -1157,9 +1157,16 @@ def _chat_context():
         rejected = core.pitch_audit().rejected(limit=15)["rows"]
     except Exception:
         rejected = []
+    try:
+        diagnosis = core.pipeline_diagnosis()
+    except Exception as e:
+        log_message(f"💬 [Chat] Diagnosi della pipeline non disponibile: {type(e).__name__}: {e}")
+        diagnosis = None
     return {"account": acc, "positions": positions_with_allocation(), "radar": radar, "macro": macro,
+            "diagnosis": diagnosis,
             "vix": macro.get("vix"),
-            "drawdown_blocked": core.current_drawdown()[1],   # stessa formula del Drawdown Controller
+            # stessa formula del Drawdown Controller; dalla cache fino a 5 minuti per non rallentare la chat
+            "drawdown_blocked": core.current_drawdown(max_age_sec=300)[1],
             "config": core.get_config(), "market_open": core.is_us_market_open(),
             "bot_active": bot_state["active"], "bot_status": bot_state["status"], "last_scan": bot_state["last_scan"],
             "cio": cio, "logs": logs, "rejected": rejected}
@@ -1175,6 +1182,7 @@ def api_chat_history():
 @require_token
 def api_chat():
     """Stanza dei Dipendenti AI: assistente conversazionale (Groq) sui dati live; le azioni richiedono conferma."""
+    started = time.monotonic()   # il budget della risposta parte da qui (contesto + Groq)
     data = request.get_json(silent=True) or {}
     message = str(data.get("message") or "").strip()
     if not message:
@@ -1185,7 +1193,7 @@ def api_chat():
         log_message(f"💬 [Chat] Contesto non disponibile: {e}")
         ctx = {"account": {}, "positions": [], "radar": {}, "vix": None, "drawdown_blocked": False}
     try:
-        reply = cc.chat(data.get("persona", "coo"), message, ctx, set_bot_active)
+        reply = cc.chat(data.get("persona", "coo"), message, ctx, set_bot_active, started=started)
     except Exception as e:    # mai una richiesta pendente: risposta sintetica dai dati reali
         log_message(f"💬 [Chat] Errore assistente ({type(e).__name__}: {e}): risposta locale")
         reply = cc.fallback_reply(data.get("persona", "coo"), ctx)

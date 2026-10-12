@@ -1,5 +1,5 @@
 // Quant Desk — logica della dashboard (Alpine.js). API_TOKEN è inserito dal template dopo il login.
-const CHAT_TIMEOUT_MS = 8000;   // la chat non resta mai bloccata su "penso…" (il server risponde entro ~6 s)
+const CHAT_TIMEOUT_MS = 13000;  // la chat non resta mai bloccata su "penso…" (il server risponde entro ~9 s, contesto compreso)
 
 function dashboard() {
     return {

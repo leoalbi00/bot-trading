@@ -27,7 +27,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import trading_core as core
 
 STATE_PATH = os.path.join(core.DATA_DIR, "command_center.json")
-CHAT_TIMEOUT_S = 6.0            # budget TOTALE (wall-clock) per la risposta di Groq; oltre -> riserva locale
+CHAT_TIMEOUT_S = 9.0            # budget TOTALE della richiesta (contesto + Groq), misurato dal suo arrivo; oltre -> riserva locale
+CHAT_MIN_LLM_S = 1.5            # se dopo il contesto restano meno secondi di così, risposta locale senza provare Groq
 CHAT_HISTORY_MAX = 80
 CHAT_TURNS_IN_PROMPT = 12        # ultimi messaggi della conversazione passati all'LLM
 PROPOSAL_TTL_SEC = 600           # una proposta non confermata entro 10 minuti decade
@@ -619,7 +620,7 @@ _CHAT_RULES = """REGOLE DI RISPOSTA
 - Parla in italiano, con linguaggio semplice, fluido e naturale, come un collega esperto. Niente formule fisse, niente elenchi inutili. Di solito 2-6 frasi; più dettagli solo se richiesti.
 - Rispondi a qualsiasi domanda: funzionamento del software, mercati e concetti finanziari, stato del portafoglio.
 - Usa SOLO i dati dello STATO LIVE per numeri e fatti sul sistema. Se un dato manca dillo, non inventarlo.
-- Se chiedono perché il portafoglio è fermo o perché non si compra, ragiona sullo stato live e sui log: bot in pausa, modalità Advisor, mercato chiuso, VIX alto, drawdown, esposizione al limite, agenti in pausa, blocchi, nessuna scheda con Ensemble >= 72, veti delle notizie, cooldown. Indica la causa concreta con i numeri.
+- Se chiedono perché il portafoglio è fermo, perché non si compra o perché al CIO non arriva nulla, parti dalla sezione DIAGNOSI DELLA PIPELINE (collo di bottiglia, imbuto, motivi di scarto più frequenti, migliori Ensemble) e poi dallo stato live: bot in pausa, modalità Advisor, mercato chiuso, VIX alto, drawdown, esposizione al limite, agenti in pausa, blocchi, cooldown. Indica la causa concreta con i numeri e lo stadio in cui le schede si fermano.
 - NON applichi mai nulla di tua iniziativa. Se un'azione del Centro di Comando è utile o richiesta, spiegala (cosa cambia, pro e rischi) e mettila in "proposal": verrà eseguita SOLO se l'utente risponde confermando. La richiesta di conferma viene aggiunta automaticamente in fondo: non ripeterla.
 - Non proporre mai ordini di acquisto/vendita su singoli titoli: non sono tra le azioni disponibili (l'utente può usare i pulsanti del portafoglio, es. Rischio Zero o Vendi subito).
 FORMATO: rispondi SOLO con un oggetto JSON {"reply": "testo per l'utente", "proposal": null oppure {...}}.
@@ -690,6 +691,7 @@ def live_state_text(ctx):
     if radar.get("cooldown"):
         lines.append("Ticker in cooldown dopo un veto: " + ", ".join(f"{c['symbol']} ({c['minutes']} min)"
                                                                    for c in radar["cooldown"][:10]))
+    lines += diagnosis_lines(ctx.get("diagnosis"))
     rejected = ctx.get("rejected") or []
     if rejected:
         lines.append("\nULTIME BOCCIATURE DELLA PIPELINE (motivo):")
@@ -701,6 +703,35 @@ def live_state_text(ctx):
         lines.append("\nLOG RECENTI (dal più vecchio al più recente):")
         lines += [_clean(l["text"])[:220] for l in logs[-35:]]
     return "\n".join(lines)
+
+
+def diagnosis_lines(diag):
+    """Sezione DIAGNOSI DELLA PIPELINE del System Prompt (perché arrivano o non arrivano schede al CIO)."""
+    if not diag:
+        return []
+    out = ["\nDIAGNOSI DELLA PIPELINE (usala per spiegare perché al CIO arrivano o non arrivano schede):",
+           f"- Ultima scansione dello sciame: {diag.get('last_scan') or 'nessuna'}; giri recenti nel registro "
+           f"{diag.get('scans_recent', 0)}, schede create {diag.get('pitches_recent', 0)}",
+           f"- Ultima scheda arrivata al CIO: {diag.get('last_to_cio') or 'nessuna nello storico recente'}"
+           + (f"; in attesa ora: {', '.join(diag['waiting_cio'])}" if diag.get("waiting_cio") else "")]
+    f = diag.get("funnel_since_start") or {}
+    if f:
+        out.append(f"- Imbuto dall'avvio: ricevuti {f.get('received', 0)} → passano Stage 1 {f.get('stage1_pass', 0)} → "
+                   f"passano Stage 2 {f.get('stage2_pass', 0)} → valutati Stage 3 {f.get('stage3_done', 0)}")
+    if diag.get("stage3_decisions_1h"):
+        out.append("- Esiti Stage 3 ultima ora: " + ", ".join(f"{k} {v}" for k, v in diag["stage3_decisions_1h"].items())
+                   + " · migliori Ensemble: " + "; ".join(diag.get("best_ensemble_1h") or []))
+    if diag.get("news_status_1h"):
+        out.append("- Notizie (Agente #4) ultima ora: " + ", ".join(f"{k} {v}" for k, v in diag["news_status_1h"].items()))
+    g = diag.get("groq_news") or {}
+    if g.get("calls"):
+        out.append(f"- Groq notizie: {g.get('ok', 0)}/{g['calls']} ok, {g.get('timeouts', 0)} timeout, {g.get('errors', 0)} errori")
+    out.append(f"- Bocciature ultime 5h: {diag.get('rejected_total', 0)}")
+    for stage, v in (diag.get("rejected_by_stage") or {}).items():
+        out.append(f"  · {stage}: {v['count']} — " + "; ".join(f"{r} ({n})" for r, n in v["top"]))
+    if diag.get("bottleneck"):
+        out.append("- COLLO DI BOTTIGLIA: " + " | ".join(diag["bottleneck"]))
+    return out
 
 
 def build_system_prompt(persona, ctx):
@@ -746,11 +777,18 @@ def _llm_request(messages, deadline):
     raise last_error
 
 
-def _llm_chat(persona, message, ctx):
-    """Risposta conversazionale dell'LLM -> {"reply", "proposal"}; None se Groq manca, sbaglia o supera CHAT_TIMEOUT_S."""
+def _llm_chat(persona, message, ctx, started=None):
+    """Risposta conversazionale dell'LLM -> {"reply", "proposal"}; None se Groq manca, sbaglia o supera il budget.
+
+    started (time.monotonic() all'arrivo della richiesta): il budget CHAT_TIMEOUT_S comprende anche la costruzione
+    del contesto, così la risposta arriva sempre prima del timeout della dashboard.
+    """
     if not core.GROQ_KEY:
         return None
-    started = time.monotonic()
+    started = started if started is not None else time.monotonic()
+    if started + CHAT_TIMEOUT_S - time.monotonic() < CHAT_MIN_LLM_S:
+        print("[chat] contesto lento: budget insufficiente per Groq, risposta locale", flush=True)
+        return None
     try:
         history = [m for m in chat_history(persona) if m.get("text")][-CHAT_TURNS_IN_PROMPT - 1:-1]   # senza il messaggio appena salvato
         messages = [{"role": "system", "content": build_system_prompt(persona, ctx)}]
@@ -768,7 +806,7 @@ def _llm_chat(persona, message, ctx):
             proposal = None
         return {"reply": str(data["reply"]).strip(), "proposal": proposal, "model": model}
     except FutureTimeout:
-        print(f"[chat] Groq oltre {CHAT_TIMEOUT_S:.0f}s: risposta locale", flush=True)
+        print(f"[chat] Groq oltre il budget di {CHAT_TIMEOUT_S:.0f}s: risposta locale", flush=True)
     except Exception as e:
         print(f"[chat] Groq non disponibile ({type(e).__name__}: {str(e)[:140]}): risposta locale", flush=True)
     return None
@@ -808,12 +846,17 @@ def local_reply(ctx):
     blocks = blocks_text(st["blocks"])
     if blocks:
         why.append("acquisti bloccati su " + ", ".join(blocks))
+    diag = ctx.get("diagnosis") or {}
     queue = (ctx.get("radar") or {}).get("queue") or []
-    if not any(q.get("status") == "APPROVED_BY_RISK" for q in queue):
+    if diag.get("bottleneck"):
+        why += diag["bottleneck"]
+        if diag.get("last_to_cio"):
+            why.append(f"ultima scheda arrivata al CIO: {diag['last_to_cio']}")
+    elif not any(q.get("status") == "APPROVED_BY_RISK" for q in queue):
         why.append(f"nessuna scheda approvata con Ensemble ≥ {core.PIPELINE_BUY_SCORE:.0f}")
-    rejected = ctx.get("rejected") or []
-    if rejected:
-        why.append("ultime bocciature: " + "; ".join(f"{r['symbol']} ({str(r.get('reason') or '')[:70]})" for r in rejected[:3]))
+        rejected = ctx.get("rejected") or []
+        if rejected:
+            why.append("ultime bocciature: " + "; ".join(f"{r['symbol']} ({str(r.get('reason') or '')[:70]})" for r in rejected[:3]))
     if why:
         text += " Perché non si compra ora: " + "; ".join(why) + "."
     return text
@@ -873,7 +916,7 @@ def _propose(persona, cmd, summary, reply, ctx, parser, intro_verdict="PROPOSTA"
                  intent=cmd["intent"], parser=parser, change=None, proposal=summary)
 
 
-def chat(persona, message, ctx, apply_bot_state):
+def chat(persona, message, ctx, apply_bot_state, started=None):
     """Messaggio al dirigente -> risposta. Le azioni vengono solo proposte e applicate dopo la conferma esplicita.
 
     apply_bot_state(active) mette in pausa/riattiva il bot.
@@ -897,7 +940,7 @@ def chat(persona, message, ctx, apply_bot_state):
         return _push("agent", persona, f"Va bene, nessuna modifica: ho annullato la proposta ({pending['summary']}).",
                      verdict="INFO", intent="cancel", parser="conferma", change=None)
 
-    llm = _llm_chat(persona, message, ctx)
+    llm = _llm_chat(persona, message, ctx, started=started)
     if llm:
         proposal = llm["proposal"]
         reply = llm["reply"]
@@ -920,7 +963,7 @@ def fallback_reply(persona, ctx):
     """Risposta locale d'emergenza (errore inatteso nella chat): mai una richiesta lasciata senza risposta."""
     persona = persona if persona in PERSONAS else "coo"
     try:
-        text = "Risposta rapida dai dati di sistema (assistente momentaneamente non disponibile). " + local_reply(ctx)
+        text = "Risposta rapida dai dati di sistema (assistente IA momentaneamente non disponibile). " + local_reply(ctx)
     except Exception:
         text = "Assistente momentaneamente non disponibile: riprova tra qualche secondo."
     return _push("agent", persona, text, verdict="INFO", intent="chat", parser="locale", change=None)
