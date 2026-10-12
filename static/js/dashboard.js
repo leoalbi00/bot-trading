@@ -1,5 +1,5 @@
 // Quant Desk — logica della dashboard (Alpine.js). API_TOKEN è inserito dal template dopo il login.
-const CHAT_TIMEOUT_MS = 13000;  // la chat non resta mai bloccata su "penso…" (il server risponde entro ~9 s, contesto compreso)
+const CHAT_TIMEOUT_MS = 60000;  // il COO può ragionare e cercare sul web: il server risponde entro ~45 s (COO_BUDGET_S)
 
 function dashboard() {
     return {
@@ -17,10 +17,10 @@ function dashboard() {
         // Stanza dei Dipendenti AI
         persona: 'coo', chatMessages: [], chatInput: '', chatSending: false, chatPending: {},
         personas: {
-            coo: { name: 'COO', short: 'COO', tagline: 'COO: chiedimi qualsiasi cosa su bot, mercati e portafoglio. Posso proporre modifiche (agenti, blocchi, aggressività, modalità): le applico solo dopo la tua conferma.' },
+            coo: { name: 'COO', short: 'COO', tagline: 'COO: agente IA con accesso in lettura a tutto il sistema e ricerca sul web. Chiedimi qualsiasi cosa su bot, mercati e portafoglio: se serve verifico online e cito le fonti. Le modifiche (agenti, blocchi, aggressività, modalità) le propongo e le applico solo dopo la tua conferma.' },
             risk: { name: 'Risk Manager', short: 'Risk Manager', tagline: 'Risk Manager: stesse capacità, con un occhio più severo su rischi, drawdown e protezioni. Nessuna modifica senza la tua conferma.' },
         },
-        chatSuggestions: ['Come sta andando il portafoglio?', 'Perché il portafoglio è fermo?', 'Cosa stanno scansionando gli Scout?', 'Come funziona il Guardian?', 'Conviene ridurre il rischio?'],
+        chatSuggestions: ['Come sta andando il portafoglio?', 'Perché al CIO non arriva niente?', 'Cosa stanno scansionando gli Scout?', 'Ci sono notizie importanti sui mercati oggi?', 'Conviene ridurre il rischio?'],
         account: {}, positions: [], closedPositions: [], bot: { logs: [] },
         radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
         settings: { watchlist: [] }, envLocked: {},

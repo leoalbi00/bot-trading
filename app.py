@@ -1151,7 +1151,8 @@ def _chat_context():
     acc = cached("account_pnl", account_with_pnl)
     macro = (radar.get("channels") or {}).get("macro") or {}
     with state_lock:
-        logs = list(bot_state["logs"])[-60:]
+        logs_all = list(bot_state["logs"])
+        logs = logs_all[-60:]
         cio = dict(bot_state["cio"])
     try:
         rejected = core.pitch_audit().rejected(limit=15)["rows"]
@@ -1169,7 +1170,7 @@ def _chat_context():
             "drawdown_blocked": core.current_drawdown(max_age_sec=300)[1],
             "config": core.get_config(), "market_open": core.is_us_market_open(),
             "bot_active": bot_state["active"], "bot_status": bot_state["status"], "last_scan": bot_state["last_scan"],
-            "cio": cio, "logs": logs, "rejected": rejected}
+            "cio": cio, "logs": logs, "logs_all": logs_all, "rejected": rejected}
 
 @app.route("/api/chat", methods=["GET"])
 @require_login

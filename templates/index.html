@@ -169,7 +169,7 @@
                             <input x-ref="cmd" x-model="chatInput" maxlength="800" :disabled="chatSending"
                                    :placeholder="'Chiedi al ' + personas[persona].short + ' — es. perché il portafoglio è fermo?'"
                                    class="flex-1 min-w-0 text-[13px] text-zinc-100 placeholder-zinc-600">
-                            <span x-show="chatSending" class="text-[11px] text-zinc-500 mono">penso…</span>
+                            <span x-show="chatSending" class="text-[11px] text-zinc-500 mono">ragiono…</span>
                             <span x-show="!chatSending" class="kbd hidden sm:inline">⌘K</span>
                             <button type="submit" class="btn btn-sm btn-primary" :disabled="chatSending || !chatInput.trim()">Invia</button>
                         </form>
@@ -202,6 +202,7 @@
                                             <span class="text-[11px] text-zinc-500" x-text="m.author"></span>
                                         </div>
                                         <div class="text-[12.5px] text-zinc-300 leading-relaxed whitespace-pre-line" x-text="m.text"></div>
+                                        <div x-show="m.parser" class="mt-1 mono text-[10.5px] text-zinc-600" x-text="m.parser"></div>
                                     </div>
                                 </template>
                             </div>

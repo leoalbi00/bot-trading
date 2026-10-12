@@ -13,6 +13,12 @@ Componenti:
 5. Agente #6 Guardian: loop indipendente ogni 20 s sulle posizioni, UNICO punto da cui partono le uscite
    automatiche. Vendite manuali solo dalla dashboard (Vendi subito, Rischio Zero, PANIC).
 6. Centro di Comando e chat (COO / Risk Manager) con conferma esplicita di ogni azione.
+7. COO (agents/coo_agent.py): agente IA autonomo, separato dalla pipeline di trading. Ciclo con strumenti (tool calling
+   Groq, modelli COO_MODELS: qwen3.8-27b -> gpt-oss-20b -> gpt-oss-120b) in sola lettura sul sistema e ricerca web:
+   Tavily/Brave se configurati (TAVILY_API_KEY, BRAVE_SEARCH_API_KEY), Google News RSS, DuckDuckGo, browser_search di
+   Groq (tetto giornaliero COO_WEB_BROWSER_DAILY), lettura di pagine pubbliche (protezione SSRF). Budget COO_BUDGET_S
+   (45 s), massimo COO_MAX_STEPS passi; sui limiti di token al minuto attende fino a 20 s prima di cambiare modello.
+   Non invia ordini: le azioni del Centro di Comando le propone e vengono applicate solo dopo la conferma.
 
 ================================================================================
 1. GERARCHIA

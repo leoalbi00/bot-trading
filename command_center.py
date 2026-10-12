@@ -10,10 +10,11 @@
   La sensibilità (Standard / Selettivo / Rigoroso) alza il punteggio minimo dell'agente richiesto alle schede
   APPROVED_BY_RISK prima che il CIO le valuti.
 - Blocchi operativi: asset class (crypto/azioni), settori e singoli ticker esclusi dai nuovi acquisti.
-- Chat con i dirigenti (COO e Risk Manager): assistente conversazionale Groq con la mappa dell'architettura e lo
-  stato live del sistema (conto, posizioni, VIX, sciame, bocciature, log). Risponde a qualsiasi domanda; quando
-  un'azione è utile la PROPONE e la applica solo dopo la conferma esplicita dell'utente ("sì", "conferma").
-  Senza Groq resta un parser a regole di riserva, con la stessa conferma obbligatoria.
+- Chat con i dirigenti (COO e Risk Manager): agente IA autonomo (agents/coo_agent.py) che ragiona con strumenti in sola
+  lettura sul sistema (diagnosi della pipeline, conto, ticker, bocciature, log, impostazioni, notizie del bot) e, se serve,
+  cerca sul web e legge pagine citando le fonti. Quando un'azione è utile la PROPONE (strumento proponi_azione) e la
+  applica solo dopo la conferma esplicita dell'utente ("sì", "conferma"), con gli avvisi dei controlli.
+  Senza Groq resta un parser a regole di riserva con la diagnosi della pipeline, con la stessa conferma obbligatoria.
 """
 import itertools
 import json
@@ -22,13 +23,13 @@ import re
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 import trading_core as core
+from agents import coo_agent as coo
 
 STATE_PATH = os.path.join(core.DATA_DIR, "command_center.json")
-CHAT_TIMEOUT_S = 9.0            # budget TOTALE della richiesta (contesto + Groq), misurato dal suo arrivo; oltre -> riserva locale
-CHAT_MIN_LLM_S = 1.5            # se dopo il contesto restano meno secondi di così, risposta locale senza provare Groq
+CHAT_MIN_LLM_S = 1.5            # se dopo il contesto restano meno secondi di così, risposta locale senza provare l'IA
+# Budget della risposta del COO (ragionamento + strumenti + web): agents/coo_agent.COO_BUDGET_S, dall'arrivo della richiesta
 CHAT_HISTORY_MAX = 80
 CHAT_TURNS_IN_PROMPT = 12        # ultimi messaggi della conversazione passati all'LLM
 PROPOSAL_TTL_SEC = 600           # una proposta non confermata entro 10 minuti decade
@@ -611,21 +612,37 @@ Flusso: Scout -> Stage 1-3 (Agenti #1 #2 #4 -> Fusion Engine #5, con #3 e #6) ->
 - Modalità: Auto-Trading (ordini inviati) o Advisor (solo suggerimenti). Le azioni USA si negoziano lun-ven 09:30-16:00 New York; le crypto h24.
 - Centro di Comando: pausa/attivazione agenti (#3 mai), sensibilità (Standard/Selettivo/Rigoroso) di #1 #2 #4 #5, blocchi su asset class/settori/ticker, aggressività = esposizione massima tra 10% e 50%."""
 
+# Versione breve nel System Prompt (limite di token al minuto del piano gratuito Groq); quella completa (ARCHITECTURE)
+# il COO la legge con lo strumento architettura_bot quando una domanda riguarda il funzionamento in dettaglio
+ARCHITECTURE_BRIEF = f"""BOT (sintesi; dettagli con lo strumento architettura_bot): Quant Desk multi-agente su conto Alpaca paper, azioni USA +
+crypto, solo long. Scout (universo dinamico a blocchi di {core.UNIVERSE_CHUNK_SIZE} ticker) -> Stage 1-3 con Agenti #1 Quant,
+#2 Microstruttura, #4 Macro/News (Groq), #3 Risk, #6 Guardian -> Fusion Engine #5: Ensemble = Quant x 0.50 + News x 0.35 +
+OFI x 0.15, BUY se >= {core.PIPELINE_BUY_SCORE:.0f} -> Comitato Rischi -> CIO (taglia 8-50% per convinzione, max 4 posizioni,
+esposizione 50%) -> ordine. Guardian ogni {core.GUARDIAN_INTERVAL_SEC}s: hard stop 1.5x ATR (1.2-3.5%), Target 2R vende 50%,
+runner con trailing ATR. Agente #4: spinta quantitativa >= 70 senza notizia fresca (< 30 min) = veto."""
+
 _PERSONA_STYLE = {
     "coo": "Sei il COO (Capo delle Operazioni) del desk: pratico, orientato all'operatività e ai risultati.",
     "risk": "Sei il Risk Manager del desk: prudente, metti sempre in evidenza rischi, drawdown e protezioni.",
 }
 
-_CHAT_RULES = """REGOLE DI RISPOSTA
-- Parla in italiano, con linguaggio semplice, fluido e naturale, come un collega esperto. Niente formule fisse, niente elenchi inutili. Di solito 2-6 frasi; più dettagli solo se richiesti.
-- Rispondi a qualsiasi domanda: funzionamento del software, mercati e concetti finanziari, stato del portafoglio.
-- Usa SOLO i dati dello STATO LIVE per numeri e fatti sul sistema. Se un dato manca dillo, non inventarlo.
-- Se chiedono perché il portafoglio è fermo, perché non si compra o perché al CIO non arriva nulla, parti dalla sezione DIAGNOSI DELLA PIPELINE (collo di bottiglia, imbuto, motivi di scarto più frequenti, migliori Ensemble) e poi dallo stato live: bot in pausa, modalità Advisor, mercato chiuso, VIX alto, drawdown, esposizione al limite, agenti in pausa, blocchi, cooldown. Indica la causa concreta con i numeri e lo stadio in cui le schede si fermano.
-- NON applichi mai nulla di tua iniziativa. Se un'azione del Centro di Comando è utile o richiesta, spiegala (cosa cambia, pro e rischi) e mettila in "proposal": verrà eseguita SOLO se l'utente risponde confermando. La richiesta di conferma viene aggiunta automaticamente in fondo: non ripeterla.
-- Non proporre mai ordini di acquisto/vendita su singoli titoli: non sono tra le azioni disponibili (l'utente può usare i pulsanti del portafoglio, es. Rischio Zero o Vendi subito).
-FORMATO: rispondi SOLO con un oggetto JSON {"reply": "testo per l'utente", "proposal": null oppure {...}}.
-proposal (solo se proponi un'azione): {"intent": uno tra """ + ", ".join(ACTION_INTENTS) + """, "agent": "01".."07" o null, "level": 0|1|2 o null (sensibilità: 0 Standard, 1 Selettivo, 2 Rigoroso), "kind": "asset"|"sector"|"symbol" o null, "value": (asset: crypto|stocks; sector: tech|commodities|bonds|energy|finance|biotech; symbol: ticker maiuscolo, crypto come BTC-USD) o null, "sector_hint": null, "summary": "descrizione breve dell'azione"}.
-Significato: pause_agent/resume_agent (agent), set_sensitivity (agent, level), block/unblock nuovi acquisti (kind, value), clear_blocks, aggressiveness_up (+10 punti di esposizione massima, max 50%), aggressiveness_down (-10, min 10%), pause_bot/resume_bot (tutto il sistema), advisor_mode (nessun ordine), auto_mode (ordini eseguiti)."""
+_CHAT_RULES = """REGOLE
+- Sei un agente autonomo con strumenti: ragiona, usa gli strumenti che servono, poi rispondi. Parla in italiano, in modo
+  semplice e naturale, come un collega esperto: di solito 3-8 frasi, testo normale (niente JSON, niente tabelle markdown).
+- FATTI SUL SISTEMA: usa SOLO i dati del riepilogo e degli strumenti di sistema (diagnosi_pipeline, conto_e_posizioni,
+  dettaglio_ticker, bocciature, log_recenti, impostazioni_e_controlli, notizie_ticker). Se il riepilogo non basta per
+  rispondere con precisione, chiama lo strumento giusto prima di rispondere. Non inventare numeri né cause.
+- Domande del tipo "perché non compra / perché al CIO non arriva niente": parti da diagnosi_pipeline (collo di bottiglia,
+  imbuto, motivi di scarto, migliori Ensemble) e indica lo stadio in cui le schede si fermano, con i numeri.
+- WEB: usa cerca_web (tipo "notizie" per fatti recenti e mercati, "web" per concetti, documentazione, regole di
+  broker/exchange) quando la risposta dipende da informazioni esterne o aggiornate, o quando l'utente lo chiede.
+  Se un risultato è promettente ma l'estratto non basta, usa leggi_pagina. Cita sempre le fonti web (nome e URL) in fondo,
+  in una riga "Fonti:". Distingui chiaramente i dati del bot dalle informazioni trovate sul web e indica le date.
+- AZIONI: non applichi mai nulla. Se un'azione del Centro di Comando è utile o richiesta, spiega cosa cambia (pro e rischi)
+  e chiama proponi_azione: verrà eseguita solo se l'utente conferma. La domanda di conferma viene aggiunta in automatico:
+  non scriverla tu. Blocchi, pause e sensibilità restano attivi finché non vengono rimossi (nessuna scadenza automatica).
+  Non proporre mai ordini di acquisto/vendita su singoli titoli (l'utente ha i pulsanti del portafoglio).
+- Se uno strumento fallisce o il web non risponde, dillo e rispondi con quello che sai, segnalando l'incertezza."""
 
 
 def _fmt(v, nd=2):
@@ -734,81 +751,252 @@ def diagnosis_lines(diag):
     return out
 
 
+def brief_state_text(ctx):
+    """Riepilogo compatto dello stato per il System Prompt del COO (i dettagli si leggono con gli strumenti)."""
+    acc = ctx.get("account") or {}
+    eq = acc.get("portfolio") or 0
+    exposure = acc.get("exposure") or 0
+    cfg = ctx.get("config") or {}
+    st = snapshot_state()
+    positions = ctx.get("positions") or []
+    queue = (ctx.get("radar") or {}).get("queue") or []
+    cio = ctx.get("cio") or {}
+    paused = [AGENTS[a]["title"] for a, v in st["agents"].items() if v["paused"]]
+    lines = [
+        f"Ora del bot: {core.now_local().strftime('%Y-%m-%d %H:%M %A')} (Europe/Rome)",
+        f"Sistema {'ATTIVO' if ctx.get('bot_active', True) else 'IN PAUSA'} · "
+        f"{'Auto-Trading' if cfg.get('auto_execute_trades') else 'Advisor (nessun ordine)'} · mercato USA "
+        f"{'APERTO' if ctx.get('market_open') else 'CHIUSO'} · VIX {_fmt(ctx.get('vix'))} · Drawdown Controller "
+        f"{'BLOCCA gli acquisti' if ctx.get('drawdown_blocked') else 'ok'} · ultimo ciclo CIO {ctx.get('last_scan', 'N/D')}",
+        f"Conto: patrimonio ${_fmt(eq)}, investito {exposure / eq * 100 if eq else 0:.1f}% (max "
+        f"{_fmt(cfg.get('max_exposure_pct'), 0)}%), PnL oggi ${_fmt(acc.get('daily_pnl_usd'))} ({_fmt(acc.get('daily_pnl_pct'))}%)",
+        f"Posizioni ({len(positions)}): " + (", ".join(f"{p['symbol']} {_fmt(p.get('unrealized_plpc'))}%" for p in positions[:8])
+                                             or "nessuna"),
+        f"Schede in coda: {len(queue)}" + (" (" + ", ".join(f"{q['symbol']} {q['status']}" for q in queue[:6]) + ")" if queue else ""),
+        "Agenti in pausa: " + (", ".join(paused) or "nessuno") + " · blocchi acquisti: "
+        + (", ".join(blocks_text(st["blocks"])) or "nessuno"),
+    ]
+    if cio:
+        lines.append(f"Ultimo mandato CIO ({cio.get('timestamp', '?')}): {cio.get('action')} "
+                     f"{cio.get('buy_symbol') or cio.get('sell_symbol') or ''} — {str(cio.get('reason') or '')[:200]}")
+    bottleneck = (ctx.get("diagnosis") or {}).get("bottleneck")
+    if bottleneck:
+        lines.append("Collo di bottiglia attuale: " + " | ".join(bottleneck)[:600])
+    return "\n".join(lines)
+
+
 def build_system_prompt(persona, ctx):
     pending = _pending.get(persona)
     extra = (f"\nPROPOSTA IN ATTESA DI CONFERMA: {pending['summary']} (se l'utente ne parla, ricordagli che basta rispondere "
              "\"sì\" per applicarla o \"no\" per annullarla).") if pending else ""
     return "\n\n".join([_PERSONA_STYLE.get(persona, _PERSONA_STYLE["coo"])
                         + " Lavori nella sala operativa di un bot di trading e parli con il suo proprietario.",
-                        ARCHITECTURE, "STATO LIVE DEL SISTEMA\n" + live_state_text(ctx) + extra, _CHAT_RULES])
+                        ARCHITECTURE_BRIEF, "RIEPILOGO DELLO STATO (dettagli con gli strumenti)\n" + brief_state_text(ctx) + extra,
+                        _CHAT_RULES])
 
 
 _groq = None
+_web = None
+_coo_agent = None
 
 
 def _groq_client():
     global _groq
     if _groq is None:
         import groq
-        _groq = groq.Groq(api_key=core.GROQ_KEY, timeout=CHAT_TIMEOUT_S, max_retries=0)
+        _groq = groq.Groq(api_key=core.GROQ_KEY, timeout=coo.COO_CALL_TIMEOUT_S, max_retries=0)
     return _groq
 
 
-_llm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chat-llm")
+def _web_research():
+    global _web
+    if _web is None:
+        _web = coo.WebResearch(groq_client_factory=_groq_client)
+    return _web
 
 
-def _llm_request(messages, deadline):
-    """Prova i modelli Groq finché resta tempo nel budget. Solleva l'ultimo errore se nessuno risponde."""
-    last_error = TimeoutError("budget esaurito")
-    for model in core.GROQ_MODELS[:3]:
-        remaining = deadline - time.monotonic()
-        if remaining < 0.5:
+def _agent():
+    global _coo_agent
+    if _coo_agent is None:
+        _coo_agent = coo.COOAgent(_groq_client)
+    return _coo_agent
+
+
+def _fn(name, description, properties=None, required=()):
+    return {"name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties or {}, "required": list(required)}}
+
+
+def _ticker_detail(ctx, simbolo):
+    """Tutto ciò che il sistema sa su un ticker: valutazione dei 7 agenti, scout, bocciature, coda e posizione."""
+    raw = str(simbolo or "").upper().strip()
+    candidates = [raw, raw + "-USD", raw.replace("/", "-")] if "-" not in raw else [raw]
+    q, sym = None, raw
+    for c in candidates:
+        q = core.quant_rationale(c, max_age_sec=None)
+        if q:
+            sym = c
             break
-        try:
-            res = _groq_client().chat.completions.create(model=model, max_tokens=600, temperature=0.4,
-                                                         response_format={"type": "json_object"}, messages=messages,
-                                                         timeout=remaining)
-            data = json.loads(res.choices[0].message.content)
-            if not str(data.get("reply") or "").strip():
-                raise ValueError("risposta vuota")
-            return data, model
-        except Exception as e:
-            last_error = e
-    raise last_error
+    key = core.normalize_symbol(sym)
+    out = {"simbolo": sym}
+    if q:
+        a1, a2, a3, a4, a5 = (q.get(k) or {} for k in ("agent_01_quant", "agent_02_micro", "agent_03_risk",
+                                                       "agent_04_macro", "agent_05_cio"))
+        m1 = a1.get("metrics") or {}
+        out["ultima_valutazione_7_agenti"] = {
+            "eta_min": round((time.time() - q["evaluated_at"]) / 60, 1),
+            "agente_1_quant": {"score": a1.get("score"), "hurst": m1.get("hurst_exponent"), "z": m1.get("z_score"),
+                               "koopman": m1.get("koopman_lambda")},
+            "agente_2_micro": {"score": a2.get("score"), "ofi": a2.get("ofi"), "fonte_ofi": a2.get("ofi_source")},
+            "agente_3_risk": {"approvato": a3.get("approved"), "motivo": a3.get("reason"), "stop_pct": a3.get("stop_loss_pct")},
+            "agente_4_news": {"approvato": a4.get("approved"), "motivo": a4.get("reason"), "notizie": a4.get("news")},
+            "agente_5_cio": {"ensemble": a5.get("score"), "decisione": a5.get("decision"), "motivo": a5.get("reason"),
+                             "componenti": a5.get("components"), "classe": a5.get("trade_class")}}
+    else:
+        out["ultima_valutazione_7_agenti"] = "nessuna valutazione in memoria (ticker non arrivato allo Stage 3 di recente)"
+    scout = next((v for k, v in core._last_scout_results.items() if core.normalize_symbol(k) == key), None)
+    if scout:
+        out["scout"] = {k: scout.get(k) for k in ("score", "mtf_aligned", "rvol", "vwap_dist_pct", "anomalies", "pitch", "beta")}
+    try:
+        rows = core.pitch_audit().rejected(limit=2000)["rows"]
+        out["bocciature_5h"] = [{k: r.get(k) for k in ("time", "stage", "reason", "veto_agent", "score")}
+                                for r in rows if core.normalize_symbol(r["symbol"]) == key][:6]
+    except Exception:
+        pass
+    radar = ctx.get("radar") or {}
+    out["in_coda"] = [{k: p.get(k) for k in ("status", "score", "note")} for p in radar.get("queue") or []
+                      if core.normalize_symbol(p["symbol"]) == key]
+    out["cooldown_min"] = next((c["minutes"] for c in radar.get("cooldown") or []
+                                if core.normalize_symbol(c["symbol"]) == key), None)
+    pos = next((p for p in ctx.get("positions") or [] if core.normalize_symbol(p["symbol"]) == key), None)
+    if pos:
+        out["posizione"] = {k: pos.get(k) for k in ("qty", "avg_entry_price", "current_price", "unrealized_plpc",
+                                                    "effective_stop_pct", "target_pct", "buy_thesis", "hold_rationale")}
+    return out
+
+
+def _coo_tools(ctx, proposal_box):
+    """Strumenti del COO: sistema (sola lettura), web, proposta di azioni. proposal_box riceve la proposta."""
+    web = _web_research()
+
+    def logs(filtro="", quanti=30):
+        rows = ctx.get("logs_all") or ctx.get("logs") or []
+        if filtro:
+            rx = re.compile(re.escape(str(filtro)), re.IGNORECASE)
+            rows = [r for r in rows if rx.search(r["text"])]
+        return [_clean(r["text"])[:240] for r in rows[-max(1, min(int(quanti or 30), 60)):]]
+
+    def rejected(stadio="", simbolo="", quante=15):
+        rows = core.pitch_audit().rejected(limit=3000, stage=stadio or None)["rows"]
+        if simbolo:
+            rows = [r for r in rows if core.normalize_symbol(r["symbol"]) == core.normalize_symbol(simbolo)]
+        return [{k: r.get(k) for k in ("time", "symbol", "stage", "reason", "veto_agent", "score")}
+                for r in rows[:max(1, min(int(quante or 15), 30))]]
+
+    def account():
+        acc = ctx.get("account") or {}
+        return {"conto": {k: acc.get(k) for k in ("portfolio", "cash", "buying_power", "exposure", "daily_pnl_usd",
+                                                   "daily_pnl_pct", "net_pnl_usd", "net_pnl_pct", "initial_capital")},
+                "posizioni": [{k: p.get(k) for k in ("symbol", "qty", "avg_entry_price", "current_price", "market_value",
+                                                     "unrealized_plpc", "effective_stop_pct", "target_pct", "scaled_out",
+                                                     "buy_thesis", "hold_rationale", "opened_at")}
+                              for p in ctx.get("positions") or []],
+                "ultime_chiuse": (core.guardian_snapshot().get("closed") or [])[-5:],
+                "ultimo_mandato_cio": ctx.get("cio")}
+
+    def settings():
+        cfg = core.public_config()
+        st = snapshot_state()
+        return {"configurazione": cfg, "agenti": st["agents"], "blocchi": st["blocks"],
+                "bot_attivo": ctx.get("bot_active"), "mercato_usa_aperto": ctx.get("market_open")}
+
+    def news(simbolo):
+        sym = str(simbolo or "").upper().strip()
+        crypto = core.is_crypto(sym) or sym.endswith("-USD")
+        radar = core.quant_engine().news_radar
+        heads = radar.collect(sym, crypto) if radar else []
+        q = core.quant_rationale(sym, max_age_sec=None) or {}
+        return {"titoli_24h": [{"titolo": h["title"], "fonte": h["source"],
+                                "minuti_fa": int((time.time() - h["published"]) / 60)} for h in heads[:8]],
+                "ultimo_giudizio_agente_4": ((q.get("agent_04_macro") or {}).get("news"))}
+
+    def propose(intent, summary="", agent=None, level=None, kind=None, value=None):
+        if intent not in ACTION_INTENTS:
+            return {"errore": f"intent non valido: usa uno tra {', '.join(ACTION_INTENTS)}"}
+        cmd = normalize_command({"intent": intent, "agent": agent, "level": level, "kind": kind, "value": value})
+        cmd["summary"] = str(summary or "").strip() or describe_command(cmd)
+        proposal_box["cmd"] = cmd
+        return {"ok": True, "nota": "proposta registrata. La richiesta di conferma viene aggiunta automaticamente sotto la tua "
+                                    "risposta: non chiederla tu e non promettere scadenze automatiche."}
+
+    deadline = ctx.get("_deadline")
+    return {
+        "architettura_bot": {"schema": _fn("architettura_bot", "Descrizione completa di come funziona il bot: agenti, soglie, "
+                                           "flusso, Guardian, Centro di Comando."), "fn": lambda: ARCHITECTURE},
+        "diagnosi_pipeline": {"schema": _fn("diagnosi_pipeline",
+                                            "Perché al CIO arrivano o non arrivano schede: imbuto degli Stage, esiti, motivi di "
+                                            "scarto più frequenti (5h), migliori Ensemble, notizie, collo di bottiglia."),
+                              "fn": lambda: ctx.get("diagnosis") or core.pipeline_diagnosis()},
+        "conto_e_posizioni": {"schema": _fn("conto_e_posizioni", "Conto, posizioni aperte con stop/target/schede del "
+                                            "Guardian, ultime chiusure e ultimo mandato del CIO."), "fn": account},
+        "dettaglio_ticker": {"schema": _fn("dettaglio_ticker", "Tutto ciò che il bot sa su un ticker: voti dei 7 agenti, "
+                                           "scout, bocciature recenti, coda, cooldown, posizione.",
+                                           {"simbolo": {"type": "string", "description": "es. NVDA o BTC-USD"}}, ["simbolo"]),
+                             "fn": lambda simbolo: _ticker_detail(ctx, simbolo)},
+        "bocciature": {"schema": _fn("bocciature", "Schede bocciate nelle ultime 5 ore (più recenti prima).",
+                                     {"stadio": {"type": "string", "description": "Stage 1, Stage 2, Stage 3, Comitato Rischi, CIO"},
+                                      "simbolo": {"type": "string"}, "quante": {"type": "integer"}}), "fn": rejected},
+        "log_recenti": {"schema": _fn("log_recenti", "Ultime righe di log del bot, filtrabili per testo.",
+                                      {"filtro": {"type": "string", "description": "testo da cercare, es. CIO, Guardian, NVDA"},
+                                       "quanti": {"type": "integer"}}), "fn": logs},
+        "impostazioni_e_controlli": {"schema": _fn("impostazioni_e_controlli", "Configurazione, agenti in pausa, sensibilità, "
+                                                   "blocchi e stato del mercato."), "fn": settings},
+        "notizie_ticker": {"schema": _fn("notizie_ticker", "Titoli delle ultime 24h dalle fonti del bot (Finnhub, Polygon, "
+                                         "RSS Yahoo, SEC) e ultimo giudizio dell'Agente #4 su un ticker.",
+                                         {"simbolo": {"type": "string"}}, ["simbolo"]), "fn": news},
+        "cerca_web": {"schema": _fn("cerca_web", "Ricerca su internet. tipo='notizie' per fatti recenti/mercati, 'web' per "
+                                    "concetti, documentazione, regole di broker ed exchange. Restituisce titoli, URL, estratti.",
+                                    {"domanda": {"type": "string"}, "tipo": {"type": "string", "enum": ["notizie", "web"]}},
+                                    ["domanda"]),
+                      "fn": lambda domanda, tipo="web": web.search(domanda, tipo, deadline=deadline)},
+        "leggi_pagina": {"schema": _fn("leggi_pagina", "Legge il testo di una pagina web pubblica (da un URL dei risultati).",
+                                       {"url": {"type": "string"}}, ["url"]), "fn": lambda url: web.read_page(url)},
+        "proponi_azione": {"schema": _fn("proponi_azione", "Propone un'azione del Centro di Comando: l'utente dovrà confermarla. "
+                                         "Blocchi, pause e sensibilità NON scadono da soli: restano finché non vengono rimossi "
+                                         "(non promettere durate come 'per oggi'). Non chiedere tu la conferma: la domanda viene "
+                                         "aggiunta automaticamente.",
+                                         {"intent": {"type": "string", "enum": list(ACTION_INTENTS)},
+                                          "summary": {"type": "string", "description": "descrizione breve dell'azione"},
+                                          "agent": {"type": "string", "description": "01..07 (per pause/resume/sensibilità)"},
+                                          "level": {"type": "integer", "description": "0 Standard, 1 Selettivo, 2 Rigoroso"},
+                                          "kind": {"type": "string", "enum": ["asset", "sector", "symbol"]},
+                                          "value": {"type": "string", "description": "crypto|stocks, settore o ticker"}},
+                                         ["intent", "summary"]), "fn": propose},
+    }
 
 
 def _llm_chat(persona, message, ctx, started=None):
-    """Risposta conversazionale dell'LLM -> {"reply", "proposal"}; None se Groq manca, sbaglia o supera il budget.
+    """COO agentico (agents/coo_agent.py): ragiona con gli strumenti e, se serve, cerca sul web.
 
-    started (time.monotonic() all'arrivo della richiesta): il budget CHAT_TIMEOUT_S comprende anche la costruzione
-    del contesto, così la risposta arriva sempre prima del timeout della dashboard.
+    -> {"reply", "proposal", "model", "tools_used"}; None se Groq manca o nessun modello risponde nel budget
+    (COO_BUDGET_S dall'arrivo della richiesta): in quel caso risponde la riserva locale.
     """
     if not core.GROQ_KEY:
         return None
     started = started if started is not None else time.monotonic()
-    if started + CHAT_TIMEOUT_S - time.monotonic() < CHAT_MIN_LLM_S:
-        print("[chat] contesto lento: budget insufficiente per Groq, risposta locale", flush=True)
+    deadline = started + coo.COO_BUDGET_S
+    if deadline - time.monotonic() < CHAT_MIN_LLM_S:
         return None
     try:
         history = [m for m in chat_history(persona) if m.get("text")][-CHAT_TURNS_IN_PROMPT - 1:-1]   # senza il messaggio appena salvato
-        messages = [{"role": "system", "content": build_system_prompt(persona, ctx)}]
-        messages += [{"role": "user" if m["role"] == "user" else "assistant", "content": m["text"][:1500]} for m in history]
-        messages.append({"role": "user", "content": message})
-        deadline = started + CHAT_TIMEOUT_S
-        # Timeout rigoroso sul tempo totale: il timeout di httpx vale per singola operazione, non per la richiesta
-        data, model = _llm_pool.submit(_llm_request, messages, deadline).result(timeout=max(0.1, deadline - time.monotonic()))
-        proposal = data.get("proposal")
-        if isinstance(proposal, dict) and proposal.get("intent") in ACTION_INTENTS:
-            summary = str(proposal.get("summary") or "").strip()
-            proposal = normalize_command(proposal)
-            proposal["summary"] = summary or describe_command(proposal)
-        else:
-            proposal = None
-        return {"reply": str(data["reply"]).strip(), "proposal": proposal, "model": model}
-    except FutureTimeout:
-        print(f"[chat] Groq oltre il budget di {CHAT_TIMEOUT_S:.0f}s: risposta locale", flush=True)
+        history = [{"role": "user" if m["role"] == "user" else "assistant", "content": m["text"][:700]} for m in history]
+        proposal_box = {}
+        tools = _coo_tools({**ctx, "_deadline": deadline}, proposal_box)
+        out = _agent().run(build_system_prompt(persona, ctx), history, message, tools, deadline)
+        return {"reply": out["reply"], "proposal": proposal_box.get("cmd"), "model": out["model"],
+                "tools_used": out["tools_used"]}
     except Exception as e:
-        print(f"[chat] Groq non disponibile ({type(e).__name__}: {str(e)[:140]}): risposta locale", flush=True)
+        print(f"[chat] COO IA non disponibile ({type(e).__name__}: {str(e)[:160]}): risposta locale", flush=True)
     return None
 
 
@@ -909,6 +1097,7 @@ def _propose(persona, cmd, summary, reply, ctx, parser, intro_verdict="PROPOSTA"
     if verdict in ("IMPOSSIBILE", "CHIARIMENTO", "INFO"):
         return _push("agent", persona, (reply + "\n\n" if reply else "") + text, verdict=verdict, intent=cmd["intent"],
                      parser=parser, change=None)
+    summary = str(summary or "").strip().rstrip(".")
     _pending[persona] = {"cmd": cmd, "summary": summary, "ts": time.time()}
     warning = f"\n\n⚠️ {text}" if verdict == "SCONSIGLIATO" else ""
     reply = (reply + warning + f"\n\nProposta: {summary}. Confermi? Rispondi \"sì\" per applicarla o \"no\" per annullare.")
@@ -944,10 +1133,13 @@ def chat(persona, message, ctx, apply_bot_state, started=None):
     if llm:
         proposal = llm["proposal"]
         reply = llm["reply"]
+        used = list(dict.fromkeys(t["tool"] for t in llm.get("tools_used") or []))
+        parser = f"COO IA · {llm['model']}" + (f" · strumenti: {', '.join(used)}" if used else "")
         if proposal:
             # Conferma obbligatoria (la richiesta esplicita c'è sempre) e avvisi dei controlli prima della conferma
-            return _propose(persona, proposal, proposal["summary"], reply, ctx, f"Groq · {llm['model']}")
-        return _push("agent", persona, reply, verdict="INFO", intent="chat", parser=f"Groq · {llm['model']}", change=None)
+            return _propose(persona, proposal, proposal["summary"], reply, ctx, parser)
+        return _push("agent", persona, reply, verdict="INFO", intent="chat", parser=parser, change=None,
+                     tools=llm.get("tools_used") or [])
 
     # Riserva senza LLM: comandi riconosciuti dalle regole, sempre con conferma
     cmd, source = parse_command(message)
