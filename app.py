@@ -1141,7 +1141,11 @@ def api_chat():
     except Exception as e:
         log_message(f"💬 [Chat] Contesto non disponibile: {e}")
         ctx = {"account": {}, "positions": [], "radar": {}, "vix": None, "drawdown_blocked": False}
-    reply = cc.chat(data.get("persona", "coo"), message, ctx, set_bot_active)
+    try:
+        reply = cc.chat(data.get("persona", "coo"), message, ctx, set_bot_active)
+    except Exception as e:    # mai una richiesta pendente: risposta sintetica dai dati reali
+        log_message(f"💬 [Chat] Errore assistente ({type(e).__name__}: {e}): risposta locale")
+        reply = cc.fallback_reply(data.get("persona", "coo"), ctx)
     log_message(f"💬 [{cc.PERSONAS[reply['persona']]['short']}] {reply['verdict']}: {core.summarize_reason(reply['text'], 200)}")
     if reply.get("change"):
         core.agent_say(cc.PERSONAS[reply["persona"]]["short"], f"Ordine applicato: {reply['text']}", "alert")

@@ -1,4 +1,6 @@
 // Quant Desk — logica della dashboard (Alpine.js). API_TOKEN è inserito dal template dopo il login.
+const CHAT_TIMEOUT_MS = 8000;   // la chat non resta mai bloccata su "penso…" (il server risponde entro ~6 s)
+
 function dashboard() {
     return {
         connected: true,
@@ -149,7 +151,7 @@ function dashboard() {
         // ---------- Stanza dei Dipendenti AI ----------
         async loadChat() {
             try {
-                const res = await fetch('/api/chat');
+                const res = await this.fetchWithTimeout('/api/chat', {}, CHAT_TIMEOUT_MS);
                 if (res.ok) { const d = await res.json(); this.chatMessages = d.messages || []; this.chatPending = d.pending || {}; this.scrollChat(); }
             } catch (e) { /* riprova */ }
         },
@@ -158,6 +160,8 @@ function dashboard() {
         async sendChat(text) {
             const message = (text ?? this.chatInput).trim();
             if (!message || this.chatSending) return;
+            const fail = (msg) => this.chatMessages.push({ id: 'err' + Date.now(), role: 'agent', persona: this.persona, verdict: 'IMPOSSIBILE',
+                                                          author: this.personas[this.persona].name, text: msg });
             this.chatInput = '';
             this.chatSending = true;
             const local = { id: 'tmp' + Date.now(), role: 'user', persona: this.persona, author: 'Comandante', text: message,
@@ -165,21 +169,21 @@ function dashboard() {
             this.chatMessages.push(local);
             this.scrollChat();
             try {
-                const { res, data } = await this.api('/api/chat', 'POST', { persona: this.persona, message });
-                this.chatMessages = this.chatMessages.filter(m => m !== local);
+                const { res, data } = await this.api('/api/chat', 'POST', { persona: this.persona, message }, CHAT_TIMEOUT_MS);
                 if (res.ok && data.reply) {
-                    await this.loadChat();
+                    this.chatMessages = this.chatMessages.filter(m => m !== local);
+                    this.chatMessages.push({ ...local, id: 'sent' + Date.now() }, data.reply);   // risposta subito visibile
+                    this.loadChat();   // riallinea storico e proposte in sospeso, senza bloccare l'input
                     if (data.reply.change) { this.loadAgents(); this.loadSettings(); this.fetchStatus(); }
                 } else {
-                    this.chatMessages.push(local, { id: 'err' + Date.now(), role: 'agent', persona: this.persona, verdict: 'IMPOSSIBILE',
-                                                    author: this.personas[this.persona].name, text: data.message || 'Errore di comunicazione con il dirigente.' });
+                    fail(data.message || 'Errore di comunicazione con il dirigente.');
                 }
             } catch (e) {
-                this.chatMessages.push({ id: 'err' + Date.now(), role: 'agent', persona: this.persona, verdict: 'IMPOSSIBILE',
-                                         author: this.personas[this.persona].name, text: 'Connessione persa: ' + e.message });
+                fail(e.name === 'AbortError' ? `Nessuna risposta entro ${CHAT_TIMEOUT_MS / 1000} secondi: riprova.` : 'Connessione persa: ' + e.message);
             } finally {
-                this.chatSending = false;
+                this.chatSending = false;   // in OGNI caso: "penso…" -> "Invia", input sbloccato
                 this.scrollChat();
+                this.$nextTick(() => this.$refs.cmd?.focus());
             }
         },
         verdictTone(v) {
@@ -302,10 +306,20 @@ function dashboard() {
         },
 
         // ---------- API ----------
-        async api(url, method = 'POST', body) {
+        async fetchWithTimeout(url, options = {}, timeoutMs = 0) {
+            if (!timeoutMs) return fetch(url, options);
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+            try {
+                return await fetch(url, { ...options, signal: ctrl.signal });
+            } finally {
+                clearTimeout(timer);
+            }
+        },
+        async api(url, method = 'POST', body, timeoutMs = 0) {
             const headers = { 'X-API-Key': API_TOKEN };
             if (body !== undefined) headers['Content-Type'] = 'application/json';
-            const res = await fetch(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
+            const res = await this.fetchWithTimeout(url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined }, timeoutMs);
             if (res.status === 401) { window.location.href = '/login'; }
             const data = await res.json().catch(() => ({}));
             return { res, data };

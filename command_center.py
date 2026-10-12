@@ -22,11 +22,12 @@ import re
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 import trading_core as core
 
 STATE_PATH = os.path.join(core.DATA_DIR, "command_center.json")
-CHAT_TIMEOUT_S = 25.0
+CHAT_TIMEOUT_S = 6.0            # budget TOTALE (wall-clock) per la risposta di Groq; oltre -> riserva locale
 CHAT_HISTORY_MAX = 80
 CHAT_TURNS_IN_PROMPT = 12        # ultimi messaggi della conversazione passati all'LLM
 PROPOSAL_TTL_SEC = 600           # una proposta non confermata entro 10 minuti decade
@@ -692,39 +693,104 @@ def _groq_client():
     global _groq
     if _groq is None:
         import groq
-        _groq = groq.Groq(api_key=core.GROQ_KEY, timeout=CHAT_TIMEOUT_S, max_retries=1)
+        _groq = groq.Groq(api_key=core.GROQ_KEY, timeout=CHAT_TIMEOUT_S, max_retries=0)
     return _groq
 
 
-def _llm_chat(persona, message, ctx):
-    """Risposta conversazionale dell'LLM -> {"reply", "proposal"} oppure None se Groq non è disponibile."""
-    if not core.GROQ_KEY:
-        return None
-    history = [m for m in chat_history(persona) if m.get("text")][-CHAT_TURNS_IN_PROMPT - 1:-1]   # senza il messaggio appena salvato
-    messages = [{"role": "system", "content": build_system_prompt(persona, ctx)}]
-    messages += [{"role": "user" if m["role"] == "user" else "assistant", "content": m["text"][:1500]} for m in history]
-    messages.append({"role": "user", "content": message})
-    last_error = None
+_llm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chat-llm")
+
+
+def _llm_request(messages, deadline):
+    """Prova i modelli Groq finché resta tempo nel budget. Solleva l'ultimo errore se nessuno risponde."""
+    last_error = TimeoutError("budget esaurito")
     for model in core.GROQ_MODELS[:3]:
+        remaining = deadline - time.monotonic()
+        if remaining < 0.5:
+            break
         try:
-            res = _groq_client().chat.completions.create(model=model, max_tokens=900, temperature=0.4,
-                                                         response_format={"type": "json_object"}, messages=messages)
+            res = _groq_client().chat.completions.create(model=model, max_tokens=600, temperature=0.4,
+                                                         response_format={"type": "json_object"}, messages=messages,
+                                                         timeout=remaining)
             data = json.loads(res.choices[0].message.content)
-            reply = str(data.get("reply") or "").strip()
-            if not reply:
+            if not str(data.get("reply") or "").strip():
                 raise ValueError("risposta vuota")
-            proposal = data.get("proposal")
-            if isinstance(proposal, dict) and proposal.get("intent") in ACTION_INTENTS:
-                summary = str(proposal.get("summary") or "").strip()
-                proposal = normalize_command(proposal)
-                proposal["summary"] = summary or describe_command(proposal)
-            else:
-                proposal = None
-            return {"reply": reply, "proposal": proposal, "model": model}
+            return data, model
         except Exception as e:
             last_error = e
-    print(f"[chat] Groq non disponibile, uso il parser a regole: {str(last_error)[:160]}", flush=True)
+    raise last_error
+
+
+def _llm_chat(persona, message, ctx):
+    """Risposta conversazionale dell'LLM -> {"reply", "proposal"}; None se Groq manca, sbaglia o supera CHAT_TIMEOUT_S."""
+    if not core.GROQ_KEY:
+        return None
+    started = time.monotonic()
+    try:
+        history = [m for m in chat_history(persona) if m.get("text")][-CHAT_TURNS_IN_PROMPT - 1:-1]   # senza il messaggio appena salvato
+        messages = [{"role": "system", "content": build_system_prompt(persona, ctx)}]
+        messages += [{"role": "user" if m["role"] == "user" else "assistant", "content": m["text"][:1500]} for m in history]
+        messages.append({"role": "user", "content": message})
+        deadline = started + CHAT_TIMEOUT_S
+        # Timeout rigoroso sul tempo totale: il timeout di httpx vale per singola operazione, non per la richiesta
+        data, model = _llm_pool.submit(_llm_request, messages, deadline).result(timeout=max(0.1, deadline - time.monotonic()))
+        proposal = data.get("proposal")
+        if isinstance(proposal, dict) and proposal.get("intent") in ACTION_INTENTS:
+            summary = str(proposal.get("summary") or "").strip()
+            proposal = normalize_command(proposal)
+            proposal["summary"] = summary or describe_command(proposal)
+        else:
+            proposal = None
+        return {"reply": str(data["reply"]).strip(), "proposal": proposal, "model": model}
+    except FutureTimeout:
+        print(f"[chat] Groq oltre {CHAT_TIMEOUT_S:.0f}s: risposta locale", flush=True)
+    except Exception as e:
+        print(f"[chat] Groq non disponibile ({type(e).__name__}: {str(e)[:140]}): risposta locale", flush=True)
     return None
+
+
+def local_reply(ctx):
+    """Risposta sintetica dai dati reali (senza LLM): stato del conto e cause concrete di un portafoglio fermo."""
+    acc = ctx.get("account") or {}
+    cfg = ctx.get("config") or {}
+    st = snapshot_state()
+    eq = acc.get("portfolio") or 0
+    exp_pct = (acc.get("exposure") or 0) / eq * 100 if eq else 0
+    positions = ctx.get("positions") or []
+    text = (f"Patrimonio ${eq:,.2f} (oggi {acc.get('daily_pnl_usd', 0) or 0:+,.2f}$, {acc.get('daily_pnl_pct', 0) or 0:+.2f}%), "
+            f"cassa ${acc.get('cash', 0) or 0:,.2f}, investito {exp_pct:.0f}%, {len(positions)} posizioni aperte")
+    if positions:
+        text += " (" + ", ".join(f"{p['symbol']} {p.get('unrealized_plpc', 0):+.2f}%" for p in positions[:5]) + ")"
+    if ctx.get("vix") is not None:
+        text += f", VIX {ctx['vix']}"
+    text += "."
+    why = []
+    if ctx.get("bot_active") is False:
+        why.append("il sistema è in pausa")
+    if cfg and not cfg.get("auto_execute_trades"):
+        why.append("è attiva la modalità Advisor (nessun ordine inviato)")
+    if ctx.get("market_open") is False:
+        why.append("il mercato azionario USA è chiuso (solo crypto operative)")
+    if ctx.get("drawdown_blocked"):
+        why.append("il Drawdown Controller blocca gli acquisti per la perdita giornaliera")
+    if cfg.get("max_exposure_pct") and exp_pct >= float(cfg["max_exposure_pct"]) - 1:
+        why.append(f"l'esposizione è al limite ({exp_pct:.0f}% su {float(cfg['max_exposure_pct']):.0f}%)")
+    if ctx.get("vix") is not None and ctx["vix"] > core.VIX_RISK_CONTRACTION:
+        why.append(f"VIX {ctx['vix']} sopra {core.VIX_RISK_CONTRACTION:.0f}: rischio contratto")
+    paused = [AGENTS[a]["title"] for a, v in st["agents"].items() if v["paused"]]
+    if paused:
+        why.append("agenti in pausa: " + ", ".join(paused))
+    blocks = blocks_text(st["blocks"])
+    if blocks:
+        why.append("acquisti bloccati su " + ", ".join(blocks))
+    queue = (ctx.get("radar") or {}).get("queue") or []
+    if not any(q.get("status") == "APPROVED_BY_RISK" for q in queue):
+        why.append(f"nessuna scheda approvata con Ensemble ≥ {core.PIPELINE_BUY_SCORE:.0f}")
+    rejected = ctx.get("rejected") or []
+    if rejected:
+        why.append("ultime bocciature: " + "; ".join(f"{r['symbol']} ({str(r.get('reason') or '')[:70]})" for r in rejected[:3]))
+    if why:
+        text += " Perché non si compra ora: " + "; ".join(why) + "."
+    return text
 
 
 def describe_command(cmd):
@@ -797,12 +863,22 @@ def chat(persona, message, ctx, apply_bot_state):
     if cmd["intent"] in ACTION_INTENTS:
         summary = describe_command(cmd)
         _pending[persona] = {"cmd": cmd, "summary": summary, "ts": time.time()}
-        text = (f"Assistente IA non disponibile (Groq offline), ho interpretato la richiesta come: {summary}. "
+        text = (f"Assistente IA momentaneamente non disponibile: ho interpretato la richiesta come: {summary}. "
                 "Vuoi che proceda? Rispondi \"sì\" per confermare o \"no\" per annullare.")
         return _push("agent", persona, text, verdict="PROPOSTA", intent=cmd["intent"], parser=source, change=None,
                      proposal=summary)
-    text = ("Assistente IA non disponibile (Groq offline): posso solo riepilogare lo stato. " + status_text(ctx, persona))
-    return _push("agent", persona, text, verdict="INFO", intent=cmd["intent"], parser=source, change=None)
+    text = "Risposta rapida dai dati di sistema (assistente IA momentaneamente non disponibile). " + local_reply(ctx)
+    return _push("agent", persona, text, verdict="INFO", intent=cmd["intent"], parser="locale", change=None)
+
+
+def fallback_reply(persona, ctx):
+    """Risposta locale d'emergenza (errore inatteso nella chat): mai una richiesta lasciata senza risposta."""
+    persona = persona if persona in PERSONAS else "coo"
+    try:
+        text = "Risposta rapida dai dati di sistema (assistente momentaneamente non disponibile). " + local_reply(ctx)
+    except Exception:
+        text = "Assistente momentaneamente non disponibile: riprova tra qualche secondo."
+    return _push("agent", persona, text, verdict="INFO", intent="chat", parser="locale", change=None)
 
 
 def pending_proposal(persona):
