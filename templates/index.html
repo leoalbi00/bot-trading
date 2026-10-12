@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>J.A.R.V.I.S. · Quant Desk</title>
+    <title>Quant Desk</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -17,13 +17,13 @@
                 extend: {
                     fontFamily: {
                         sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
-                        mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
+                        mono: ['JetBrains Mono', 'Roboto Mono', 'ui-monospace', 'monospace'],
                     }
                 }
             }
         }
     </script>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/jarvis.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/pro_desk.css') }}">
     <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
     <script>
         // Token degli endpoint di controllo, inserito dal server dopo il login
@@ -32,255 +32,210 @@
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 </head>
-<body class="min-h-screen font-sans antialiased" x-data="dashboard()" x-init="init()">
-<div class="app-layer">
+<body class="min-h-screen font-sans antialiased text-[13px]" x-data="dashboard()" x-init="init()"
+      @keydown.window.prevent.meta.k="focusCommand()" @keydown.window.prevent.ctrl.k="focusCommand()">
 
-    <!-- ============ BARRA DI COMANDO ============ -->
-    <header class="sticky top-0 z-40 border-b border-sky-400/10 bg-[#090d16]/80 backdrop-blur-xl">
-        <div class="max-w-[1500px] mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-3">
-            <div class="flex items-center gap-3 min-w-0">
-                <div class="hud-ring" :class="(!connected || !bot.active) && 'off'"></div>
-                <div class="min-w-0">
-                    <div class="hud-font text-[13px] font-bold text-cyan-100 truncate">J.A.R.V.I.S.</div>
-                    <div class="text-[10.5px] text-slate-400 truncate num"
-                         x-text="!connected ? 'Connessione…' : (bot.active ? (settings.auto_execute_trades ? 'Auto-Trading' : 'Advisor · solo suggerimenti') : 'In pausa') + ' · ' + (bot.status || '')"></div>
-                </div>
+    <!-- ============ HEADER ============ -->
+    <header class="sticky top-0 z-40 border-b border-zinc-800 bg-[#09090b]/95 backdrop-blur">
+        <div class="max-w-[1500px] mx-auto px-4 sm:px-6 h-11 flex items-center justify-between gap-3">
+            <div class="flex items-center gap-2.5 min-w-0">
+                <span class="dot" :class="!connected ? 'text-amber-500' : (bot.active ? 'dot-active' : 'dot-paused')"></span>
+                <span class="text-[12px] font-semibold tracking-wide text-zinc-100">QUANT DESK</span>
+                <span class="text-[11px] text-zinc-500 mono" x-text="!connected ? '• OFFLINE' : (bot.active ? '• LIVE' : '• PAUSA')"></span>
+                <span class="hidden md:inline text-[11px] text-zinc-600 truncate"
+                      x-text="(settings.auto_execute_trades ? 'Auto-Trading' : 'Advisor') + ' · ' + (bot.status || '')"></span>
             </div>
-            <nav class="flex items-center gap-1.5 shrink-0">
-                <button @click="forceCio()" title="Forza il CIO a valutare subito le proposte in coda" class="btn btn-amber">
+            <nav class="flex items-center gap-1 shrink-0">
+                <button @click="forceCio()" title="Forza il CIO a valutare subito le proposte in coda" class="btn btn-ghost">
                     <i data-lucide="zap" class="w-3.5 h-3.5"></i><span class="hidden md:inline">Forza CIO</span></button>
-                <button @click="toggleBot()" class="btn" :class="bot.active ? '' : 'btn-emerald'" :title="bot.active ? 'Metti in pausa tutto il sistema' : 'Riattiva il sistema'">
-                    <span x-text="bot.active ? '❚❚' : '▶'"></span>
+                <button @click="toggleBot()" class="btn btn-ghost" :title="bot.active ? 'Metti in pausa il sistema' : 'Riattiva il sistema'">
+                    <span class="mono text-[10px]" x-text="bot.active ? '❚❚' : '▶'"></span>
                     <span class="hidden sm:inline" x-text="bot.active ? 'Pausa' : 'Riprendi'"></span></button>
-                <button @click="showSettings = true" class="btn" title="Impostazioni"><i data-lucide="settings-2" class="w-3.5 h-3.5"></i><span class="hidden lg:inline">Impostazioni</span></button>
-                <button @click="openHistory()" class="btn" title="Operazioni eseguite mentre la dashboard era chiusa"><i data-lucide="history" class="w-3.5 h-3.5"></i><span class="hidden lg:inline">Storico</span></button>
-                <button @click="liquidate()" title="Annulla gli ordini, chiude tutte le posizioni e mette il bot in pausa" class="btn btn-rose">
-                    <i data-lucide="siren" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">PANIC</span></button>
+                <button @click="showSettings = true" class="btn btn-ghost" title="Impostazioni"><i data-lucide="settings-2" class="w-3.5 h-3.5"></i><span class="hidden lg:inline">Impostazioni</span></button>
+                <button @click="openHistory()" class="btn btn-ghost" title="Operazioni eseguite mentre la dashboard era chiusa"><i data-lucide="history" class="w-3.5 h-3.5"></i><span class="hidden lg:inline">Storico</span></button>
+                <button @click="liquidate()" title="Annulla gli ordini, chiude tutte le posizioni e mette il bot in pausa" class="btn btn-danger">PANIC</button>
                 <form method="post" action="/logout">
-                    <button type="submit" title="Esci" class="btn w-8 px-0"><i data-lucide="log-out" class="w-3.5 h-3.5"></i></button>
+                    <button type="submit" title="Esci" class="btn btn-ghost w-7 px-0"><i data-lucide="log-out" class="w-3.5 h-3.5"></i></button>
                 </form>
             </nav>
         </div>
     </header>
 
-    <main class="max-w-[1500px] mx-auto px-4 sm:px-6 py-6 space-y-6">
+    <main class="max-w-[1500px] mx-auto px-4 sm:px-6 py-4 space-y-4">
 
-        <!-- ============ HEADER STATO: 4 indicatori per tutti ============ -->
-        <section class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-            <div class="glass hud-corners kpi" title="Valore complessivo del conto: liquidità + investimenti">
-                <div class="scan"></div>
-                <div class="kpi-label">Saldo totale</div>
-                <div class="kpi-value num text-cyan-50" x-text="usd(account.portfolio)"></div>
-                <div class="kpi-sub num flex items-center gap-1.5">
-                    <span :class="glow(account.net_pnl_usd)" x-text="arrow(account.net_pnl_usd) + ' ' + pct(account.net_pnl_pct)"></span>
-                    <span x-text="account.initial_capital ? 'da inizio (' + usd(account.initial_capital) + ')' : 'crescita totale'"></span>
+        <!-- ============ KPI ============ -->
+        <section class="glass kpi-bar">
+            <div class="kpi">
+                <div class="label">Saldo totale</div>
+                <div class="kpi-value num text-zinc-100" x-text="usd(account.portfolio)"></div>
+                <div class="mt-0.5 text-[11px] num" :class="tone(account.net_pnl_pct)"
+                     x-text="pct(account.net_pnl_pct) + (account.initial_capital ? ' da ' + usd(account.initial_capital) : '')"></div>
+            </div>
+            <div class="kpi">
+                <div class="label">Profitto di oggi</div>
+                <div class="flex items-baseline gap-2 mt-0.5">
+                    <span class="kpi-value num" :class="tone(account.daily_pnl_usd)" x-text="usd(account.daily_pnl_usd, true)"></span>
+                    <span class="pill num" :class="pnlPill(account.daily_pnl_pct)" x-text="pct(account.daily_pnl_pct)"></span>
                 </div>
             </div>
-            <div class="glass hud-corners kpi" title="Guadagno o perdita di oggi">
-                <div class="scan"></div>
-                <div class="kpi-label">Profitto di oggi</div>
-                <div class="kpi-value num" :class="glow(account.daily_pnl_usd)" x-text="usd(account.daily_pnl_usd, true)"></div>
-                <div class="kpi-sub num"><span class="font-semibold" :class="glow(account.daily_pnl_pct)" x-text="pct(account.daily_pnl_pct)"></span>
-                    <span x-text="Number(account.daily_pnl_usd) >= 0 ? ' rispetto a ieri sera' : ' rispetto a ieri sera · protezioni attive'"></span></div>
+            <div class="kpi">
+                <div class="label">Regime operativo</div>
+                <div class="mt-1.5"><span class="pill" :class="health().pill" :title="health().hint">
+                    <span class="dot"></span><span x-text="health().label"></span></span></div>
+                <div class="mt-1 text-[11px] text-zinc-500 truncate" x-text="health().hint"></div>
             </div>
-            <div class="glass hud-corners kpi" title="Salute del sistema in una parola">
-                <div class="scan"></div>
-                <div class="kpi-label">Stato di salute</div>
-                <div class="mt-2.5"><span class="hud-badge" :class="health().tone"><span class="core"></span><span x-text="health().label"></span></span></div>
-                <div class="kpi-sub" x-text="health().hint"></div>
-            </div>
-            <div class="glass hud-corners kpi" title="Quanta parte del capitale è investita e quanta è al sicuro in cassa">
-                <div class="scan"></div>
-                <div class="kpi-label">Rischio portafoglio</div>
-                <div class="mt-1.5 text-[13px] font-bold hud-font text-cyan-100" x-text="safetyLabel()"></div>
-                <div class="mt-1 num text-[12.5px]">
-                    <span class="text-cyan-300" x-text="investedPct() === null ? '—' : investedPct().toFixed(0) + '% INVESTITO'"></span>
-                    <span class="text-slate-500"> / </span>
-                    <span class="text-emerald-300" x-text="investedPct() === null ? '—' : (100 - investedPct()).toFixed(0) + '% CASSA PROTETTA'"></span>
+            <div class="kpi">
+                <div class="flex items-center justify-between label">
+                    <span>Allocazione cassa</span>
+                    <span class="num text-zinc-300" x-text="investedPct() === null ? '—' : (100 - investedPct()).toFixed(0) + '% cassa'"></span>
                 </div>
-                <div class="risk-bar mt-2.5"><span :style="'width:' + (investedPct() ?? 0) + '%'"></span></div>
+                <div class="kpi-value num text-zinc-100" x-text="investedPct() === null ? '—' : investedPct().toFixed(1) + '%'"></div>
+                <div class="exp-bar mt-1.5" :title="'Esposizione massima ' + (settings.max_exposure_pct ?? '—') + '%'"><span :style="'width:' + (investedPct() ?? 0) + '%'"></span></div>
             </div>
         </section>
 
-        <!-- ============ SCHEDE ============ -->
-        <nav class="glass tabbar scroll-thin">
+        <!-- ============ TAB ============ -->
+        <nav class="tabbar scroll-thin">
             <template x-for="t in tabs" :key="t.id">
-                <button class="tab" :class="tab === t.id && 'active'" @click="tab = t.id">
-                    <i :data-lucide="t.icon" class="w-4 h-4"></i><span x-text="t.label"></span>
-                </button>
+                <button class="tab" :class="tab === t.id && 'active'" @click="tab = t.id" x-text="t.label"></button>
             </template>
         </nav>
 
-        <!-- ================================================================ CENTRO DI COMANDO -->
-        <div x-show="tab === 'command'" class="tab-panel space-y-6">
+        <!-- ================================================================ AGENTI -->
+        <div x-show="tab === 'command'" class="space-y-4">
 
             <!-- AGENT MATRIX -->
-            <section class="glass hud-corners">
+            <section class="glass">
                 <div class="panel-head">
-                    <h2 class="panel-title">Agent Matrix · i 7 agenti al lavoro</h2>
-                    <div class="flex flex-wrap items-center gap-3 text-[11px] text-slate-400">
-                        <span class="flex items-center gap-1.5"><span class="status-led tone-emerald"></span>Attivo</span>
-                        <span class="flex items-center gap-1.5"><span class="status-led blink tone-cyan"></span>Elaborazione</span>
-                        <span class="flex items-center gap-1.5"><span class="status-led tone-amber"></span>In pausa</span>
+                    <h2 class="panel-title">Agenti <span class="text-zinc-500 font-normal num" x-text="agents.filter(a => !a.paused).length + '/' + agents.length + ' attivi'"></span></h2>
+                    <div class="flex flex-wrap items-center gap-3 text-[11px] text-zinc-500">
+                        <span class="flex items-center gap-1.5"><span class="dot dot-active"></span>Attivo</span>
+                        <span class="flex items-center gap-1.5"><span class="dot dot-processing"></span>Elaborazione</span>
+                        <span class="flex items-center gap-1.5"><span class="dot dot-paused"></span>Pausa</span>
                     </div>
                 </div>
-                <div x-show="blockChips().length" x-transition class="px-4 pt-3 flex flex-wrap items-center gap-2 text-[11px]">
-                    <span class="text-amber-300/90 flex items-center gap-1"><i data-lucide="ban" class="w-3.5 h-3.5"></i>Acquisti bloccati dal Comandante:</span>
+                <div x-show="blockChips().length" class="px-3 pt-3 flex flex-wrap items-center gap-1.5 text-[11px]">
+                    <span class="text-zinc-500">Acquisti bloccati:</span>
                     <template x-for="b in blockChips()" :key="b.kind + b.value">
-                        <button class="chip !border-amber-400/40 !text-amber-200" @click="removeBlock(b.kind, b.value)" :title="'Rimuovi il blocco su ' + b.label" x-text="b.label + '  ✕'"></button>
+                        <button class="pill pill-down mono" @click="removeBlock(b.kind, b.value)" :title="'Rimuovi il blocco su ' + b.label" x-text="b.label + ' ×'"></button>
                     </template>
-                    <button class="text-slate-500 hover:text-slate-200 underline" @click="removeBlock()">rimuovi tutti</button>
+                    <button class="text-zinc-500 hover:text-zinc-200" @click="removeBlock()">rimuovi tutti</button>
                 </div>
-                <div class="p-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                <div class="p-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-7 gap-2">
                     <template x-if="!agents.length">
-                        <div class="text-sm text-slate-500 col-span-full">Collegamento con gli agenti…</div>
+                        <div class="text-zinc-500 col-span-full">Caricamento agenti…</div>
                     </template>
-                    <template x-for="(a, i) in agents" :key="a.id">
-                        <article class="glow-card" :class="'st-' + a.status" :style="'animation-delay:' + (i * 60) + 'ms'">
-                            <div class="inner">
-                                <div class="flex items-start gap-3">
-                                    <div class="agent-icon"><i :data-lucide="a.icon" class="w-5 h-5"></i></div>
-                                    <div class="min-w-0 flex-1">
-                                        <div class="text-[10px] text-slate-500 num" x-text="'AGENTE #' + Number(a.id)"></div>
-                                        <div class="text-sm font-semibold text-slate-100 leading-tight" x-text="a.title.split('· ')[1] || a.name"></div>
-                                    </div>
-                                    <span class="flex items-center gap-1.5 text-[10px] font-semibold tracking-wider" :class="statusTone(a.status)">
-                                        <span class="status-led" :class="a.status === 'PROCESSING' && 'blink'"></span>
-                                        <span x-text="statusText(a.status)"></span>
-                                    </span>
+                    <template x-for="a in agents" :key="a.id">
+                        <article class="agent-card" :class="a.paused && 'paused'">
+                            <div class="flex items-center gap-2">
+                                <span class="dot" :class="'dot-' + a.status.toLowerCase()" :title="statusText(a.status)"></span>
+                                <span class="mono text-[11px] text-zinc-500" x-text="'#' + Number(a.id)"></span>
+                                <span class="agent-name text-[12.5px] font-medium text-zinc-100 truncate" x-text="a.name" :title="a.title"></span>
+                                <button class="switch ml-auto" :class="!a.paused && 'on'" :disabled="!a.pausable || agentBusy === a.id"
+                                        :title="!a.pausable ? 'Sempre attivo: cancello di sicurezza' : (a.paused ? 'Attiva agente' : 'Metti in pausa')"
+                                        @click="togglePause(a)"></button>
+                            </div>
+                            <div class="text-[11px] text-zinc-500" x-text="statusText(a.status) + (a.last_ts ? ' · ' + ago(a.last_ts) : '')"></div>
+                            <div class="text-[11.5px] text-zinc-300 leading-snug line-clamp-3 min-h-[3.2em]" :title="a.summary" x-text="a.summary"></div>
+                            <div class="mt-auto flex flex-wrap items-center justify-between gap-2 pt-1">
+                                <div class="seg" x-show="a.tunable" title="Sensibilità: voto minimo richiesto dall'agente perché il CIO investa">
+                                    <template x-for="lv in [0, 1, 2]" :key="lv">
+                                        <button :class="a.sensitivity === lv && 'on'" :disabled="agentBusy === a.id"
+                                                @click="controlAgent(a, { sensitivity: lv })" x-text="['Std', 'Sel', 'Rig'][lv]"></button>
+                                    </template>
                                 </div>
-                                <p class="text-[11.5px] text-slate-400 leading-snug" x-text="a.role"></p>
-                                <div class="rounded-lg bg-slate-950/50 border border-sky-400/10 px-2.5 py-2 min-h-[58px]">
-                                    <div class="text-[10px] uppercase tracking-wider text-cyan-300/70 flex items-center gap-1.5">Azione corrente
-                                        <span x-show="a.status === 'PROCESSING'" class="thinking-dots text-cyan-300"><span></span><span></span><span></span></span>
-                                        <span class="ml-auto normal-case tracking-normal text-slate-600 num" x-text="ago(a.last_ts)"></span></div>
-                                    <div class="mt-1 text-[12px] text-slate-200 leading-snug line-clamp-3" :title="a.summary" x-text="a.summary"></div>
-                                </div>
-                                <div class="flex items-center justify-between text-[10.5px] text-slate-500">
-                                    <span x-text="a.tunable ? 'Sensibilità: ' + a.sensitivity_label : (a.pausable ? 'Parametri di sicurezza fissi' : 'Sempre attivo · cancello di sicurezza')"></span>
-                                </div>
-                                <div class="mt-auto space-y-2">
-                                    <button class="btn btn-cyan w-full" @click="openBrain(a)"><i data-lucide="brain-circuit" class="w-3.5 h-3.5"></i>ISPEZIONA CERVELLO</button>
-                                    <div class="grid grid-cols-2 gap-2">
-                                        <button class="btn btn-sm" :class="a.paused ? 'btn-emerald' : 'btn-amber'" :disabled="!a.pausable || agentBusy === a.id"
-                                                :title="a.pausable ? '' : 'Il Risk Manager non può essere sospeso'"
-                                                @click="togglePause(a)" x-text="a.paused ? '▶ ATTIVA' : '❚❚ PAUSA AGENTE'"></button>
-                                        <button class="btn btn-sm" :disabled="!a.tunable" :title="a.tunable ? '' : 'Sensibilità non regolabile per questo agente'"
-                                                @click="tuning = tuning === a.id ? null : a.id">⚙ SENSIBILITÀ</button>
-                                    </div>
-                                    <div x-show="tuning === a.id" x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" class="space-y-1.5">
-                                        <div class="seg">
-                                            <template x-for="lv in [0, 1, 2]" :key="lv">
-                                                <button :class="a.sensitivity === lv && 'on'" :disabled="agentBusy === a.id"
-                                                        @click="controlAgent(a, { sensitivity: lv })" x-text="['Standard', 'Selettivo', 'Rigoroso'][lv]"></button>
-                                            </template>
-                                        </div>
-                                        <div class="text-[10.5px] text-slate-500 leading-snug">Più alta la sensibilità, più forte deve essere il voto di questo agente perché il CIO investa.</div>
-                                    </div>
-                                </div>
+                                <span x-show="!a.tunable" class="text-[10.5px] text-zinc-600" x-text="a.pausable ? 'Parametri fissi' : 'Sempre attivo'"></span>
+                                <button class="btn btn-sm" @click="openBrain(a)">Ispeziona</button>
                             </div>
                         </article>
                     </template>
                 </div>
             </section>
 
-            <div class="grid grid-cols-1 xl:grid-cols-5 gap-6 items-stretch">
-                <!-- STANZA DEI DIPENDENTI AI -->
-                <section class="glass hud-corners xl:col-span-3 flex flex-col min-h-[560px]">
+            <div class="grid grid-cols-1 xl:grid-cols-5 gap-4 items-start">
+                <!-- COMMAND BAR (dipendenti AI) -->
+                <section class="glass xl:col-span-3 flex flex-col">
                     <div class="panel-head">
-                        <h2 class="panel-title">Stanza dei Dipendenti AI</h2>
-                        <span class="text-[11px] text-slate-500">Dai un ordine: il dirigente valuta, applica o ti spiega perché no</span>
-                    </div>
-                    <div class="p-3 grid grid-cols-2 gap-2 border-b border-sky-400/10">
-                        <template x-for="(p, key) in personas" :key="key">
-                            <button class="persona" :class="persona === key && 'on'" @click="persona = key; scrollChat()">
-                                <span class="avatar" :class="key === 'risk' && 'risk'" x-text="p.initials"></span>
-                                <span class="min-w-0"><span class="block text-[13px] font-semibold text-slate-100 truncate" x-text="p.name"></span>
-                                    <span class="block text-[11px] text-slate-500 truncate" x-text="p.tagline"></span></span>
-                            </button>
-                        </template>
-                    </div>
-                    <div x-ref="chat" class="chat-scroll scroll-thin flex-1 p-4 space-y-3 max-h-[440px]">
-                        <template x-if="!personaMessages().length">
-                            <div class="bubble ai">
-                                <div class="text-[11px] text-cyan-300/80 mb-1" x-text="personas[persona].name"></div>
-                                <span x-text="persona === 'coo'
-                                    ? 'Buongiorno Comandante. Sono il Capo delle Operazioni: posso mettere in pausa gli agenti, bloccare un mercato, cambiare l\'aggressività o darle un rapporto. Ogni ordine viene verificato sui dati in tempo reale.'
-                                    : 'Comandante, sono il Risk Manager. Il mio compito è proteggere il capitale: valuto ogni sua richiesta e la applico solo se il rischio è sotto controllo.'"></span>
-                            </div>
-                        </template>
-                        <template x-for="m in personaMessages()" :key="m.id">
-                            <div :class="m.role === 'user' ? 'flex justify-end' : 'flex items-end gap-2'">
-                                <span x-show="m.role !== 'user'" class="avatar !w-7 !h-7 !text-[10px]" :class="persona === 'risk' && 'risk'" x-text="personas[persona].initials"></span>
-                                <div class="bubble" :class="m.role === 'user' ? 'me' : 'ai v-' + (m.verdict || '')">
-                                    <div class="flex items-center gap-2 mb-1 text-[10.5px]" x-show="m.role !== 'user'">
-                                        <span class="text-cyan-300/80" x-text="m.author"></span>
-                                        <span x-show="m.verdict" class="verdict" :class="verdictTone(m.verdict)" x-text="m.verdict"></span>
-                                        <span class="ml-auto text-slate-600 num" x-text="m.time || ''"></span>
-                                    </div>
-                                    <div x-text="m.text"></div>
-                                </div>
-                            </div>
-                        </template>
-                        <div x-show="chatSending" class="flex items-end gap-2">
-                            <span class="avatar !w-7 !h-7 !text-[10px]" :class="persona === 'risk' && 'risk'" x-text="personas[persona].initials"></span>
-                            <div class="bubble ai text-cyan-300 text-[12px] flex items-center gap-2">Sto valutando la fattibilità <span class="thinking-dots"><span></span><span></span><span></span></span></div>
+                        <h2 class="panel-title">Comandi</h2>
+                        <div class="seg">
+                            <template x-for="(p, key) in personas" :key="key">
+                                <button :class="persona === key && 'on'" @click="persona = key; scrollChat()" x-text="p.short"></button>
+                            </template>
                         </div>
                     </div>
-                    <div class="p-3 border-t border-sky-400/10 space-y-2.5">
-                        <div class="flex gap-2 overflow-x-auto scroll-thin pb-1">
+                    <div class="p-3">
+                        <form @submit.prevent="sendChat()" class="cmd flex items-center gap-2 px-2.5 h-9">
+                            <span class="mono text-zinc-500 text-[12px]">›</span>
+                            <input x-ref="cmd" x-model="chatInput" maxlength="800" :disabled="chatSending"
+                                   :placeholder="'Ordine al ' + personas[persona].short + ' — es. blocca crypto, riduci il rischio, stato'"
+                                   class="flex-1 min-w-0 text-[13px] text-zinc-100 placeholder-zinc-600">
+                            <span x-show="chatSending" class="text-[11px] text-zinc-500 mono">valuto…</span>
+                            <span x-show="!chatSending" class="kbd hidden sm:inline">⌘K</span>
+                            <button type="submit" class="btn btn-sm btn-primary" :disabled="chatSending || !chatInput.trim()">Invia</button>
+                        </form>
+                        <div class="mt-2 flex flex-wrap gap-1.5">
                             <template x-for="s in chatSuggestions" :key="s">
                                 <button class="chip" @click="sendChat(s)" :disabled="chatSending" x-text="s"></button>
                             </template>
                         </div>
-                        <form @submit.prevent="sendChat()" class="chat-input flex items-center gap-2 pl-3 pr-1.5 py-1.5">
-                            <i data-lucide="terminal" class="w-4 h-4 text-cyan-400/70 shrink-0"></i>
-                            <input x-model="chatInput" maxlength="800" :placeholder="'Scrivi un ordine al ' + (persona === 'coo' ? 'COO' : 'Risk Manager') + '…'"
-                                   class="flex-1 min-w-0 bg-transparent text-sm text-slate-100 placeholder-slate-500 focus:outline-none h-8">
-                            <button type="submit" class="btn btn-cyan" :disabled="chatSending || !chatInput.trim()"><i data-lucide="send" class="w-3.5 h-3.5"></i><span class="hidden sm:inline">Invia</span></button>
-                        </form>
+                    </div>
+                    <div x-ref="chat" class="border-t border-zinc-800 overflow-y-auto scroll-thin max-h-[380px] px-3 py-2 space-y-2.5">
+                        <div x-show="!personaMessages().length" class="py-3 text-[12px] text-zinc-500" x-text="personas[persona].tagline"></div>
+                        <template x-for="m in personaMessages()" :key="m.id">
+                            <div>
+                                <template x-if="m.role === 'user'">
+                                    <div class="flex gap-2 text-[12.5px]"><span class="mono text-zinc-600">›</span>
+                                        <span class="text-zinc-200" x-text="m.text"></span>
+                                        <span class="ml-auto mono text-[10.5px] text-zinc-600 shrink-0" x-text="m.time || ''"></span></div>
+                                </template>
+                                <template x-if="m.role !== 'user'">
+                                    <div class="reply ml-3" :class="'v-' + (m.verdict || 'INFO')">
+                                        <div class="flex items-center gap-2">
+                                            <span class="verdict" :class="verdictTone(m.verdict)" x-text="m.verdict || 'INFO'"></span>
+                                            <span class="text-[11px] text-zinc-500" x-text="m.author"></span>
+                                        </div>
+                                        <div class="text-[12.5px] text-zinc-300 leading-relaxed" x-text="m.text"></div>
+                                    </div>
+                                </template>
+                            </div>
+                        </template>
                     </div>
                 </section>
 
-                <!-- FEED OLOGRAFICO -->
-                <section class="glass hud-corners xl:col-span-2 flex flex-col min-h-[560px]">
+                <!-- FEED EVENTI -->
+                <section class="glass xl:col-span-2 flex flex-col">
                     <div class="panel-head">
-                        <h2 class="panel-title">Telemetria olografica</h2>
-                        <span class="flex items-center gap-1.5 text-[11px] text-slate-500 num">
-                            <span class="status-led" :class="streamAlive() ? 'tone-emerald blink' : 'tone-slate'"></span>
-                            <span x-text="dialogue.length + ' segnali · live'"></span></span>
+                        <h2 class="panel-title">Eventi agenti</h2>
+                        <span class="flex items-center gap-1.5 text-[11px] text-zinc-500 num">
+                            <span class="dot" :class="streamAlive() ? 'dot-active' : 'dot-paused'"></span>
+                            <span x-text="dialogue.length + ' eventi'"></span></span>
                     </div>
-                    <div class="holo-feed scroll-thin flex-1 p-3 max-h-[560px]">
+                    <div class="overflow-y-auto scroll-thin max-h-[470px] py-1">
                         <template x-for="d in feed()" :key="d.id">
-                            <div class="holo-card" :class="'lv-' + (d.level || 'info')">
-                                <div class="flex items-center gap-2 text-[10.5px]">
-                                    <span class="font-semibold truncate" :class="agentColor(d.agent)" x-text="d.agent"></span>
-                                    <span class="ml-auto text-slate-600 num shrink-0" x-text="d.time"></span>
-                                </div>
-                                <div class="mt-0.5 text-[12px] text-slate-200 leading-snug break-words" x-text="d.text"></div>
+                            <div class="feed-row">
+                                <span class="mono text-zinc-600" x-text="d.time"></span>
+                                <span class="feed-agent truncate text-zinc-400" :title="d.agent" x-text="d.agent"></span>
+                                <span class="break-words" :class="levelColor(d.level)" x-text="d.text"></span>
                             </div>
                         </template>
-                        <div x-show="!dialogue.length" class="text-sm text-slate-500 p-2">In attesa dei segnali degli agenti…</div>
+                        <div x-show="!dialogue.length" class="px-3 py-2 text-zinc-500">In attesa degli eventi…</div>
                     </div>
                 </section>
             </div>
 
-            <!-- Mandato del CIO in linguaggio semplice -->
-            <section class="glass hud-corners">
+            <!-- Ultima decisione del CIO -->
+            <section class="glass">
                 <div class="panel-head">
-                    <h2 class="panel-title">Ultima decisione del direttore (CIO)</h2>
-                    <span class="text-[11px] text-slate-500 num" x-text="cio.source ? cio.source + ' · ' + (cio.timestamp || '') : ''"></span>
+                    <h2 class="panel-title">Ultima decisione CIO</h2>
+                    <span class="text-[11px] text-zinc-500 num" x-text="cio.source ? cio.source + ' · ' + (cio.timestamp || '') : ''"></span>
                 </div>
-                <div class="p-4 flex flex-wrap items-start gap-4">
-                    <template x-if="!cio.action"><div class="text-sm text-slate-500">In attesa del primo ciclo del CIO.</div></template>
+                <div class="px-3 py-2.5 flex flex-wrap items-center gap-3">
+                    <template x-if="!cio.action"><span class="text-zinc-500">In attesa del primo ciclo del CIO.</span></template>
                     <template x-if="cio.action">
-                        <div class="flex flex-wrap items-start gap-4 w-full">
-                            <span class="hud-badge" :class="cio.action === 'BUY' ? 'tone-emerald' : cio.action === 'SELL' ? 'tone-rose' : cio.action === 'ROTATE' ? 'tone-cyan' : 'tone-slate'">
-                                <span class="core"></span><span x-text="{ BUY: 'COMPRA', SELL: 'VENDI', ROTATE: 'SPOSTA CAPITALE', HOLD: 'ATTENDE' }[cio.action] || cio.action"></span></span>
-                            <div class="flex-1 min-w-[240px]">
-                                <div class="num text-slate-100" x-text="cioTarget()"></div>
-                                <p class="mt-1 text-sm text-slate-300 leading-relaxed" x-text="cio.reason"></p>
-                            </div>
+                        <div class="flex flex-wrap items-center gap-3 w-full">
+                            <span class="pill mono" :class="cio.action === 'BUY' ? 'pill-up' : cio.action === 'SELL' ? 'pill-down' : cio.action === 'ROTATE' ? 'pill-accent' : 'pill-muted'" x-text="cio.action"></span>
+                            <span class="mono text-zinc-100" x-text="cioTarget()"></span>
+                            <span class="text-zinc-400 flex-1 min-w-[240px] truncate" :title="cio.reason" x-text="cio.reason"></span>
                         </div>
                     </template>
                 </div>
@@ -288,67 +243,67 @@
         </div>
 
         <!-- ================================================================ MERCATI -->
-        <div x-show="tab === 'markets'" x-cloak class="tab-panel space-y-6">
+        <div x-show="tab === 'markets'" x-cloak class="space-y-4">
         <!-- ============ 5 CANALI DI INTELLIGENCE ============ -->
-        <section class="glass hud-corners">
-            <div class="px-4 py-3 border-b border-sky-400/10 flex flex-wrap items-center justify-between gap-2">
+        <section class="glass">
+            <div class="px-4 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2">
                 <h2 class="panel-title">Canali di intelligence</h2>
-                <span class="text-[11px] text-slate-500 num" x-text="channels.timestamp ? shortTime(channels.timestamp) + ' · ' + channels.scouts + ' micro-scout (' + channels.workers + ' worker) · dati ' + channels.download_s + 's · calcoli ' + channels.scouts_ms + 'ms · prossima scansione ' + mmss(radar.next_scan_in) : 'In attesa della prima scansione dello sciame'"></span>
+                <span class="text-[11px] text-zinc-500 num" x-text="channels.timestamp ? shortTime(channels.timestamp) + ' · ' + channels.scouts + ' micro-scout (' + channels.workers + ' worker) · dati ' + channels.download_s + 's · calcoli ' + channels.scouts_ms + 'ms · prossima scansione ' + mmss(radar.next_scan_in) : 'In attesa della prima scansione dello sciame'"></span>
             </div>
-            <div class="grid grid-cols-1 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-slate-800">
+            <div class="grid grid-cols-1 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x divide-zinc-800">
                 <div class="p-4 space-y-1.5 text-xs">
-                    <div class="text-[11px] uppercase tracking-wider text-slate-500">1 · Macro & volatilità</div>
-                    <div class="num"><span class="text-slate-400">VIX </span>
-                        <span :class="macro.risk_contraction ? 'text-rose-400' : 'text-slate-100'" x-text="macro.vix ?? '—'"></span>
-                        <span class="text-rose-400" x-show="macro.risk_contraction"> contrazione</span></div>
+                    <div class="text-[11px] uppercase tracking-wider text-zinc-500">1 · Macro & volatilità</div>
+                    <div class="num"><span class="text-zinc-400">VIX </span>
+                        <span :class="macro.risk_contraction ? 'text-red-500' : 'text-zinc-100'" x-text="macro.vix ?? '—'"></span>
+                        <span class="text-red-500" x-show="macro.risk_contraction"> contrazione</span></div>
                     <template x-for="(v, k) in (macro.indices || {})" :key="k">
-                        <div class="num"><span class="text-slate-400" x-text="k + ' '"></span>
-                            <span :class="v.trend === 'RIALZISTA' ? 'text-emerald-400' : 'text-rose-400'" x-text="v.trend.toLowerCase()"></span></div>
+                        <div class="num"><span class="text-zinc-400" x-text="k + ' '"></span>
+                            <span :class="v.trend === 'RIALZISTA' ? 'text-emerald-500' : 'text-red-500'" x-text="v.trend.toLowerCase()"></span></div>
                     </template>
-                    <div class="num text-slate-400" x-text="macro.regime ? 'Azioni ' + macro.regime.stock + ' · Crypto ' + macro.regime.crypto : ''"></div>
+                    <div class="num text-zinc-400" x-text="macro.regime ? 'Azioni ' + macro.regime.stock + ' · Crypto ' + macro.regime.crypto : ''"></div>
                     <template x-if="radar.pulse">
                         <div class="pt-2 space-y-0.5">
-                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Pulse pre/post-market</div>
+                            <div class="text-[11px] uppercase tracking-wider text-zinc-500">Pulse pre/post-market</div>
                             <template x-for="m in (radar.pulse.top_moves || []).slice(0, 5)" :key="m.symbol">
-                                <div class="num flex justify-between"><span class="text-slate-400" x-text="m.symbol"></span>
+                                <div class="num flex justify-between"><span class="text-zinc-400" x-text="m.symbol"></span>
                                     <span :class="tone(m.move_pct)" x-text="pct(m.move_pct)"></span></div>
                             </template>
-                            <div class="text-[10px] text-slate-600 num" x-text="'aggiornato ' + shortTime(radar.pulse.timestamp) + ' · ogni 15 min'"></div>
+                            <div class="text-[10px] text-zinc-600 num" x-text="'aggiornato ' + shortTime(radar.pulse.timestamp) + ' · ogni 15 min'"></div>
                         </div>
                     </template>
                 </div>
                 <div class="p-4 space-y-1.5 text-xs">
-                    <div class="text-[11px] uppercase tracking-wider text-slate-500">4 · Sentiment crypto</div>
+                    <div class="text-[11px] uppercase tracking-wider text-zinc-500">4 · Sentiment crypto</div>
                     <div class="num" x-show="channels.fear_greed">
-                        <span class="text-slate-100" x-text="channels.fear_greed ? channels.fear_greed.value : ''"></span>
-                        <span class="text-slate-400" x-text="channels.fear_greed ? ' ' + channels.fear_greed.label : ''"></span>
+                        <span class="text-zinc-100" x-text="channels.fear_greed ? channels.fear_greed.value : ''"></span>
+                        <span class="text-zinc-400" x-text="channels.fear_greed ? ' ' + channels.fear_greed.label : ''"></span>
                     </div>
-                    <div class="text-[11px] text-slate-500">Fear &amp; Greed Index. Notizie e trimestrali sono verificate dal Comitato su ogni scheda.</div>
-                    <div class="text-[11px] uppercase tracking-wider text-slate-500 pt-2">Panieri</div>
-                    <div class="text-[11px] text-sky-400/90" x-text="channels.mode || ''"></div>
+                    <div class="text-[11px] text-zinc-500">Fear &amp; Greed Index. Notizie e trimestrali sono verificate dal Comitato su ogni scheda.</div>
+                    <div class="text-[11px] uppercase tracking-wider text-zinc-500 pt-2">Panieri</div>
+                    <div class="text-[11px] text-indigo-400" x-text="channels.mode || ''"></div>
                     <template x-for="b in (channels.baskets || [])" :key="b.name">
-                        <div class="flex justify-between gap-2"><span :class="b.current ? 'text-slate-100' : 'text-slate-400'" x-text="(b.current ? '▸ ' : '') + b.name"></span>
-                            <span class="num" :class="b.anomalies ? 'text-amber-400' : 'text-slate-500'" x-text="b.tickers + ' · ' + b.anomalies + ' anomalie'"></span></div>
+                        <div class="flex justify-between gap-2"><span :class="b.current ? 'text-zinc-100' : 'text-zinc-400'" x-text="(b.current ? '▸ ' : '') + b.name"></span>
+                            <span class="num" :class="b.anomalies ? 'text-amber-400' : 'text-zinc-500'" x-text="b.tickers + ' · ' + b.anomalies + ' anomalie'"></span></div>
                     </template>
                 </div>
                 <div class="p-4 lg:col-span-2 overflow-x-auto scroll-thin">
-                    <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">2 · Multi-timeframe · 3 · Order flow · 5 · Correlazioni — migliori score</div>
+                    <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">2 · Multi-timeframe · 3 · Order flow · 5 · Correlazioni — migliori score</div>
                     <table class="w-full text-[11px] num">
-                        <thead><tr class="text-slate-500 text-left">
+                        <thead><tr class="text-zinc-500 text-left">
                             <th class="font-medium py-1 pr-3">Ticker</th><th class="font-medium py-1 pr-3 text-right">Score</th>
                             <th class="font-medium py-1 pr-3 text-right">MTF</th><th class="font-medium py-1 pr-3 text-right">RVOL</th>
                             <th class="font-medium py-1 pr-3 text-right">VWAP</th><th class="font-medium py-1 pr-3 text-right">Beta</th><th class="font-medium py-1 text-right">Corr</th>
                         </tr></thead>
                         <tbody>
                             <template x-for="t in (channels.top || [])" :key="t.symbol">
-                                <tr class="border-t border-sky-400/10/60">
-                                    <td class="py-1 pr-3 text-slate-200" x-text="t.symbol"></td>
-                                    <td class="py-1 pr-3 text-right text-slate-200" x-text="t.score"></td>
-                                    <td class="py-1 pr-3 text-right" :class="t.mtf >= 2 ? 'text-emerald-400' : 'text-slate-500'" x-text="t.mtf + '/3'"></td>
-                                    <td class="py-1 pr-3 text-right" :class="t.rvol >= 1.2 ? 'text-slate-200' : 'text-slate-500'" x-text="t.rvol != null ? t.rvol + 'x' : '—'"></td>
+                                <tr class="border-t border-zinc-800/60">
+                                    <td class="py-1 pr-3 text-zinc-200" x-text="t.symbol"></td>
+                                    <td class="py-1 pr-3 text-right text-zinc-200" x-text="t.score"></td>
+                                    <td class="py-1 pr-3 text-right" :class="t.mtf >= 2 ? 'text-emerald-500' : 'text-zinc-500'" x-text="t.mtf + '/3'"></td>
+                                    <td class="py-1 pr-3 text-right" :class="t.rvol >= 1.2 ? 'text-zinc-200' : 'text-zinc-500'" x-text="t.rvol != null ? t.rvol + 'x' : '—'"></td>
                                     <td class="py-1 pr-3 text-right" :class="tone(t.vwap_dist)" x-text="t.vwap_dist != null ? pct(t.vwap_dist) : '—'"></td>
-                                    <td class="py-1 pr-3 text-right text-slate-400" x-text="t.beta ?? '—'"></td>
-                                    <td class="py-1 text-right text-slate-400" x-text="t.corr ?? '—'"></td>
+                                    <td class="py-1 pr-3 text-right text-zinc-400" x-text="t.beta ?? '—'"></td>
+                                    <td class="py-1 text-right text-zinc-400" x-text="t.corr ?? '—'"></td>
                                 </tr>
                             </template>
                         </tbody>
@@ -359,50 +314,50 @@
 
         <section class="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
             <!-- Tier 2-3: coda delle schede e Comitato Rischi -->
-            <div class="xl:col-span-2 glass hud-corners">
-                <div class="px-4 py-3 border-b border-sky-400/10 flex items-center justify-between">
+            <div class="xl:col-span-2 glass">
+                <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
                     <h2 class="panel-title">Trade pitches · Chief of Staff &amp; Comitato Rischi</h2>
-                    <span class="text-[11px] text-slate-500" x-text="'TTL ' + (radar.ttl_minutes || 15) + ' min · cooldown 60 min'"></span>
+                    <span class="text-[11px] text-zinc-500" x-text="'TTL ' + (radar.ttl_minutes || 15) + ' min · cooldown 60 min'"></span>
                 </div>
                 <div class="p-4 space-y-2">
                     <template x-if="!(radar.queue || []).length">
-                        <div class="text-xs text-slate-500">Nessuna scheda attiva in coda.</div>
+                        <div class="text-xs text-zinc-500">Nessuna scheda attiva in coda.</div>
                     </template>
                     <template x-for="q in (radar.queue || [])" :key="q.symbol + q.discovered_at">
-                        <div class="rounded border border-sky-400/10 px-3 py-2.5 text-xs">
+                        <div class="rounded border border-zinc-800 px-3 py-2.5 text-xs">
                             <div class="flex flex-wrap items-center justify-between gap-2">
                                 <span class="flex items-center gap-2">
-                                    <span class="num text-slate-100" x-text="q.symbol"></span>
-                                    <span class="text-slate-500" x-text="q.sector"></span>
+                                    <span class="num text-zinc-100" x-text="q.symbol"></span>
+                                    <span class="text-zinc-500" x-text="q.sector"></span>
                                 </span>
                                 <span class="flex items-center gap-2">
                                     <span class="num text-[10px] px-1.5 py-0.5 rounded border" :class="statusStyle(q.status)" x-text="statusLabel(q.status)"></span>
-                                    <span class="num" :class="q.ttl_seconds < 180 ? 'text-amber-400' : 'text-slate-400'" x-text="mmss(q.ttl_seconds)"></span>
+                                    <span class="num" :class="q.ttl_seconds < 180 ? 'text-amber-400' : 'text-zinc-400'" x-text="mmss(q.ttl_seconds)"></span>
                                 </span>
                             </div>
-                            <div class="mt-1 num text-[11px] text-slate-400"
+                            <div class="mt-1 num text-[11px] text-zinc-400"
                                  x-text="'score ' + q.score + ' · ' + (q.anomalies || []).join(', ') + ' · MTF ' + q.mtf_aligned + '/3 · RVOL ' + q.rvol + 'x · VWAP ' + pct(q.vwap_dist_pct) + (q.beta != null ? ' · beta ' + q.beta : '')"></div>
-                            <div x-show="q.package" class="mt-1 num text-[11px] text-slate-300"
+                            <div x-show="q.package" class="mt-1 num text-[11px] text-zinc-300"
                                  x-text="q.package ? 'Target ' + usd(q.package.target_price) + ' · stop ATR ' + q.package.stop_pct + '%' : ''"></div>
                             <div class="mt-1.5 grid grid-cols-1 sm:grid-cols-3 gap-1.5" x-show="(q.gates || []).length">
                                 <template x-for="g in (q.gates || [])" :key="g.agent">
-                                    <div class="rounded-lg bg-slate-950/50 border border-sky-400/10 px-2 py-1 text-[11px]">
-                                        <span :class="g.veto ? 'text-rose-400' : 'text-emerald-400'" x-text="(g.veto ? '✕ ' : '✓ ') + g.agent"></span>
-                                        <div class="text-slate-500 num truncate" :title="g.detail" x-text="g.detail"></div>
+                                    <div class="rounded-md bg-[#0c0c0e] border border-zinc-800 px-2 py-1 text-[11px]">
+                                        <span :class="g.veto ? 'text-red-500' : 'text-emerald-500'" x-text="(g.veto ? '✕ ' : '✓ ') + g.agent"></span>
+                                        <div class="text-zinc-500 num truncate" :title="g.detail" x-text="g.detail"></div>
                                     </div>
                                 </template>
                             </div>
-                            <div x-show="q.note" class="mt-1 text-[11px] text-slate-500" x-text="q.note"></div>
+                            <div x-show="q.note" class="mt-1 text-[11px] text-zinc-500" x-text="q.note"></div>
                         </div>
                     </template>
 
                     <div x-show="vetoes().length" class="pt-2">
-                        <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Veti del Comitato Rischi</div>
+                        <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">Veti del Comitato Rischi</div>
                         <div class="space-y-1">
                             <template x-for="r in vetoes()" :key="r.symbol + r.updated_at">
                                 <div class="text-[11px] flex gap-2">
-                                    <span class="num text-rose-400 shrink-0 w-14" x-text="r.symbol"></span>
-                                    <span class="text-slate-400" x-text="(r.vetoes || []).join(' · ') || r.note"></span>
+                                    <span class="num text-red-500 shrink-0 w-14" x-text="r.symbol"></span>
+                                    <span class="text-zinc-400" x-text="(r.vetoes || []).join(' · ') || r.note"></span>
                                 </div>
                             </template>
                         </div>
@@ -411,41 +366,41 @@
                         <template x-for="r in otherRecent()" :key="r.symbol + r.updated_at + r.status">
                             <div class="text-[11px] flex gap-2">
                                 <span class="num shrink-0 w-20" :class="statusStyle(r.status, true)" x-text="statusLabel(r.status)"></span>
-                                <span class="num text-slate-300 shrink-0" x-text="r.symbol"></span>
-                                <span class="text-slate-500 truncate" x-text="r.note"></span>
+                                <span class="num text-zinc-300 shrink-0" x-text="r.symbol"></span>
+                                <span class="text-zinc-500 truncate" x-text="r.note"></span>
                             </div>
                         </template>
                     </div>
-                    <div x-show="(radar.cooldown || []).length" class="pt-1 text-[11px] text-slate-500">
-                        Cooldown: <span class="num text-slate-400" x-text="(radar.cooldown || []).map(c => c.symbol + ' ' + c.minutes + 'm').join('  ')"></span>
+                    <div x-show="(radar.cooldown || []).length" class="pt-1 text-[11px] text-zinc-500">
+                        Cooldown: <span class="num text-zinc-400" x-text="(radar.cooldown || []).map(c => c.symbol + ' ' + c.minutes + 'm').join('  ')"></span>
                     </div>
                 </div>
             </div>
 
             <!-- Tier 4: mandato del CIO -->
-            <div class="glass hud-corners">
-                <div class="px-4 py-3 border-b border-sky-400/10 flex items-center justify-between">
+            <div class="glass">
+                <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
                     <h2 class="panel-title">Mandato CIO</h2>
-                    <span class="text-[11px] text-slate-500 num" x-text="cio.source ? cio.source + ' · ' + (cio.timestamp || '') : ''"></span>
+                    <span class="text-[11px] text-zinc-500 num" x-text="cio.source ? cio.source + ' · ' + (cio.timestamp || '') : ''"></span>
                 </div>
                 <div class="p-4">
                     <template x-if="!cio.action">
-                        <div class="text-sm text-slate-500">In attesa del primo ciclo del CIO.</div>
+                        <div class="text-sm text-zinc-500">In attesa del primo ciclo del CIO.</div>
                     </template>
                     <template x-if="cio.action">
                         <div class="space-y-3">
                             <div class="flex items-center gap-3">
                                 <span class="num text-xs font-medium px-2 py-1 rounded border" :class="actionStyle(cio.action)" x-text="cio.action"></span>
-                                <span class="num text-slate-100" x-text="cioTarget()"></span>
+                                <span class="num text-zinc-100" x-text="cioTarget()"></span>
                             </div>
                             <dl class="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
-                                <div><dt class="text-[11px] uppercase tracking-wider text-slate-500">Convinzione</dt><dd class="num text-slate-100" x-text="cio.conviction ?? '—'"></dd></div>
-                                <div><dt class="text-[11px] uppercase tracking-wider text-slate-500">Allocazione</dt><dd class="num text-slate-100" x-text="cio.allocation_pct != null ? cio.allocation_pct + '%' : '—'"></dd></div>
-                                <div><dt class="text-[11px] uppercase tracking-wider text-slate-500">Importo</dt><dd class="num text-slate-100" x-text="cio.amount != null ? usd(cio.amount) : '—'"></dd></div>
-                                <div><dt class="text-[11px] uppercase tracking-wider text-slate-500">Stop ATR</dt><dd class="num text-slate-100" x-text="cio.stop_pct != null ? cio.stop_pct + '%' : '—'"></dd></div>
+                                <div><dt class="text-[11px] uppercase tracking-wider text-zinc-500">Convinzione</dt><dd class="num text-zinc-100" x-text="cio.conviction ?? '—'"></dd></div>
+                                <div><dt class="text-[11px] uppercase tracking-wider text-zinc-500">Allocazione</dt><dd class="num text-zinc-100" x-text="cio.allocation_pct != null ? cio.allocation_pct + '%' : '—'"></dd></div>
+                                <div><dt class="text-[11px] uppercase tracking-wider text-zinc-500">Importo</dt><dd class="num text-zinc-100" x-text="cio.amount != null ? usd(cio.amount) : '—'"></dd></div>
+                                <div><dt class="text-[11px] uppercase tracking-wider text-zinc-500">Stop ATR</dt><dd class="num text-zinc-100" x-text="cio.stop_pct != null ? cio.stop_pct + '%' : '—'"></dd></div>
                             </dl>
-                            <p class="text-sm leading-relaxed text-slate-300 border-l-2 border-slate-700 pl-3" x-text="cio.reason"></p>
-                            <div class="space-y-0.5 text-[11px] text-slate-500">
+                            <p class="text-sm leading-relaxed text-zinc-300 border-l-2 border-zinc-700 pl-3" x-text="cio.reason"></p>
+                            <div class="space-y-0.5 text-[11px] text-zinc-500">
                                 <div x-text="'Attivazione: ' + (cio.trigger || '—')"></div>
                                 <div x-show="cio.proposal && cio.proposal !== cioDescription()" x-text="'Proposta originale: ' + cio.proposal"></div>
                                 <template x-for="n in (cio.notes || [])" :key="n"><div x-text="'· ' + n"></div></template>
@@ -459,26 +414,26 @@
         </div>
 
         <!-- ================================================================ PORTAFOGLIO -->
-        <div x-show="tab === 'portfolio'" x-cloak class="tab-panel space-y-6">
-        <section class="flex flex-wrap gap-x-8 gap-y-2 px-1 text-xs text-slate-500">
-            <span>Trade chiusi (90gg) <span class="num text-slate-200" x-text="perf.trades ?? '—'"></span></span>
-            <span>Win rate <span class="num text-slate-200" x-text="perf.win_rate != null ? perf.win_rate + '%' : '—'"></span></span>
+        <div x-show="tab === 'portfolio'" x-cloak class="space-y-4">
+        <section class="flex flex-wrap gap-x-8 gap-y-2 px-1 text-xs text-zinc-500">
+            <span>Trade chiusi (90gg) <span class="num text-zinc-200" x-text="perf.trades ?? '—'"></span></span>
+            <span>Win rate <span class="num text-zinc-200" x-text="perf.win_rate != null ? perf.win_rate + '%' : '—'"></span></span>
             <span>PnL realizzato <span class="num" :class="tone(perf.pnl)" x-text="usd(perf.pnl, true)"></span></span>
-            <span>Permanenza media <span class="num text-slate-200" x-text="duration(perf.avg_held_min)"></span></span>
-            <span>Cash <span class="num text-slate-200" x-text="usd(account.cash)"></span></span>
-            <span x-show="perf.best">Migliore <span class="num text-emerald-400" x-text="perf.best ? perf.best.symbol + ' ' + usd(perf.best.pnl, true) : ''"></span></span>
-            <span x-show="perf.worst">Peggiore <span class="num text-rose-400" x-text="perf.worst ? perf.worst.symbol + ' ' + usd(perf.worst.pnl, true) : ''"></span></span>
+            <span>Permanenza media <span class="num text-zinc-200" x-text="duration(perf.avg_held_min)"></span></span>
+            <span>Cash <span class="num text-zinc-200" x-text="usd(account.cash)"></span></span>
+            <span x-show="perf.best">Migliore <span class="num text-emerald-500" x-text="perf.best ? perf.best.symbol + ' ' + usd(perf.best.pnl, true) : ''"></span></span>
+            <span x-show="perf.worst">Peggiore <span class="num text-red-500" x-text="perf.worst ? perf.worst.symbol + ' ' + usd(perf.worst.pnl, true) : ''"></span></span>
         </section>
         <!-- ============ POSIZIONI ============ -->
-        <section class="glass hud-corners">
-            <div class="px-4 py-3 border-b border-sky-400/10 flex items-center justify-between">
+        <section class="glass">
+            <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
                 <h2 class="panel-title">Posizioni aperte</h2>
-                <span class="text-[11px] text-slate-500 num" x-text="positions.length + ' posizioni'"></span>
+                <span class="text-[11px] text-zinc-500 num" x-text="positions.length + ' posizioni'"></span>
             </div>
             <div class="overflow-x-auto scroll-thin">
                 <table class="w-full text-xs">
                     <thead>
-                        <tr class="border-b border-sky-400/10 text-slate-500 text-left">
+                        <tr class="border-b border-zinc-800 text-zinc-500 text-left">
                             <th class="font-medium px-4 py-2.5">Asset</th>
                             <th class="font-medium px-4 py-2.5 text-right">Quantità</th>
                             <th class="font-medium px-4 py-2.5 text-right">Allocazione CIO</th>
@@ -492,33 +447,33 @@
                         </tr>
                     </thead>
                     <tbody class="num" x-show="!positions.length">
-                        <tr><td colspan="10" class="px-4 py-4 text-slate-500 font-sans">Nessuna posizione aperta.</td></tr>
+                        <tr><td colspan="10" class="px-4 py-4 text-zinc-500 font-sans">Nessuna posizione aperta.</td></tr>
                     </tbody>
                     <template x-for="p in positions" :key="p.symbol">
-                        <tbody class="num border-b border-sky-400/10/70">
+                        <tbody class="num border-b border-zinc-800/70">
                             <tr class="table-row cursor-pointer" @click="openPosition(p)" title="Apri la scheda della posizione">
-                                <td class="px-4 py-2.5 text-slate-100">
+                                <td class="px-4 py-2.5 text-zinc-100">
                                     <span x-text="p.symbol"></span>
                                     <span x-show="p.trade_class === 'SUPER_CONVICTION'" class="ml-1 text-[10px] font-sans px-1 rounded bg-amber-500/15 text-amber-300">SUPER</span>
-                                    <span x-show="p.horizon" class="ml-1 text-[10px] font-sans text-slate-500" x-text="p.horizon === 'SWING_CATALYST' ? 'swing' : 'intraday'"></span>
-                                    <span x-show="p.scaled_out" class="ml-1 text-[10px] font-sans text-emerald-400">runner</span>
+                                    <span x-show="p.horizon" class="ml-1 text-[10px] font-sans text-zinc-500" x-text="p.horizon === 'SWING_CATALYST' ? 'swing' : 'intraday'"></span>
+                                    <span x-show="p.scaled_out" class="ml-1 text-[10px] font-sans text-emerald-500">runner</span>
                                 </td>
-                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="qty(p.qty)"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.conviction ?? '—'"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-400" x-text="usd(p.avg_entry_price)"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.current_price)"></td>
-                                <td class="px-4 py-2.5 text-right text-slate-300" x-text="usd(p.market_value)"></td>
+                                <td class="px-4 py-2.5 text-right text-zinc-300" x-text="qty(p.qty)"></td>
+                                <td class="px-4 py-2.5 text-right text-zinc-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
+                                <td class="px-4 py-2.5 text-right text-zinc-400" x-text="p.conviction ?? '—'"></td>
+                                <td class="px-4 py-2.5 text-right text-zinc-400" x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></td>
+                                <td class="px-4 py-2.5 text-right text-zinc-400" x-text="usd(p.avg_entry_price)"></td>
+                                <td class="px-4 py-2.5 text-right text-zinc-300" x-text="usd(p.current_price)"></td>
+                                <td class="px-4 py-2.5 text-right text-zinc-300" x-text="usd(p.market_value)"></td>
                                 <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></td>
                                 <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></td>
                             </tr>
                             <tr class="font-sans">
                                 <td colspan="10" class="px-4 pb-2.5 pt-0">
                                     <dl class="grid grid-cols-1 lg:grid-cols-3 gap-x-4 gap-y-1 text-[11px] leading-snug">
-                                        <div class="min-w-0"><dt class="inline text-sky-400">buy_thesis · </dt><dd class="inline text-slate-300" x-text="p.buy_thesis || '—'"></dd></div>
-                                        <div class="min-w-0"><dt class="inline text-amber-300">hold_rationale · </dt><dd class="inline text-slate-300" x-text="p.hold_rationale || '—'"></dd></div>
-                                        <div class="min-w-0"><dt class="inline text-rose-300">exit_reason · </dt><dd class="inline text-slate-300" x-text="p.exit_reason || 'nessuna uscita (posizione intera)'"></dd></div>
+                                        <div class="min-w-0"><dt class="inline text-indigo-400">buy_thesis · </dt><dd class="inline text-zinc-300" x-text="p.buy_thesis || '—'"></dd></div>
+                                        <div class="min-w-0"><dt class="inline text-amber-300">hold_rationale · </dt><dd class="inline text-zinc-300" x-text="p.hold_rationale || '—'"></dd></div>
+                                        <div class="min-w-0"><dt class="inline text-red-500">exit_reason · </dt><dd class="inline text-zinc-300" x-text="p.exit_reason || 'nessuna uscita (posizione intera)'"></dd></div>
                                     </dl>
                                 </td>
                             </tr>
@@ -529,18 +484,18 @@
         </section>
 
         <!-- ============ ULTIME CHIUSURE (exit_reason del Guardian) ============ -->
-        <section class="glass hud-corners" x-show="closedPositions.length">
-            <div class="px-4 py-3 border-b border-sky-400/10 flex items-center justify-between">
+        <section class="glass" x-show="closedPositions.length">
+            <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
                 <h2 class="panel-title">Ultime chiusure</h2>
-                <span class="text-[11px] text-slate-500 num" x-text="closedPositions.length + ' recenti'"></span>
+                <span class="text-[11px] text-zinc-500 num" x-text="closedPositions.length + ' recenti'"></span>
             </div>
-            <ul class="divide-y divide-slate-800/70 text-[11px]">
+            <ul class="divide-y divide-zinc-800/70 text-[11px]">
                 <template x-for="c in closedPositions" :key="c.symbol + c.closed_at">
                     <li class="px-4 py-2 space-y-0.5">
-                        <div class="flex items-center gap-2"><span class="text-slate-100 num" x-text="c.symbol"></span>
-                            <span class="text-slate-500 num" x-text="dateTime(c.closed_at)"></span></div>
-                        <div><span class="text-rose-300">exit_reason · </span><span class="text-slate-300" x-text="c.exit_reason"></span></div>
-                        <div x-show="c.buy_thesis"><span class="text-sky-400">buy_thesis · </span><span class="text-slate-400" x-text="c.buy_thesis"></span></div>
+                        <div class="flex items-center gap-2"><span class="text-zinc-100 num" x-text="c.symbol"></span>
+                            <span class="text-zinc-500 num" x-text="dateTime(c.closed_at)"></span></div>
+                        <div><span class="text-red-500">exit_reason · </span><span class="text-zinc-300" x-text="c.exit_reason"></span></div>
+                        <div x-show="c.buy_thesis"><span class="text-indigo-400">buy_thesis · </span><span class="text-zinc-400" x-text="c.buy_thesis"></span></div>
                     </li>
                 </template>
             </ul>
@@ -548,15 +503,15 @@
         </div>
 
         <!-- ================================================================ AUDIT -->
-        <div x-show="tab === 'audit'" x-cloak class="tab-panel space-y-6">
+        <div x-show="tab === 'audit'" x-cloak class="space-y-4">
         <!-- ============ AUDIT AGENTI & REVISIONI ============ -->
-        <section class="glass hud-corners">
-            <div class="px-4 py-3 border-b border-sky-400/10 flex flex-wrap items-center justify-between gap-2">
+        <section class="glass">
+            <div class="px-4 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2">
                 <h2 class="panel-title">📜 Audit agenti &amp; revisioni (ultime 5h)</h2>
                 <div class="flex flex-wrap gap-1 text-[11px]">
                     <template x-for="t in auditTabs" :key="t.id">
                         <button @click="auditTab = t.id" class="px-2.5 py-1 rounded border"
-                                :class="auditTab === t.id ? 'border-sky-500/60 bg-sky-500/10 text-sky-300' : 'border-sky-400/10 text-slate-400 hover:text-slate-200'"
+                                :class="auditTab === t.id ? 'border-indigo-500/40 bg-indigo-500/10 text-indigo-400' : 'border-zinc-800 text-zinc-400 hover:text-zinc-200'"
                                 x-text="t.label + (t.id === 'rejected' ? ' · ' + (audit.rejected?.total ?? 0) : t.id === 'executed' ? ' · ' + (audit.executed || []).length : '')"></button>
                     </template>
                 </div>
@@ -566,38 +521,38 @@
             <div x-show="auditTab === 'rejected'" class="p-4 space-y-3">
                 <div class="flex flex-wrap gap-1 text-[11px]">
                     <button @click="auditStage = ''" class="px-2 py-0.5 rounded border"
-                            :class="auditStage === '' ? 'border-slate-500 text-slate-200' : 'border-sky-400/10 text-slate-500'">Tutte</button>
+                            :class="auditStage === '' ? 'border-zinc-500 text-zinc-200' : 'border-zinc-800 text-zinc-500'">Tutte</button>
                     <template x-for="[st, n] in Object.entries(audit.rejected?.by_stage || {})" :key="st">
                         <button @click="auditStage = st" class="px-2 py-0.5 rounded border num"
-                                :class="auditStage === st ? 'border-slate-500 text-slate-200' : 'border-sky-400/10 text-slate-500'"
+                                :class="auditStage === st ? 'border-zinc-500 text-zinc-200' : 'border-zinc-800 text-zinc-500'"
                                 x-text="st + ' ' + n"></button>
                     </template>
                 </div>
                 <div class="overflow-x-auto max-h-96 overflow-y-auto scroll-thin">
                     <table class="w-full text-xs">
-                        <thead class="sticky top-0 bg-slate-900">
-                            <tr class="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                        <thead class="sticky top-0 bg-zinc-900">
+                            <tr class="text-left text-[11px] uppercase tracking-wider text-zinc-500">
                                 <th class="py-1.5 pr-3 font-medium">Ora</th><th class="py-1.5 pr-3 font-medium">Ticker</th>
                                 <th class="py-1.5 pr-3 font-medium">Stage</th><th class="py-1.5 pr-3 font-medium text-right">Score</th>
                                 <th class="py-1.5 pr-3 font-medium">Veto</th><th class="py-1.5 font-medium">Motivazione</th>
                             </tr>
                         </thead>
-                        <tbody class="divide-y divide-slate-800/70">
+                        <tbody class="divide-y divide-zinc-800/70">
                             <template x-if="!auditRejected().length">
-                                <tr><td colspan="6" class="py-3 text-slate-500">Nessuna scheda bocciata nelle ultime 5 ore.</td></tr>
+                                <tr><td colspan="6" class="py-3 text-zinc-500">Nessuna scheda bocciata nelle ultime 5 ore.</td></tr>
                             </template>
                             <template x-for="r in auditRejected()" :key="r.symbol + r.stage">
                                 <tr class="align-top">
-                                    <td class="py-1.5 pr-3 num text-slate-400 whitespace-nowrap" x-text="(r.time || '').slice(11, 19)"></td>
-                                    <td class="py-1.5 pr-3 num text-slate-100 whitespace-nowrap" x-text="r.symbol"></td>
-                                    <td class="py-1.5 pr-3 whitespace-nowrap" :class="r.status === 'EXPIRED' ? 'text-amber-400/90' : 'text-slate-400'"
+                                    <td class="py-1.5 pr-3 num text-zinc-400 whitespace-nowrap" x-text="(r.time || '').slice(11, 19)"></td>
+                                    <td class="py-1.5 pr-3 num text-zinc-100 whitespace-nowrap" x-text="r.symbol"></td>
+                                    <td class="py-1.5 pr-3 whitespace-nowrap" :class="r.status === 'EXPIRED' ? 'text-amber-400/90' : 'text-zinc-400'"
                                         x-text="r.stage + (r.status === 'EXPIRED' ? ' · scaduta' : '')"></td>
-                                    <td class="py-1.5 pr-3 num text-right text-slate-300" x-text="r.score ?? '—'"></td>
-                                    <td class="py-1.5 pr-3 text-rose-400 whitespace-nowrap" x-text="r.veto_agent"></td>
-                                    <td class="py-1.5 text-slate-400">
+                                    <td class="py-1.5 pr-3 num text-right text-zinc-300" x-text="r.score ?? '—'"></td>
+                                    <td class="py-1.5 pr-3 text-red-500 whitespace-nowrap" x-text="r.veto_agent"></td>
+                                    <td class="py-1.5 text-zinc-400">
                                         <span x-text="r.reason"></span>
-                                        <span x-show="r.count > 1" class="num text-slate-600" x-text="' · ×' + r.count"></span>
-                                        <span x-show="r.outcome" class="num" :class="r.outcome === 'lifesaver' ? 'text-emerald-400' : 'text-amber-400'"
+                                        <span x-show="r.count > 1" class="num text-zinc-600" x-text="' · ×' + r.count"></span>
+                                        <span x-show="r.outcome" class="num" :class="r.outcome === 'lifesaver' ? 'text-emerald-500' : 'text-amber-400'"
                                               x-text="r.outcome === 'lifesaver' ? ' · veto salvavita (' + pct(r.outcome_move_pct) + ')' : ' · falso allarme (' + pct(r.outcome_move_pct) + ')'"></span>
                                     </td>
                                 </tr>
@@ -610,35 +565,35 @@
             <!-- Approvate & storico -->
             <div x-show="auditTab === 'executed'" class="p-4 space-y-3">
                 <template x-if="!(audit.executed || []).length">
-                    <div class="text-xs text-slate-500">Nessuna scheda approvata ed eseguita registrata.</div>
+                    <div class="text-xs text-zinc-500">Nessuna scheda approvata ed eseguita registrata.</div>
                 </template>
                 <template x-for="e in (audit.executed || [])" :key="e.symbol + e.time">
-                    <div class="rounded border px-3 py-2.5 text-xs" :class="e.in_portfolio ? 'border-emerald-500/40' : 'border-sky-400/10'">
+                    <div class="rounded border px-3 py-2.5 text-xs" :class="e.in_portfolio ? 'border-emerald-500/30' : 'border-zinc-800'">
                         <div class="flex flex-wrap items-center justify-between gap-2">
                             <span class="flex items-center gap-2">
-                                <span class="num text-slate-100" x-text="e.symbol"></span>
-                                <span x-show="e.in_portfolio" class="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/40 text-emerald-300">in portafoglio</span>
-                                <span class="text-slate-500" x-text="e.origin || ''"></span>
+                                <span class="num text-zinc-100" x-text="e.symbol"></span>
+                                <span x-show="e.in_portfolio" class="text-[10px] px-1.5 py-0.5 rounded border border-emerald-500/30 text-emerald-500">in portafoglio</span>
+                                <span class="text-zinc-500" x-text="e.origin || ''"></span>
                             </span>
-                            <span class="num text-slate-500" x-text="(e.time || '').replace('T', ' ').slice(0, 19)"></span>
+                            <span class="num text-zinc-500" x-text="(e.time || '').replace('T', ' ').slice(0, 19)"></span>
                         </div>
-                        <div class="mt-1 num text-[11px] text-slate-300"
+                        <div class="mt-1 num text-[11px] text-zinc-300"
                              x-text="e.decision + (e.cio?.conviction != null ? ' · convinzione ' + e.cio.conviction : '') + (e.cio?.allocation_pct != null ? ' · allocazione ' + e.cio.allocation_pct + '%' : '') + (e.cio?.amount != null ? ' · ' + usd(e.cio.amount) : '')"></div>
-                        <p x-show="e.cio?.reason" class="mt-1.5 text-[12px] leading-relaxed text-slate-300 border-l-2 border-slate-700 pl-2" x-text="'Perché il CIO ha comprato: ' + (e.cio?.reason || '')"></p>
-                        <div x-show="e.package" class="mt-1 num text-[11px] text-slate-400"
+                        <p x-show="e.cio?.reason" class="mt-1.5 text-[12px] leading-relaxed text-zinc-300 border-l-2 border-zinc-700 pl-2" x-text="'Perché il CIO ha comprato: ' + (e.cio?.reason || '')"></p>
+                        <div x-show="e.package" class="mt-1 num text-[11px] text-zinc-400"
                              x-text="e.package ? 'Ingresso ' + usd(e.package.entry_price) + ' · target ' + usd(e.package.target_price) + ' · stop ATR ' + e.package.stop_pct + '%' : ''"></div>
-                        <div x-show="(e.anomalies || []).length" class="mt-1 text-[11px] text-slate-500" x-text="'Anomalie Scout: ' + (e.anomalies || []).join(', ') + (e.score != null ? ' · score ' + e.score : '')"></div>
+                        <div x-show="(e.anomalies || []).length" class="mt-1 text-[11px] text-zinc-500" x-text="'Anomalie Scout: ' + (e.anomalies || []).join(', ') + (e.score != null ? ' · score ' + e.score : '')"></div>
                         <div class="mt-2 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-1.5">
                             <template x-for="v in agentVotes(e.agents)" :key="v.name">
-                                <div class="rounded-lg bg-slate-950/50 border border-sky-400/10 px-2 py-1 text-[11px]">
-                                    <div class="text-slate-500" x-text="v.name"></div>
+                                <div class="rounded-md bg-[#0c0c0e] border border-zinc-800 px-2 py-1 text-[11px]">
+                                    <div class="text-zinc-500" x-text="v.name"></div>
                                     <div class="num" :class="v.cls" x-text="v.value"></div>
                                 </div>
                             </template>
                         </div>
                         <div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5" x-show="(e.risk_gates || []).length">
                             <template x-for="g in (e.risk_gates || [])" :key="g.agent">
-                                <span class="text-[11px]" :class="g.veto ? 'text-rose-400' : 'text-emerald-400'" :title="g.detail" x-text="(g.veto ? '✕ ' : '✓ ') + g.agent"></span>
+                                <span class="text-[11px]" :class="g.veto ? 'text-red-500' : 'text-emerald-500'" :title="g.detail" x-text="(g.veto ? '✕ ' : '✓ ') + g.agent"></span>
                             </template>
                         </div>
                     </div>
@@ -650,47 +605,47 @@
                 <div class="overflow-x-auto scroll-thin">
                     <table class="w-full text-xs">
                         <thead>
-                            <tr class="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                            <tr class="text-left text-[11px] uppercase tracking-wider text-zinc-500">
                                 <th class="py-1.5 pr-3 font-medium">#</th><th class="py-1.5 pr-3 font-medium">Agente</th>
                                 <th class="py-1.5 pr-3 font-medium text-right">Win rate</th><th class="py-1.5 pr-3 font-medium text-right">Contributo PnL</th>
                                 <th class="py-1.5 pr-3 font-medium text-right">Campioni</th><th class="py-1.5 font-medium">Metrica</th>
                             </tr>
                         </thead>
-                        <tbody class="divide-y divide-slate-800/70">
+                        <tbody class="divide-y divide-zinc-800/70">
                             <template x-for="a in (audit.scorecard?.agents || [])" :key="a.no">
                                 <tr class="align-top">
-                                    <td class="py-1.5 pr-3 num text-slate-500" x-text="a.rank"></td>
-                                    <td class="py-1.5 pr-3 text-slate-100 whitespace-nowrap" x-text="a.name"></td>
-                                    <td class="py-1.5 pr-3 num text-right text-slate-300" x-text="a.win_rate != null ? a.win_rate + '%' : '—'"></td>
-                                    <td class="py-1.5 pr-3 num text-right" :class="a.pnl > 0 ? 'text-emerald-400' : a.pnl < 0 ? 'text-rose-400' : 'text-slate-400'"
+                                    <td class="py-1.5 pr-3 num text-zinc-500" x-text="a.rank"></td>
+                                    <td class="py-1.5 pr-3 text-zinc-100 whitespace-nowrap" x-text="a.name"></td>
+                                    <td class="py-1.5 pr-3 num text-right text-zinc-300" x-text="a.win_rate != null ? a.win_rate + '%' : '—'"></td>
+                                    <td class="py-1.5 pr-3 num text-right" :class="a.pnl > 0 ? 'text-emerald-500' : a.pnl < 0 ? 'text-red-500' : 'text-zinc-400'"
                                         x-text="a.pnl != null ? usd(a.pnl, true) : '—'"></td>
-                                    <td class="py-1.5 pr-3 num text-right text-slate-400" x-text="a.samples ?? '—'"></td>
-                                    <td class="py-1.5 text-slate-400"><div class="text-slate-300" x-text="a.metric"></div><div class="text-[11px] text-slate-500" x-text="a.detail"></div></td>
+                                    <td class="py-1.5 pr-3 num text-right text-zinc-400" x-text="a.samples ?? '—'"></td>
+                                    <td class="py-1.5 text-zinc-400"><div class="text-zinc-300" x-text="a.metric"></div><div class="text-[11px] text-zinc-500" x-text="a.detail"></div></td>
                                 </tr>
                             </template>
                         </tbody>
                     </table>
                 </div>
-                <div class="mt-2 text-[11px] text-slate-500"
+                <div class="mt-2 text-[11px] text-zinc-500"
                      x-text="(audit.scorecard?.closed_trades ?? 0) + ' trade chiusi analizzati, ' + (audit.scorecard?.voted_trades ?? 0) + ' con i voti degli agenti all\'ingresso'"></div>
             </div>
         </section>
         </div>
 
         <!-- ================================================================ LOG TECNICI -->
-        <details x-show="tab === 'audit'" class="glass hud-corners group">
-            <summary class="px-4 py-3 flex items-center justify-between cursor-pointer select-none">
+        <details x-show="tab === 'audit'" class="glass group">
+            <summary class="panel-head cursor-pointer select-none !border-b-0">
                 <span class="panel-title">
-                    <i data-lucide="chevron-right" class="w-3.5 h-3.5 transition-transform group-open:rotate-90"></i>
-                    Log tecnici (per sviluppatori)
+                    <i data-lucide="chevron-right" class="w-3.5 h-3.5 text-zinc-500 transition-transform group-open:rotate-90"></i>
+                    Log di sistema
                 </span>
-                <span class="text-[11px] text-slate-500 num" x-text="visibleLogs().length + ' righe'"></span>
+                <span class="text-[11px] text-zinc-500 num" x-text="visibleLogs().length + ' righe'"></span>
             </summary>
-            <div class="border-t border-sky-400/10">
-                <div class="flex justify-end px-4 pt-2">
-                    <button @click="clearLogs()" class="text-[11px] text-slate-500 hover:text-slate-300">Pulisci</button>
+            <div class="border-t border-zinc-800">
+                <div class="flex justify-end px-3 pt-2">
+                    <button @click="clearLogs()" class="text-[11px] text-zinc-500 hover:text-zinc-300">Pulisci</button>
                 </div>
-                <div class="max-h-96 overflow-y-auto scroll-thin px-4 pb-4 pt-1 num text-[11px] leading-relaxed space-y-0.5">
+                <div class="max-h-96 overflow-y-auto scroll-thin px-3 pb-3 pt-1 mono text-[11px] leading-relaxed space-y-0.5">
                     <template x-for="l in visibleLogs()" :key="l.key">
                         <div class="break-words" :class="l.cls" x-text="l.text"></div>
                     </template>
@@ -699,60 +654,52 @@
         </details>
     </main>
 
-    <!-- ============ ISPEZIONA CERVELLO (drawer laterale) ============ -->
+    <!-- ============ ISPEZIONA (console laterale) ============ -->
     <div x-cloak @keydown.escape.window="closeBrain()">
-        <div class="drawer-backdrop" @click="closeBrain()"
-             x-show="brainOpen" x-transition:enter="t-enter" x-transition:enter-start="t-fade-from" x-transition:enter-end="t-to"
+        <div class="drawer-backdrop" @click="closeBrain()" x-show="brainOpen"
+             x-transition:enter="t-enter" x-transition:enter-start="t-fade-from" x-transition:enter-end="t-to"
              x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-fade-from"></div>
         <aside class="drawer" x-show="brainOpen"
                x-transition:enter="t-enter" x-transition:enter-start="t-drawer-from" x-transition:enter-end="t-to"
                x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-drawer-from">
-            <div class="px-5 py-4 border-b border-sky-400/15 flex items-start gap-3">
-                <div class="hud-ring" :class="brain?.agent?.paused && 'off'"></div>
-                <div class="min-w-0 flex-1">
-                    <div class="text-[10px] tracking-[0.2em] uppercase text-cyan-300/80">Ispezione cervello</div>
-                    <div class="text-base font-semibold text-slate-100" x-text="brain?.agent?.title || ''"></div>
-                    <div class="mt-1 text-[12px] text-slate-400 leading-snug" x-text="brain?.agent?.role || ''"></div>
-                </div>
-                <button @click="closeBrain()" class="btn w-8 px-0" title="Chiudi">✕</button>
+            <div class="px-4 h-11 border-b border-zinc-800 flex items-center gap-2.5">
+                <span class="dot" :class="'dot-' + (brain?.agent?.status || 'standby').toLowerCase()"></span>
+                <span class="mono text-[11px] text-zinc-500" x-text="'#' + Number(brain?.agent?.id || 0)"></span>
+                <span class="font-medium text-zinc-100 truncate" x-text="brain?.agent?.title?.split('· ')[1] || brain?.agent?.name || ''"></span>
+                <span class="text-[11px] text-zinc-500" x-text="statusText(brain?.agent?.status)"></span>
+                <button class="switch ml-auto" :class="!brain?.agent?.paused && 'on'" :disabled="!brain?.agent?.pausable"
+                        :title="brain?.agent?.paused ? 'Attiva agente' : 'Metti in pausa'" @click="togglePause(brain.agent)"></button>
+                <button @click="closeBrain()" class="btn btn-ghost w-7 px-0" title="Chiudi (Esc)">✕</button>
             </div>
-            <div class="px-5 py-3 border-b border-sky-400/10 flex flex-wrap items-center gap-2 text-[11px]">
-                <span class="flex items-center gap-1.5 font-semibold tracking-wider" :class="statusTone(brain?.agent?.status)">
-                    <span class="status-led" :class="brain?.agent?.status === 'PROCESSING' && 'blink'"></span>
-                    <span x-text="statusText(brain?.agent?.status)"></span></span>
-                <span class="text-slate-500" x-show="brain?.agent?.tunable" x-text="'· sensibilità ' + (brain?.agent?.sensitivity_label || '')"></span>
-                <span class="ml-auto flex gap-1.5">
-                    <button class="btn btn-sm" :class="brain?.agent?.paused ? 'btn-emerald' : 'btn-amber'" :disabled="!brain?.agent?.pausable"
-                            @click="togglePause(brain.agent)" x-text="brain?.agent?.paused ? '▶ ATTIVA' : '❚❚ PAUSA'"></button>
-                </span>
+            <div class="px-4 py-2 border-b border-zinc-800 text-[12px] text-zinc-400 leading-snug">
+                <span x-text="brain?.agent?.role || ''"></span>
+                <span x-show="brain?.agent?.tunable" class="text-zinc-500" x-text="' · sensibilità ' + (brain?.agent?.sensitivity_label || '')"></span>
             </div>
-            <div class="px-5 pt-3 text-[10px] uppercase tracking-[0.18em] text-cyan-300/70 flex items-center gap-2">
-                Flusso di pensiero <span class="thinking-dots text-cyan-300"><span></span><span></span><span></span></span>
-                <span class="ml-auto normal-case tracking-normal text-slate-600">aggiornato ogni 2s</span>
-            </div>
-            <div class="flex-1 overflow-y-auto scroll-thin px-5 py-3">
+            <div class="flex-1 overflow-y-auto scroll-thin px-4 py-2 mono">
+                <template x-if="!brain || !brain.thoughts"><div class="text-[11.5px] text-zinc-500">caricamento…</div></template>
                 <template x-if="brain && brain.thoughts && !brain.thoughts.length">
-                    <div class="text-sm text-slate-500">Nessun pensiero registrato di recente: l'agente è in ascolto.</div>
+                    <div class="text-[11.5px] text-zinc-500">nessun evento recente — agente in ascolto</div>
                 </template>
-                <template x-if="!brain || !brain.thoughts"><div class="text-sm text-slate-500">Collegamento neurale…</div></template>
                 <template x-for="(t, i) in (brain?.thoughts || [])" :key="t.ts + ':' + i">
-                    <div class="thought" :class="'lv-' + (t.level || (/❌|Errore|VETO|🚨|🛑/.test(t.text) ? 'veto' : /✅|APPROVED|BUY/.test(t.text) ? 'ok' : 'info'))">
-                        <div class="flex items-center gap-2 text-[10.5px] text-slate-500 num">
-                            <span x-text="new Date(t.ts * 1000).toLocaleTimeString('it-IT')"></span>
-                            <span x-show="t.agent" class="text-cyan-300/70" x-text="t.agent"></span>
-                            <span class="ml-auto" x-text="ago(t.ts)"></span>
-                        </div>
-                        <div class="mt-0.5 text-[12.5px] text-slate-200 leading-snug break-words" x-text="t.text"></div>
+                    <div class="console-line">
+                        <span class="prompt" x-text="new Date(t.ts * 1000).toLocaleTimeString('it-IT')"></span>
+                        <span class="break-words" :class="thoughtColor(t)">
+                            <span x-show="t.agent" class="text-zinc-500" x-text="t.agent + ' › '"></span><span x-text="t.text"></span></span>
                     </div>
                 </template>
+            </div>
+            <div class="px-4 h-8 border-t border-zinc-800 flex items-center text-[10.5px] text-zinc-600 mono">
+                <span x-text="(brain?.thoughts?.length || 0) + ' righe · refresh 2s'"></span>
+                <span class="ml-auto">esc per chiudere</span>
             </div>
         </aside>
     </div>
 
     <!-- ============ NOTIFICHE ============ -->
-    <div class="fixed bottom-4 right-4 z-[70] space-y-2 w-[min(360px,calc(100vw-2rem))]">
+    <div class="fixed bottom-4 right-4 z-[70] space-y-2 w-[min(340px,calc(100vw-2rem))]">
         <template x-for="t in toasts" :key="t.id">
-            <div class="glass glass-strong px-4 py-3 text-[13px] bubble" :class="t.error ? '!border-rose-400/50 text-rose-200' : '!border-cyan-400/40 text-cyan-100'" x-text="t.text"></div>
+            <div class="toast" :class="t.error ? 'text-red-300' : 'text-zinc-200'"
+                 x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" x-text="t.text"></div>
         </template>
     </div>
 
@@ -761,25 +708,25 @@
          @keydown.escape.window="showSettings = false">
         <div class="modal-backdrop" @click="showSettings = false"></div>
         <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin modal">
-            <div class="px-5 py-3 border-b border-sky-400/15 flex items-center justify-between sticky top-0 bg-[#0a101e]">
-                <h2 class="text-sm font-semibold text-slate-100">Impostazioni Bot</h2>
-                <button @click="showSettings = false" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
+            <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between sticky top-0 bg-[#121215]">
+                <h2 class="text-sm font-semibold text-zinc-100">Impostazioni Bot</h2>
+                <button @click="showSettings = false" class="h-7 w-7 rounded hover:bg-zinc-800 text-zinc-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
             </div>
 
             <div class="p-5 space-y-5 text-xs">
                 <div>
-                    <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-2">Watchlist</div>
+                    <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-2">Watchlist</div>
                     <div class="flex flex-wrap gap-1.5 mb-2">
                         <template x-for="t in settings.watchlist || []" :key="t">
-                            <span class="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded border border-slate-700 num text-slate-200">
+                            <span class="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded border border-zinc-700 num text-zinc-200">
                                 <span x-text="t"></span>
-                                <button type="button" @click="removeTicker(t)" :disabled="locked('watchlist')" class="px-1 text-slate-500 hover:text-rose-400 disabled:opacity-40">×</button>
+                                <button type="button" @click="removeTicker(t)" :disabled="locked('watchlist')" class="px-1 text-zinc-500 hover:text-red-500 disabled:opacity-40">×</button>
                             </span>
                         </template>
                     </div>
                     <form @submit.prevent="addTicker()" class="flex gap-2">
                         <input x-model="tickerInput" :disabled="locked('watchlist')" maxlength="15" placeholder="Es. GOOGL o DOGE-USD"
-                               class="flex-1 min-w-0 h-8 field num uppercase text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                               class="flex-1 min-w-0 h-8 field num uppercase text-zinc-200 focus:outline-none focus:border-zinc-600 disabled:opacity-50">
                         <button type="submit" :disabled="locked('watchlist')" class="btn">Aggiungi</button>
                     </form>
                 </div>
@@ -787,34 +734,34 @@
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <template x-for="f in numberFields" :key="f.key">
                         <label class="block" :title="lockTitle(f.key)">
-                            <span class="text-[11px] uppercase tracking-wider text-slate-500" x-text="f.label"></span>
+                            <span class="text-[11px] uppercase tracking-wider text-zinc-500" x-text="f.label"></span>
                             <input type="number" :step="f.step" :min="f.min" :max="f.max" x-model.number="settings[f.key]" :disabled="locked(f.key)"
-                                   class="mt-1 w-full h-8 field num text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                                   class="mt-1 w-full h-8 field num text-zinc-200 focus:outline-none focus:border-zinc-600 disabled:opacity-50">
                         </label>
                     </template>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-sky-400/15" :title="lockTitle('auto_execute_trades')">
+                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-zinc-800" :title="lockTitle('auto_execute_trades')">
                         <span>
-                            <span class="text-slate-200">Auto-Trading</span>
-                            <span class="block text-[11px] text-slate-500" x-text="settings.auto_execute_trades ? 'Esegue gli ordini' : 'Advisor: solo suggerimenti'"></span>
+                            <span class="text-zinc-200">Auto-Trading</span>
+                            <span class="block text-[11px] text-zinc-500" x-text="settings.auto_execute_trades ? 'Esegue gli ordini' : 'Advisor: solo suggerimenti'"></span>
                         </span>
-                        <input type="checkbox" x-model="settings.auto_execute_trades" :disabled="locked('auto_execute_trades')" class="h-4 w-4 accent-emerald-500">
+                        <input type="checkbox" x-model="settings.auto_execute_trades" :disabled="locked('auto_execute_trades')" class="h-4 w-4 accent-indigo-500">
                     </label>
-                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-sky-400/15" :title="lockTitle('keep_alive_enabled')">
+                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-zinc-800" :title="lockTitle('keep_alive_enabled')">
                         <span>
-                            <span class="text-slate-200">Anti-Sleep</span>
-                            <span class="block text-[11px] text-slate-500">Self-ping ogni 10 minuti</span>
+                            <span class="text-zinc-200">Anti-Sleep</span>
+                            <span class="block text-[11px] text-zinc-500">Self-ping ogni 10 minuti</span>
                         </span>
-                        <input type="checkbox" x-model="settings.keep_alive_enabled" :disabled="locked('keep_alive_enabled')" class="h-4 w-4 accent-emerald-500">
+                        <input type="checkbox" x-model="settings.keep_alive_enabled" :disabled="locked('keep_alive_enabled')" class="h-4 w-4 accent-indigo-500">
                     </label>
                 </div>
 
                 <label class="block" :title="lockTitle('ai_provider')">
-                    <span class="text-[11px] uppercase tracking-wider text-slate-500">Motore IA</span>
+                    <span class="text-[11px] uppercase tracking-wider text-zinc-500">Motore IA</span>
                     <select x-model="settings.ai_provider" :disabled="locked('ai_provider')"
-                            class="mt-1 w-full h-8 field text-slate-200 focus:outline-none focus:border-slate-600 disabled:opacity-50">
+                            class="mt-1 w-full h-8 field text-zinc-200 focus:outline-none focus:border-zinc-600 disabled:opacity-50">
                         <option value="gemini">Gemini Flash</option>
                         <option value="groq">Groq</option>
                         <option value="hybrid">Ibrido Gemini + Groq</option>
@@ -822,16 +769,16 @@
                     </select>
                 </label>
 
-                <p x-show="Object.keys(envLocked).length" class="text-[11px] text-slate-500">
+                <p x-show="Object.keys(envLocked).length" class="text-[11px] text-zinc-500">
                     I campi disattivati sono fissati da variabili d'ambiente su Render.
                 </p>
             </div>
 
-            <div class="px-5 py-3 border-t border-sky-400/15 flex items-center justify-between gap-3 sticky bottom-0 bg-[#0a101e]">
-                <span class="text-[11px] num" :class="noticeError ? 'text-rose-400' : 'text-emerald-400'" x-text="notice"></span>
+            <div class="px-5 py-3 border-t border-zinc-800 flex items-center justify-between gap-3 sticky bottom-0 bg-[#121215]">
+                <span class="text-[11px] num" :class="noticeError ? 'text-red-500' : 'text-emerald-500'" x-text="notice"></span>
                 <div class="flex gap-2">
                     <button @click="showSettings = false" class="btn">Chiudi</button>
-                    <button @click="saveSettings()" :disabled="saving" class="btn btn-cyan">Salva impostazioni</button>
+                    <button @click="saveSettings()" :disabled="saving" class="btn btn-primary">Salva impostazioni</button>
                 </div>
             </div>
         </div>
@@ -842,87 +789,87 @@
          @keydown.escape.window="showPosition = false">
         <div class="modal-backdrop" @click="showPosition = false"></div>
         <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin modal">
-            <div class="px-5 py-3 border-b border-sky-400/15 flex items-center justify-between sticky top-0 bg-[#0a101e]">
-                <h2 class="text-sm font-semibold text-slate-100" x-text="'Posizione ' + (posDetail?.position?.symbol || posSymbol)"></h2>
-                <button @click="showPosition = false" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
+            <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between sticky top-0 bg-[#121215]">
+                <h2 class="text-sm font-semibold text-zinc-100" x-text="'Posizione ' + (posDetail?.position?.symbol || posSymbol)"></h2>
+                <button @click="showPosition = false" class="h-7 w-7 rounded hover:bg-zinc-800 text-zinc-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
             </div>
             <div class="p-5 text-xs space-y-5">
-                <div x-show="posLoading" class="text-slate-500">Caricamento…</div>
-                <div x-show="posError" class="text-rose-400" x-text="posError"></div>
+                <div x-show="posLoading" class="text-zinc-500">Caricamento…</div>
+                <div x-show="posError" class="text-red-500" x-text="posError"></div>
                 <template x-if="posDetail && !posLoading">
                     <div class="space-y-5">
                         <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 num">
-                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Apertura</div>
-                                 <div class="text-slate-200" x-text="dateTime(posDetail.opened_at)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Prezzo di ingresso</div>
-                                 <div class="text-slate-200" x-text="price(posDetail.position.avg_entry_price)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Prezzo attuale</div>
-                                 <div class="text-slate-200" x-text="price(posDetail.position.current_price)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">PnL %</div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Apertura</div>
+                                 <div class="text-zinc-200" x-text="dateTime(posDetail.opened_at)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Prezzo di ingresso</div>
+                                 <div class="text-zinc-200" x-text="price(posDetail.position.avg_entry_price)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Prezzo attuale</div>
+                                 <div class="text-zinc-200" x-text="price(posDetail.position.current_price)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">PnL %</div>
                                  <div :class="tone(posDetail.position.unrealized_plpc)" x-text="pct(posDetail.position.unrealized_plpc)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">PnL</div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">PnL</div>
                                  <div :class="tone(posDetail.position.unrealized_pl)" x-text="usd(posDetail.position.unrealized_pl, true)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Quantità · Valore</div>
-                                 <div class="text-slate-200" x-text="qty(posDetail.position.qty) + ' · ' + usd(posDetail.position.market_value)"></div></div>
+                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Quantità · Valore</div>
+                                 <div class="text-zinc-200" x-text="qty(posDetail.position.qty) + ' · ' + usd(posDetail.position.market_value)"></div></div>
                         </div>
 
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 num">
-                            <div class="border border-sky-400/15 rounded p-3">
-                                <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Stop Loss</div>
-                                <div class="text-rose-300" x-text="price(posDetail.stop_loss.price) + ' (' + posDetail.stop_loss.pct + '%)'"></div>
-                                <div class="text-[11px] text-slate-500 font-sans" x-text="posDetail.stop_loss.source + (posDetail.stop_loss.effective_pct != null && posDetail.stop_loss.effective_pct !== posDetail.stop_loss.pct ? ' · stop effettivo del Guardian ' + posDetail.stop_loss.effective_pct + '%' : '')"></div>
+                            <div class="border border-zinc-800 rounded p-3">
+                                <div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Stop Loss</div>
+                                <div class="text-red-500" x-text="price(posDetail.stop_loss.price) + ' (' + posDetail.stop_loss.pct + '%)'"></div>
+                                <div class="text-[11px] text-zinc-500 font-sans" x-text="posDetail.stop_loss.source + (posDetail.stop_loss.effective_pct != null && posDetail.stop_loss.effective_pct !== posDetail.stop_loss.pct ? ' · stop effettivo del Guardian ' + posDetail.stop_loss.effective_pct + '%' : '')"></div>
                             </div>
-                            <div class="border border-sky-400/15 rounded p-3">
-                                <div class="text-[11px] uppercase tracking-wider text-slate-500 font-sans">Target 1 (2R)</div>
-                                <div class="text-emerald-300" x-text="posDetail.take_profit.price ? price(posDetail.take_profit.price) + (posDetail.take_profit.pct != null ? ' (+' + posDetail.take_profit.pct + '%)' : '') : '—'"></div>
-                                <div class="text-[11px] text-slate-500 font-sans" x-text="posDetail.take_profit.label || 'target del Comitato Rischi / Agente #3'"></div>
+                            <div class="border border-zinc-800 rounded p-3">
+                                <div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Target 1 (2R)</div>
+                                <div class="text-emerald-500" x-text="posDetail.take_profit.price ? price(posDetail.take_profit.price) + (posDetail.take_profit.pct != null ? ' (+' + posDetail.take_profit.pct + '%)' : '') : '—'"></div>
+                                <div class="text-[11px] text-zinc-500 font-sans" x-text="posDetail.take_profit.label || 'target del Comitato Rischi / Agente #3'"></div>
                             </div>
                         </div>
 
                         <div class="space-y-1.5" x-show="posDetail.guardian">
-                            <div class="text-[11px] uppercase tracking-wider text-slate-500">Schede del Guardian
-                                <span class="normal-case tracking-normal text-slate-600" x-text="[posDetail.guardian?.trade_class, posDetail.guardian?.horizon].filter(Boolean).join(' · ')"></span></div>
-                            <div><span class="text-sky-400">buy_thesis · </span><span class="text-slate-300" x-text="posDetail.guardian?.buy_thesis || '—'"></span></div>
-                            <div><span class="text-amber-300">hold_rationale · </span><span class="text-slate-300" x-text="posDetail.guardian?.hold_rationale || '—'"></span>
-                                <span class="text-slate-600 num" x-show="posDetail.guardian?.hold_updated_at" x-text="'(' + dateTime(posDetail.guardian?.hold_updated_at) + ')'"></span></div>
-                            <div><span class="text-rose-300">exit_reason · </span><span class="text-slate-300" x-text="posDetail.guardian?.exit_reason || 'nessuna uscita (posizione intera)'"></span></div>
+                            <div class="text-[11px] uppercase tracking-wider text-zinc-500">Schede del Guardian
+                                <span class="normal-case tracking-normal text-zinc-600" x-text="[posDetail.guardian?.trade_class, posDetail.guardian?.horizon].filter(Boolean).join(' · ')"></span></div>
+                            <div><span class="text-indigo-400">buy_thesis · </span><span class="text-zinc-300" x-text="posDetail.guardian?.buy_thesis || '—'"></span></div>
+                            <div><span class="text-amber-300">hold_rationale · </span><span class="text-zinc-300" x-text="posDetail.guardian?.hold_rationale || '—'"></span>
+                                <span class="text-zinc-600 num" x-show="posDetail.guardian?.hold_updated_at" x-text="'(' + dateTime(posDetail.guardian?.hold_updated_at) + ')'"></span></div>
+                            <div><span class="text-red-500">exit_reason · </span><span class="text-zinc-300" x-text="posDetail.guardian?.exit_reason || 'nessuna uscita (posizione intera)'"></span></div>
                         </div>
 
                         <div>
-                            <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-2">Motivazione d'ingresso
-                                <span class="normal-case tracking-normal text-slate-600" x-show="posDetail.rationale_source" x-text="'· ' + posDetail.rationale_source"></span></div>
+                            <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-2">Motivazione d'ingresso
+                                <span class="normal-case tracking-normal text-zinc-600" x-show="posDetail.rationale_source" x-text="'· ' + posDetail.rationale_source"></span></div>
                             <template x-if="!posDetail.rationale">
-                                <div class="text-slate-500">Nessun rationale registrato per questa posizione (aperta prima del registro operazioni).</div>
+                                <div class="text-zinc-500">Nessun rationale registrato per questa posizione (aperta prima del registro operazioni).</div>
                             </template>
                             <template x-if="posDetail.rationale">
                                 <div class="space-y-2">
                                     <template x-if="posDetail.rationale.agents">
                                         <table class="w-full num">
-                                            <tbody class="divide-y divide-slate-800/70">
+                                            <tbody class="divide-y divide-zinc-800/70">
                                                 <template x-for="row in agentRows(posDetail.rationale.agents)" :key="row.name">
-                                                    <tr><td class="py-1.5 pr-3 text-slate-400 font-sans" x-text="row.name"></td>
-                                                        <td class="py-1.5 pr-3 text-right text-slate-100" x-text="row.score"></td>
-                                                        <td class="py-1.5 text-slate-400" x-text="row.detail"></td></tr>
+                                                    <tr><td class="py-1.5 pr-3 text-zinc-400 font-sans" x-text="row.name"></td>
+                                                        <td class="py-1.5 pr-3 text-right text-zinc-100" x-text="row.score"></td>
+                                                        <td class="py-1.5 text-zinc-400" x-text="row.detail"></td></tr>
                                                 </template>
                                             </tbody>
                                         </table>
                                     </template>
-                                    <div x-show="posDetail.rationale.desk_cio" class="text-slate-400">
+                                    <div x-show="posDetail.rationale.desk_cio" class="text-zinc-400">
                                         <span class="text-amber-300">CIO del desk</span>
                                         <span x-text="posDetail.rationale.desk_cio ? ('(' + posDetail.rationale.desk_cio.source + ', convinzione ' + posDetail.rationale.desk_cio.conviction + ', allocazione ' + posDetail.rationale.desk_cio.allocation_pct + '%): ' + posDetail.rationale.desk_cio.reason) : ''"></span>
                                     </div>
-                                    <div x-show="posDetail.rationale.risk_package?.reason" class="text-slate-500" x-text="'Comitato Rischi: ' + (posDetail.rationale.risk_package?.reason || '')"></div>
+                                    <div x-show="posDetail.rationale.risk_package?.reason" class="text-zinc-500" x-text="'Comitato Rischi: ' + (posDetail.rationale.risk_package?.reason || '')"></div>
                                 </div>
                             </template>
                         </div>
                     </div>
                 </template>
             </div>
-            <div class="px-5 py-3 border-t border-sky-400/15 flex items-center justify-between gap-3 sticky bottom-0 bg-[#0a101e]">
-                <span class="text-[11px] num" :class="posNoticeError ? 'text-rose-400' : 'text-emerald-400'" x-text="posNotice"></span>
+            <div class="px-5 py-3 border-t border-zinc-800 flex items-center justify-between gap-3 sticky bottom-0 bg-[#121215]">
+                <span class="text-[11px] num" :class="posNoticeError ? 'text-red-500' : 'text-emerald-500'" x-text="posNotice"></span>
                 <div class="flex gap-2">
                     <button @click="showPosition = false" class="btn">Chiudi</button>
-                    <button @click="sellNow()" :disabled="selling || !posDetail" class="btn btn-rose">🔴 VENDI SUBITO</button>
+                    <button @click="sellNow()" :disabled="selling || !posDetail" class="btn btn-danger">🔴 VENDI SUBITO</button>
                 </div>
             </div>
         </div>
@@ -933,41 +880,41 @@
          @keydown.escape.window="showHistory = false">
         <div class="modal-backdrop" @click="showHistory = false"></div>
         <div class="relative w-full max-w-5xl max-h-[85vh] overflow-y-auto scroll-thin modal">
-            <div class="px-5 py-3 border-b border-sky-400/15 flex items-center justify-between gap-3 sticky top-0 bg-[#0a101e]">
-                <h2 class="text-sm font-semibold text-slate-100">📜 Storico Offline</h2>
+            <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between gap-3 sticky top-0 bg-[#121215]">
+                <h2 class="text-sm font-semibold text-zinc-100">📜 Storico Offline</h2>
                 <div class="flex items-center gap-3 text-xs">
-                    <label class="flex items-center gap-1.5 text-slate-400">
-                        <input type="checkbox" x-model="historyOffline" @change="loadHistory()" class="h-3.5 w-3.5 accent-emerald-500"> solo operazioni offline
+                    <label class="flex items-center gap-1.5 text-zinc-400">
+                        <input type="checkbox" x-model="historyOffline" @change="loadHistory()" class="h-3.5 w-3.5 accent-indigo-500"> solo operazioni offline
                     </label>
-                    <button @click="showHistory = false" class="h-7 w-7 rounded hover:bg-slate-800 text-slate-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
+                    <button @click="showHistory = false" class="h-7 w-7 rounded hover:bg-zinc-800 text-zinc-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
                 </div>
             </div>
             <div class="p-5 text-xs">
-                <div class="mb-3 text-slate-500 num" x-text="historySummary()"></div>
+                <div class="mb-3 text-zinc-500 num" x-text="historySummary()"></div>
                 <div class="overflow-x-auto scroll-thin">
                     <table class="w-full">
                         <thead>
-                            <tr class="border-b border-sky-400/15 text-slate-500 text-left">
+                            <tr class="border-b border-zinc-800 text-zinc-500 text-left">
                                 <th class="font-medium py-2 pr-3">Data</th><th class="font-medium py-2 pr-3">Simbolo</th>
                                 <th class="font-medium py-2 pr-3">Operazione</th><th class="font-medium py-2 pr-3 text-right">Prezzo</th>
                                 <th class="font-medium py-2 pr-3 text-right">Quantità</th><th class="font-medium py-2 pr-3 text-right">PnL realizzato</th>
                                 <th class="font-medium py-2">Rationale</th>
                             </tr>
                         </thead>
-                        <tbody class="divide-y divide-slate-800/70 num">
+                        <tbody class="divide-y divide-zinc-800/70 num">
                             <template x-if="!historyRows.length">
-                                <tr><td colspan="7" class="py-4 text-slate-500 font-sans" x-text="historyLoading ? 'Caricamento…' : 'Nessuna operazione registrata.'"></td></tr>
+                                <tr><td colspan="7" class="py-4 text-zinc-500 font-sans" x-text="historyLoading ? 'Caricamento…' : 'Nessuna operazione registrata.'"></td></tr>
                             </template>
                             <template x-for="h in historyRows" :key="h.id">
                                 <tr class="align-top">
-                                    <td class="py-2 pr-3 text-slate-400 whitespace-nowrap" x-text="dateTime(h.timestamp)"></td>
-                                    <td class="py-2 pr-3 text-slate-100" x-text="h.symbol"></td>
-                                    <td class="py-2 pr-3 whitespace-nowrap" :class="h.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'"
+                                    <td class="py-2 pr-3 text-zinc-400 whitespace-nowrap" x-text="dateTime(h.timestamp)"></td>
+                                    <td class="py-2 pr-3 text-zinc-100" x-text="h.symbol"></td>
+                                    <td class="py-2 pr-3 whitespace-nowrap" :class="h.side === 'BUY' ? 'text-emerald-500' : 'text-red-500'"
                                         x-text="h.operation + (h.executed_offline ? '' : ' · online')"></td>
-                                    <td class="py-2 pr-3 text-right text-slate-300" x-text="price(h.price)"></td>
-                                    <td class="py-2 pr-3 text-right text-slate-300" x-text="h.quantity != null ? qty(h.quantity) : (h.notional != null ? usd(h.notional) : '—')"></td>
+                                    <td class="py-2 pr-3 text-right text-zinc-300" x-text="price(h.price)"></td>
+                                    <td class="py-2 pr-3 text-right text-zinc-300" x-text="h.quantity != null ? qty(h.quantity) : (h.notional != null ? usd(h.notional) : '—')"></td>
                                     <td class="py-2 pr-3 text-right" :class="tone(h.realized_pnl)" x-text="h.realized_pnl != null ? usd(h.realized_pnl, true) : '—'"></td>
-                                    <td class="py-2 text-slate-400 font-sans" x-text="rationaleText(h)"></td>
+                                    <td class="py-2 text-zinc-400 font-sans" x-text="rationaleText(h)"></td>
                                 </tr>
                             </template>
                         </tbody>
@@ -976,6 +923,5 @@
             </div>
         </div>
     </div>
-</div>
 </body>
 </html>

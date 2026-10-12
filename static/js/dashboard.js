@@ -1,13 +1,13 @@
-// J.A.R.V.I.S. HUD — logica della dashboard (Alpine.js). API_TOKEN è inserito dal template dopo il login.
+// Quant Desk — logica della dashboard (Alpine.js). API_TOKEN è inserito dal template dopo il login.
 function dashboard() {
     return {
         connected: true,
         tab: 'command',
         tabs: [
-            { id: 'command', label: 'Centro di Comando', icon: 'radar' },
-            { id: 'markets', label: 'Mercati & Opportunità', icon: 'globe-2' },
-            { id: 'portfolio', label: 'Portafoglio', icon: 'wallet' },
-            { id: 'audit', label: 'Audit Agenti', icon: 'scroll-text' },
+            { id: 'command', label: 'Agenti & Comandi' },
+            { id: 'markets', label: 'Mercati' },
+            { id: 'portfolio', label: 'Portafoglio' },
+            { id: 'audit', label: 'Audit' },
         ],
         // Agent Matrix
         agents: [], blocks: { asset_classes: [], sectors: [], symbols: [] }, blockLabels: [], tuning: null, agentBusy: '',
@@ -15,11 +15,10 @@ function dashboard() {
         // Stanza dei Dipendenti AI
         persona: 'coo', chatMessages: [], chatInput: '', chatSending: false,
         personas: {
-            coo: { name: 'COO · Capo delle Operazioni', initials: 'COO', tagline: 'Gestisce agenti, mercati e operatività' },
-            risk: { name: 'Risk Manager', initials: 'RM', tagline: 'Custode del capitale: più severo sul rischio' },
+            coo: { name: 'COO', short: 'COO', tagline: 'COO: pausa/attivazione agenti, blocchi per mercato o ticker, aggressività, modalità Advisor, stato del desk.' },
+            risk: { name: 'Risk Manager', short: 'Risk Manager', tagline: 'Risk Manager: stessi comandi, soglie di rischio più severe (VIX > 20 blocca gli aumenti di esposizione).' },
         },
-        chatSuggestions: ['Come stiamo oggi?', 'Ferma gli acquisti sulle Crypto', "Aumenta l'aggressività su Tech",
-                          'Rendi il CIO più selettivo', 'Metti in pausa il Guardian', 'Riduci il rischio'],
+        chatSuggestions: ['stato', 'blocca crypto', 'sblocca tutto', 'CIO selettivo', 'riduci il rischio', 'pausa CHOP'],
         account: {}, positions: [], closedPositions: [], bot: { logs: [] },
         radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
         settings: { watchlist: [] }, envLocked: {},
@@ -59,22 +58,23 @@ function dashboard() {
             return Math.min(100, Math.max(0, this.account.exposure / eq * 100));
         },
         health() {
-            if (!this.connected) return { label: 'CONNESSIONE AL SISTEMA…', tone: 'tone-amber', hint: 'Riconnessione al server in corso' };
-            if (!this.bot.active) return { label: 'SISTEMA IN PAUSA', tone: 'tone-amber', hint: 'Gli agenti sono fermi: premi Riprendi per riattivarli' };
-            const d = Number(this.account.daily_pnl_usd);
-            if (isNaN(d) || this.account.daily_pnl_usd == null) return { label: 'SISTEMA OPERATIVO', tone: 'tone-cyan', hint: 'In attesa dei dati del conto' };
-            if (d >= 0) return { label: 'SISTEMA OPERATIVO IN PROFITTO', tone: 'tone-cyan', hint: 'Tutti gli agenti al lavoro, la giornata è positiva' };
-            if (Number(this.account.daily_pnl_pct) <= -3) return { label: 'MODALITÀ DIFESA ATTIVA', tone: 'tone-rose', hint: 'Giornata negativa: il sistema protegge il capitale' };
-            return { label: 'SISTEMA OPERATIVO · LIEVE CALO', tone: 'tone-amber', hint: 'Oscillazione normale: le protezioni sono attive' };
+            if (!this.connected) return { label: 'OFFLINE', pill: 'pill-muted', hint: 'Riconnessione al server in corso' };
+            if (!this.bot.active) return { label: 'IN PAUSA', pill: 'pill-muted', hint: 'Agenti fermi: nessuna scansione né acquisto' };
+            const pnl = Number(this.account.daily_pnl_pct);
+            if (!isNaN(pnl) && pnl <= -3) return { label: 'PROTEZIONE ATTIVA', pill: 'pill-down', hint: `Giornata ${this.pct(pnl)}: priorità alla difesa del capitale` };
+            return { label: 'OPERATIVO', pill: 'pill-up', hint: this.settings.auto_execute_trades ? 'Auto-Trading attivo' : 'Advisor: ordini non inviati' };
         },
-        safetyLabel() {
-            const inv = this.investedPct();
-            if (inv === null) return '—';
-            const lvl = inv <= 30 ? 'ALTO' : inv <= 50 ? 'BUONO' : inv <= 75 ? 'MEDIO' : 'BASSO';
-            return 'LIV. SICUREZZA ' + lvl;
+        pnlPill(v) {
+            if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return 'pill-muted';
+            return Number(v) > 0 ? 'pill-up' : 'pill-down';
         },
-        arrow(v) { return v > 0 ? '▲' : v < 0 ? '▼' : '■'; },
-        glow(v) { return v > 0 ? 'glow-text-emerald' : v < 0 ? 'glow-text-rose' : 'glow-text-cyan'; },
+        focusCommand() { this.tab = 'command'; this.$nextTick(() => this.$refs.cmd && this.$refs.cmd.focus()); },
+        thoughtColor(t) {
+            if (t.level === 'veto' || /❌|Errore|VETO|🚨|🛑|REJECTED/.test(t.text)) return 'text-red-400';
+            if (t.level === 'ok' || /✅|APPROVED|ESEGUIT/.test(t.text)) return 'text-emerald-500';
+            if (t.level === 'muted') return 'text-zinc-500';
+            return 'text-zinc-300';
+        },
 
         // ---------- Agent Matrix ----------
         async loadAgents() {
@@ -92,9 +92,6 @@ function dashboard() {
         },
         statusText(st) {
             return { ACTIVE: 'ATTIVO', PROCESSING: 'ELABORAZIONE IN CORSO', PAUSED: 'IN PAUSA', STANDBY: 'STANDBY' }[st] || st;
-        },
-        statusTone(st) {
-            return { ACTIVE: 'tone-emerald', PROCESSING: 'tone-cyan', PAUSED: 'tone-amber', STANDBY: 'tone-slate' }[st] || 'tone-slate';
         },
         async controlAgent(a, body) {
             this.agentBusy = a.id;
@@ -185,7 +182,7 @@ function dashboard() {
             }
         },
         verdictTone(v) {
-            return { ESEGUITO: 'tone-emerald', SCONSIGLIATO: 'tone-amber', IMPOSSIBILE: 'tone-rose' }[v] || 'tone-cyan';
+            return { ESEGUITO: 'text-emerald-500', SCONSIGLIATO: 'text-amber-500', IMPOSSIBILE: 'text-red-500' }[v] || 'text-indigo-400';
         },
 
         // ---------- toast ----------
@@ -210,8 +207,8 @@ function dashboard() {
         },
         qty(v) { return Number(v).toLocaleString('en-US', { maximumFractionDigits: 6 }); },
         tone(v) {
-            if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return 'text-slate-300';
-            return Number(v) > 0 ? 'text-emerald-400' : 'text-rose-400';
+            if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return 'text-zinc-300';
+            return Number(v) > 0 ? 'text-emerald-500' : 'text-red-500';
         },
         exposurePct() {
             const eq = Number(this.account.portfolio);
@@ -244,23 +241,23 @@ function dashboard() {
         },
         statusStyle(st, textOnly = false) {
             const map = {
-                APPROVED_BY_RISK: ['border-emerald-800 text-emerald-400', 'text-emerald-400'],
-                EXECUTED: ['border-sky-800 text-sky-400', 'text-sky-400'],
-                REJECTED_BY_RISK: ['border-rose-900 text-rose-400', 'text-rose-400'],
-                EXPIRED: ['border-slate-700 text-slate-500', 'text-slate-500'],
+                APPROVED_BY_RISK: ['border-emerald-500/30 text-emerald-500', 'text-emerald-500'],
+                EXECUTED: ['border-indigo-500/40 text-indigo-400', 'text-indigo-400'],
+                REJECTED_BY_RISK: ['border-red-500/30 text-red-500', 'text-red-500'],
+                EXPIRED: ['border-zinc-700 text-zinc-500', 'text-zinc-500'],
             };
-            const v = map[st] || ['border-amber-800 text-amber-400', 'text-amber-400'];
+            const v = map[st] || ['border-amber-500/30 text-amber-400', 'text-amber-400'];
             return textOnly ? v[1] : v[0];
         },
         actionStyle(a) {
             return {
-                BUY: 'border-emerald-800 text-emerald-400 bg-emerald-950/40',
-                SELL: 'border-rose-800 text-rose-400 bg-rose-950/40',
-                ROTATE: 'border-sky-800 text-sky-400 bg-sky-950/40',
-            }[a] || 'border-slate-700 text-slate-300 bg-slate-800/40';
+                BUY: 'border-emerald-500/30 text-emerald-500 bg-emerald-500/10',
+                SELL: 'border-red-500/30 text-red-500 bg-red-500/10',
+                ROTATE: 'border-indigo-500/40 text-indigo-400 bg-indigo-500/10',
+            }[a] || 'border-zinc-700 text-zinc-300 bg-zinc-800/40';
         },
         verdictStyle(v) {
-            return v === 'APPROVATO' ? 'text-emerald-400' : v === 'RESPINTO' ? 'text-rose-400' : 'text-slate-500';
+            return v === 'APPROVATO' ? 'text-emerald-500' : v === 'RESPINTO' ? 'text-red-500' : 'text-zinc-500';
         },
         cioTarget() {
             const c = this.cio;
@@ -278,11 +275,11 @@ function dashboard() {
 
         // ---------- log ----------
         logClass(text) {
-            if (/❌|Errore|🚨|🛑|VETO|BLOCCATI/.test(text)) return 'text-rose-300/90';
+            if (/❌|Errore|🚨|🛑|VETO|BLOCCATI/.test(text)) return 'text-red-500';
             if (/✅|ORDINE ACQUISTO/.test(text)) return 'text-emerald-300/90';
-            if (/⚠️|⛔|🌅|🧭/.test(text)) return 'text-amber-300/80';
-            if (/━━━|===/.test(text)) return 'text-slate-500';
-            return 'text-slate-400';
+            if (/⚠️|⛔|🌅|🧭/.test(text)) return 'text-amber-400';
+            if (/━━━|===/.test(text)) return 'text-zinc-500';
+            return 'text-zinc-400';
         },
         visibleLogs() {
             const server = this.logs
@@ -294,7 +291,7 @@ function dashboard() {
         addLog(message, error = false) {
             const ts = Date.now() / 1000;
             const time = new Date().toLocaleTimeString('it-IT');
-            this.localLogs.push({ key: 'l' + ts, ts, text: `[${time}] ${message}`, cls: error ? 'text-rose-300/90' : 'text-sky-300/90' });
+            this.localLogs.push({ key: 'l' + ts, ts, text: `[${time}] ${message}`, cls: error ? 'text-red-500' : 'text-indigo-400' });
             if (this.localLogs.length > 30) this.localLogs.shift();
         },
         clearLogs() {
@@ -353,17 +350,10 @@ function dashboard() {
             const last = this.dialogue[this.dialogue.length - 1];
             return last && (Date.now() / 1000 - last.ts) < 30;
         },
-        agentColor(agent) {
-            if (agent.startsWith('Scout')) return 'text-slate-400';
-            return { 'Chief of Staff': 'text-sky-400', 'Technical & Liquidity': 'text-violet-400',
-                     'Sentiment & Compliance': 'text-violet-400', 'Risk & ATR': 'text-violet-400', 'Quant Ensemble': 'text-violet-400', 'Pipeline': 'text-cyan-400', 'CHOP': 'text-yellow-300',
-                     'CIO': 'text-amber-300', 'Agente #5 CIO': 'text-amber-300', 'Execution Desk': 'text-emerald-400',
-                     'Agente #6 Guardian': 'text-teal-300', 'Centro di Comando': 'text-cyan-300', 'COO': 'text-cyan-300',
-                     'Risk Manager': 'text-emerald-300' }[agent] || 'text-slate-300';
-        },
+        agentColor(agent) { return agent.startsWith('Scout') ? 'text-zinc-500' : 'text-zinc-400'; },
         feed() { return this.dialogue.slice(-40).reverse(); },
         levelColor(level) {
-            return { alert: 'text-amber-300', veto: 'text-rose-400', ok: 'text-emerald-400', muted: 'text-slate-600' }[level] || 'text-slate-300';
+            return { alert: 'text-amber-400', veto: 'text-red-400', ok: 'text-emerald-500', muted: 'text-zinc-500' }[level] || 'text-zinc-300';
         },
         async loadSettings() {
             try {
@@ -495,19 +485,19 @@ function dashboard() {
         },
         agentVotes(a) {
             a = a || {};
-            const sc = (x, ok = 60) => x?.score == null ? { value: '—', cls: 'text-slate-500' }
-                : { value: Number(x.score).toFixed(1), cls: x.score >= ok ? 'text-emerald-400' : 'text-slate-300' };
-            const ap = (x) => x?.approved == null ? { value: '—', cls: 'text-slate-500' }
-                : { value: x.approved ? 'OK' : 'VETO', cls: x.approved ? 'text-emerald-400' : 'text-rose-400' };
+            const sc = (x, ok = 60) => x?.score == null ? { value: '—', cls: 'text-zinc-500' }
+                : { value: Number(x.score).toFixed(1), cls: x.score >= ok ? 'text-emerald-500' : 'text-zinc-300' };
+            const ap = (x) => x?.approved == null ? { value: '—', cls: 'text-zinc-500' }
+                : { value: x.approved ? 'OK' : 'VETO', cls: x.approved ? 'text-emerald-500' : 'text-red-500' };
             const risk = a.agent_03_risk;
             return [
                 { name: '#1 Quant', ...sc(a.agent_01_quant) },
                 { name: '#2 Micro', ...sc(a.agent_02_micro, 50) },
-                { name: '#3 Risk', ...(risk ? { value: (risk.approved ? 'OK ' : 'VETO ') + (risk.score != null ? Number(risk.score).toFixed(0) : ''), cls: risk.approved ? 'text-emerald-400' : 'text-rose-400' } : ap(risk)) },
+                { name: '#3 Risk', ...(risk ? { value: (risk.approved ? 'OK ' : 'VETO ') + (risk.score != null ? Number(risk.score).toFixed(0) : ''), cls: risk.approved ? 'text-emerald-500' : 'text-red-500' } : ap(risk)) },
                 { name: '#4 Macro', ...sc(a.agent_04_macro, 50) },
-                { name: '#5 CIO', value: a.agent_05_cio ? (a.agent_05_cio.decision + ' ' + (a.agent_05_cio.score ?? '')) : '—', cls: a.agent_05_cio?.decision === 'BUY' ? 'text-emerald-400' : 'text-slate-300' },
+                { name: '#5 CIO', value: a.agent_05_cio ? (a.agent_05_cio.decision + ' ' + (a.agent_05_cio.score ?? '')) : '—', cls: a.agent_05_cio?.decision === 'BUY' ? 'text-emerald-500' : 'text-zinc-300' },
                 { name: '#6 Guardian', ...ap(a.agent_06_guardian) },
-                { name: '#7 CHOP', value: a.agent_07_chop ? ((a.agent_07_chop.scouts || []).length + ' scout' + (a.agent_07_chop.latency_ms ? ' · ' + a.agent_07_chop.latency_ms.stage3 + 'ms' : '')) : '—', cls: 'text-slate-300' },
+                { name: '#7 CHOP', value: a.agent_07_chop ? ((a.agent_07_chop.scouts || []).length + ' scout' + (a.agent_07_chop.latency_ms ? ' · ' + a.agent_07_chop.latency_ms.stage3 + 'ms' : '')) : '—', cls: 'text-zinc-300' },
             ];
         },
 
