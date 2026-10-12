@@ -10,8 +10,10 @@
   La sensibilità (Standard / Selettivo / Rigoroso) alza il punteggio minimo dell'agente richiesto alle schede
   APPROVED_BY_RISK prima che il CIO le valuti.
 - Blocchi operativi: asset class (crypto/azioni), settori e singoli ticker esclusi dai nuovi acquisti.
-- Chat con i dirigenti (COO e Risk Manager): l'ordine viene interpretato (Groq in JSON, altrimenti regole),
-  valutato sui dati live e applicato solo se vantaggioso; altrimenti viene spiegato perché no.
+- Chat con i dirigenti (COO e Risk Manager): assistente conversazionale Groq con la mappa dell'architettura e lo
+  stato live del sistema (conto, posizioni, VIX, sciame, bocciature, log). Risponde a qualsiasi domanda; quando
+  un'azione è utile la PROPONE e la applica solo dopo la conferma esplicita dell'utente ("sì", "conferma").
+  Senza Groq resta un parser a regole di riserva, con la stessa conferma obbligatoria.
 """
 import itertools
 import json
@@ -24,8 +26,10 @@ from collections import deque
 import trading_core as core
 
 STATE_PATH = os.path.join(core.DATA_DIR, "command_center.json")
-CHAT_TIMEOUT_S = 8.0
+CHAT_TIMEOUT_S = 25.0
 CHAT_HISTORY_MAX = 80
+CHAT_TURNS_IN_PROMPT = 12        # ultimi messaggi della conversazione passati all'LLM
+PROPOSAL_TTL_SEC = 600           # una proposta non confermata entro 10 minuti decade
 
 AGENTS = {
     "01": {"name": "Quant", "title": "Agente #1 · Quant", "icon": "sigma",
@@ -81,12 +85,15 @@ PERSONAS = {
     "coo": {"name": "COO · Capo delle Operazioni", "short": "COO", "vix_max": 25.0},
     "risk": {"name": "Risk Manager", "short": "Risk Manager", "vix_max": 20.0},
 }
-CONFIRM_RE = re.compile(r"\b(forza|forzalo|insisto|conferm\w*|procedi comunque|override|ordine diretto)\b", re.I)
+# Risposta a una proposta in sospeso: conferma o annullamento espliciti (a inizio messaggio)
+CONFIRM_RE = re.compile(r"^\s*(s[iì]|conferm\w*|procedi|ok|okay|va bene|vai|esegui|fallo|d'accordo|certo|approv\w*)\b", re.I)
+CANCEL_RE = re.compile(r"^\s*(no|annulla|lascia (stare|perdere)|niente|non (farlo|procedere)|rifiut\w*)\b", re.I)
 
 _lock = threading.Lock()
 _state = None
 _chat = deque(maxlen=CHAT_HISTORY_MAX)
 _chat_ids = itertools.count(1)
+_pending = {}                    # persona -> proposta in attesa di conferma {"cmd", "summary", "ts"}
 
 
 # --------------------------------------------------------------------------- stato persistente
@@ -297,37 +304,7 @@ def blocks_text(blocks):
 INTENTS = ("pause_agent", "resume_agent", "set_sensitivity", "block", "unblock", "clear_blocks",
            "aggressiveness_up", "aggressiveness_down", "pause_bot", "resume_bot", "advisor_mode", "auto_mode",
            "status", "unknown")
-
-_INTENT_SYSTEM = (
-    "Sei il parser dei comandi di un desk di trading. Converti il messaggio dell'utente (italiano) in JSON con le chiavi: "
-    "intent (uno tra: " + ", ".join(INTENTS) + "), agent (\"01\"..\"07\" o null; 01 Quant, 02 Micro/microstruttura, "
-    "03 Risk, 04 Macro/News, 05 CIO, 06 Guardian/Sentinel, 07 CHOP), level (0 standard, 1 selettivo, 2 rigoroso o null), "
-    "kind (\"asset\", \"sector\", \"symbol\" o null), value (asset: crypto|stocks; sector: tech|commodities|bonds|energy|"
-    "finance|biotech; symbol: ticker maiuscolo, crypto come BTC-USD; altrimenti null), sector_hint (settore citato in una "
-    "richiesta di aggressività, o null). 'Ferma/blocca gli acquisti su X' = block; 'riprendi/sblocca X' = unblock; "
-    "'più aggressivo/più rischio' = aggressiveness_up; 'più prudente/meno rischio' = aggressiveness_down; "
-    "'solo consigli/non eseguire ordini' = advisor_mode; domande sullo stato = status. Rispondi SOLO con il JSON."
-)
-_groq = None
-
-
-def _llm_parse(message):
-    global _groq
-    if not core.GROQ_KEY:
-        return None
-    try:
-        import groq
-        if _groq is None:
-            _groq = groq.Groq(api_key=core.GROQ_KEY, timeout=CHAT_TIMEOUT_S, max_retries=0)
-        res = _groq.chat.completions.create(
-            model=core.GROQ_MODELS[0], max_tokens=150, temperature=0, response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": _INTENT_SYSTEM}, {"role": "user", "content": message[:500]}])
-        data = json.loads(res.choices[0].message.content)
-        return data if data.get("intent") in INTENTS else None
-    except Exception as e:
-        print(f"[chat] Groq non disponibile, uso il parser a regole: {str(e)[:120]}", flush=True)
-        return None
-
+ACTION_INTENTS = tuple(i for i in INTENTS if i not in ("status", "unknown"))
 
 _AGENT_WORDS = [("01", r"quant"), ("02", r"micro"), ("03", r"risk|rischi"), ("04", r"macro|news|notizi"),
                 ("05", r"\bcio\b|direttor"), ("06", r"guardian|sentinel|sentinella"), ("07", r"chop|watchdog")]
@@ -379,11 +356,11 @@ def _rule_parse(message):
     return out
 
 
-def parse_command(message):
-    parsed = _llm_parse(message)
-    source = "Groq"
-    if not parsed:
-        parsed, source = _rule_parse(message), "regole"
+def normalize_command(parsed):
+    """Comando (dall'LLM o dalle regole) con chiavi complete e valori validati."""
+    parsed = dict(parsed or {})
+    if parsed.get("intent") not in INTENTS:
+        parsed["intent"] = "unknown"
     for key in ("agent", "level", "kind", "value", "sector_hint"):
         parsed.setdefault(key, None)
     if parsed["agent"] is not None:
@@ -397,7 +374,12 @@ def parse_command(message):
         parsed["level"] = int(parsed["level"]) if parsed["level"] is not None else None
     except (TypeError, ValueError):
         parsed["level"] = None
-    return parsed, source
+    return parsed
+
+
+def parse_command(message):
+    """Parser a regole di riserva (Groq non disponibile)."""
+    return normalize_command(_rule_parse(message)), "regole"
 
 
 def _segment_label(kind, value):
@@ -474,7 +456,7 @@ def _decide(cmd, ctx, persona, force):
         meta = AGENTS[aid]
         level = cmd["level"] if cmd["level"] is not None else 1
         if not meta["tunable"]:
-            return "IMPOSSIBILE", (f"{meta['title']} lavora con parametri di sicurezza fissi (stop -1.5% / -2.5%, Target 2R) "
+            return "IMPOSSIBILE", (f"{meta['title']} lavora con parametri di sicurezza fissi (stop 1.5x ATR nella fascia 1.2-3.5%, Target 1 a 2R) "
                                    "che non conviene toccare. Posso invece regolare la sensibilità di Quant, Micro, "
                                    "Macro/News o CIO."), None
         set_agent(aid, sensitivity=level)
@@ -582,27 +564,250 @@ def status_text(ctx, persona):
     blocks = blocks_text(st["blocks"])
     if blocks:
         parts.append("acquisti bloccati su " + ", ".join(blocks))
-    lead = "Rapporto operativo" if persona == "coo" else "Quadro dei rischi"
-    return (f"{lead}, Comandante: " + "; ".join(parts) + ". Posso mettere in pausa un agente, bloccare un mercato, "
-            "regolare l'aggressività o la sensibilità degli agenti.")
+    return "; ".join(parts) + "."
 
 
-def chat(persona, message, ctx, apply_bot_state):
-    """Messaggio al dirigente -> risposta. apply_bot_state(active) mette in pausa/riattiva il bot."""
-    persona = persona if persona in PERSONAS else "coo"
-    message = (message or "").strip()[:800]
-    _push("user", persona, message)
-    cmd, source = parse_command(message)
+# --------------------------------------------------------------------------- assistente conversazionale (Groq)
+
+ARCHITECTURE = f"""ARCHITETTURA DEL BOT (Quant Desk multi-agente, conto Alpaca, azioni USA + crypto, solo posizioni long)
+Flusso: Scout -> Stage 1-3 (Agenti #1 #2 #4 -> Fusion Engine #5) -> Comitato Rischi (#3) -> CIO (#5) -> Execution Desk; #6 sorveglia le posizioni, #7 il sistema.
+- Sciame di Scout: ~100 micro-scout su panieri dinamici (Nasdaq-100, top movers, crypto) cercano anomalie (breakout, volatilità, volumi, orderbook, balene, mean reversion). Un giro completo ogni {core.RADAR_INTERVAL_SEC // 60} minuti. Le anomalie diventano "schede" (pitch) con TTL {core.PROPOSAL_TTL_MIN} minuti.
+- Agente #1 Quant: statistica sui grafici (Hurst, GARCH, Kalman, Z-score, traiettoria attesa). Voto 0-100.
+- Agente #2 Microstruttura: flusso ordini (OFI, VPIN, iceberg, RVOL). OFI <= -0.5 su una posizione = uscita anticipata.
+- Agente #3 Risk Manager (non sospendibile): hard stop dinamico Stop = max(1.2%, min(3.5%, 1.5 x ATR%)) ricalcolato sulla volatilità reale di ogni posizione, Target 1 = 2 x Stop, CVaR, sizing, veto. Safety Net: esposizione massima 50% del capitale, massimo 4 posizioni, perdita massima per trade {core.MAX_RISK_PER_TRADE_PCT}% del capitale. Drawdown Controller: perdita giornaliera <= {core.DAILY_DRAWDOWN_LIMIT}% blocca i nuovi acquisti.
+- Agente #4 Macro & News: VIX/DXY, regime di mercato (SPY e BTC vs SMA50), notizie analizzate da Groq (News Score, catalizzatori, blackout trimestrali entro 24h). VIX > {core.VIX_RISK_CONTRACTION:.0f}: contrazione del rischio, asset ad alto beta bloccati.
+- Agente #5 CIO / Fusion Engine: Ensemble Score = Quant x 0.50 + News x 0.35 + OFI x 0.15. Ingresso solo con Ensemble >= {core.PIPELINE_BUY_SCORE:.0f}. Convinzione -> allocazione: 72-79 = 8-15%, 80-89 = 15-25%, 90+ SUPER_CONVICTION = 35-50%. Può ruotare capitale da posizioni con tesi degradata verso SUPER_CONVICTION.
+- Agente #6 Guardian: ogni {core.GUARDIAN_INTERVAL_SEC} secondi su ogni posizione. Hard stop sempre attivo; Target 1 a {core.TARGET_RISK_REWARD:.0f}R: vende il 50% e porta lo stop del resto a breakeven + commissioni; il runner segue il Trailing ATR Stop (Chandelier, 1.5x ATR azioni, 2x crypto) senza tetto. Uscite anticipate solo per Thesis Decay (#4), Orderbook Reversal (#2), News Shock (VIX >= 28 o +20% dall'ingresso). NESSUN time-stop.
+- Agente #7 CHOP Watchdog: salute dello sciame, auto-healing degli scout bloccati, audit ogni 30 secondi.
+- Rischio Zero (pulsante sul portafoglio): su una posizione in profitto vende subito il 50% e porta lo stop del resto a breakeven + commissioni; il resto resta gestito dal Guardian.
+- Modalità: Auto-Trading (ordini inviati) o Advisor (solo suggerimenti). Le azioni USA si negoziano lun-ven 09:30-16:00 New York; le crypto h24.
+- Centro di Comando: pausa/attivazione agenti (#3 mai), sensibilità (Standard/Selettivo/Rigoroso) di #1 #2 #4 #5, blocchi su asset class/settori/ticker, aggressività = esposizione massima tra 10% e 50%."""
+
+_PERSONA_STYLE = {
+    "coo": "Sei il COO (Capo delle Operazioni) del desk: pratico, orientato all'operatività e ai risultati.",
+    "risk": "Sei il Risk Manager del desk: prudente, metti sempre in evidenza rischi, drawdown e protezioni.",
+}
+
+_CHAT_RULES = """REGOLE DI RISPOSTA
+- Parla in italiano, con linguaggio semplice, fluido e naturale, come un collega esperto. Niente formule fisse, niente elenchi inutili. Di solito 2-6 frasi; più dettagli solo se richiesti.
+- Rispondi a qualsiasi domanda: funzionamento del software, mercati e concetti finanziari, stato del portafoglio.
+- Usa SOLO i dati dello STATO LIVE per numeri e fatti sul sistema. Se un dato manca dillo, non inventarlo.
+- Se chiedono perché il portafoglio è fermo o perché non si compra, ragiona sullo stato live e sui log: bot in pausa, modalità Advisor, mercato chiuso, VIX alto, drawdown, esposizione al limite, agenti in pausa, blocchi, nessuna scheda con Ensemble >= 72, veti delle notizie, cooldown. Indica la causa concreta con i numeri.
+- NON applichi mai nulla di tua iniziativa. Se un'azione del Centro di Comando è utile o richiesta, spiegala (cosa cambia, pro e rischi) e mettila in "proposal": verrà eseguita SOLO se l'utente risponde confermando. La richiesta di conferma viene aggiunta automaticamente in fondo: non ripeterla.
+- Non proporre mai ordini di acquisto/vendita su singoli titoli: non sono tra le azioni disponibili (l'utente può usare i pulsanti del portafoglio, es. Rischio Zero o Vendi subito).
+FORMATO: rispondi SOLO con un oggetto JSON {"reply": "testo per l'utente", "proposal": null oppure {...}}.
+proposal (solo se proponi un'azione): {"intent": uno tra """ + ", ".join(ACTION_INTENTS) + """, "agent": "01".."07" o null, "level": 0|1|2 o null (sensibilità: 0 Standard, 1 Selettivo, 2 Rigoroso), "kind": "asset"|"sector"|"symbol" o null, "value": (asset: crypto|stocks; sector: tech|commodities|bonds|energy|finance|biotech; symbol: ticker maiuscolo, crypto come BTC-USD) o null, "sector_hint": null, "summary": "descrizione breve dell'azione"}.
+Significato: pause_agent/resume_agent (agent), set_sensitivity (agent, level), block/unblock nuovi acquisti (kind, value), clear_blocks, aggressiveness_up (+10 punti di esposizione massima, max 50%), aggressiveness_down (-10, min 10%), pause_bot/resume_bot (tutto il sistema), advisor_mode (nessun ordine), auto_mode (ordini eseguiti)."""
+
+
+def _fmt(v, nd=2):
+    return "N/D" if v is None else f"{v:,.{nd}f}" if isinstance(v, (int, float)) else str(v)
+
+
+def live_state_text(ctx):
+    """Fotografia dello stato reale del sistema per il System Prompt."""
+    acc = ctx.get("account") or {}
+    eq = acc.get("portfolio") or 0
+    exposure = acc.get("exposure") or 0
+    cfg = ctx.get("config") or {}
+    st = snapshot_state()
+    lines = [f"Ora del bot: {core.now_local().strftime('%Y-%m-%d %H:%M')} ({core.now_local().strftime('%A')})",
+             f"Sistema: {'ATTIVO' if ctx.get('bot_active', True) else 'IN PAUSA'} · stato '{ctx.get('bot_status', 'N/D')}' · "
+             f"ultimo ciclo CIO {ctx.get('last_scan', 'N/D')} · modalità "
+             f"{'Auto-Trading' if cfg.get('auto_execute_trades') else 'Advisor (nessun ordine)' if cfg else 'N/D'}",
+             f"Mercato azionario USA: {'APERTO' if ctx.get('market_open') else 'CHIUSO' if ctx.get('market_open') is not None else 'N/D'} (crypto sempre aperte)",
+             f"Conto: patrimonio ${_fmt(eq)}, cassa ${_fmt(acc.get('cash'))}, buying power ${_fmt(acc.get('buying_power'))}, "
+             f"investito ${_fmt(exposure)} ({exposure / eq * 100 if eq else 0:.1f}%), esposizione massima "
+             f"{_fmt(cfg.get('max_exposure_pct'), 0)}%, PnL oggi ${_fmt(acc.get('daily_pnl_usd'))} ({_fmt(acc.get('daily_pnl_pct'))}%)",
+             f"VIX: {_fmt(ctx.get('vix'))} · Drawdown Controller: {'BLOCCA gli acquisti' if ctx.get('drawdown_blocked') else 'ok'}"]
+    macro = ctx.get("macro") or {}
+    if macro.get("regime"):
+        lines.append(f"Regime di mercato: {json.dumps(macro['regime'], ensure_ascii=False)[:300]}")
+    paused = [AGENTS[a]["title"] for a, v in st["agents"].items() if v["paused"]]
+    tuned = [f"{AGENTS[a]['title']} {SENSITIVITY_LABELS[v['sensitivity']]}" for a, v in st["agents"].items() if v["sensitivity"]]
+    lines.append("Agenti in pausa: " + (", ".join(paused) or "nessuno")
+                 + " · Sensibilità non standard: " + (", ".join(tuned) or "nessuna")
+                 + " · Blocchi acquisti: " + (", ".join(blocks_text(st["blocks"])) or "nessuno"))
+
+    positions = ctx.get("positions") or []
+    lines.append(f"\nPOSIZIONI APERTE ({len(positions)}):")
+    for p in positions[:10]:
+        lines.append(f"- {p['symbol']}: qty {p['qty']:g}, ingresso ${_fmt(p.get('avg_entry_price'), 4)}, prezzo "
+                     f"${_fmt(p.get('current_price'), 4)}, valore ${_fmt(p.get('market_value'))}, PnL ${_fmt(p.get('unrealized_pl'))} "
+                     f"({_fmt(p.get('unrealized_plpc'))}%)"
+                     + (f", stop effettivo {p['effective_stop_pct']:+.2f}%" if p.get("effective_stop_pct") is not None else "")
+                     + (" , runner (metà già incassata)" if p.get("scaled_out") else "")
+                     + (f" · Guardian: {p['hold_rationale']}" if p.get("hold_rationale") else ""))
+    if not positions:
+        lines.append("- nessuna")
+
+    cio = ctx.get("cio") or {}
+    if cio:
+        lines.append(f"\nULTIMO MANDATO CIO ({cio.get('timestamp', '?')}, {cio.get('trigger', '')}): {cio.get('action')} "
+                     f"{cio.get('buy_symbol') or cio.get('sell_symbol') or ''} — {str(cio.get('reason') or '')[:300]}")
+
+    radar = ctx.get("radar") or {}
+    channels = radar.get("channels") or {}
+    top = channels.get("top") or []
+    if top:
+        lines.append("\nMIGLIORI SCORE DELLO SCIAME (ultimo giro): " + ", ".join(
+            f"{t['symbol']} {_fmt(t.get('score'), 0)}" for t in top[:10]))
+    queue = radar.get("queue") or []
+    lines.append(f"Schede in coda: {len(queue)}" + (": " + "; ".join(
+        f"{q['symbol']} {q['status']} score {_fmt(q.get('score'), 0)}" for q in queue[:8]) if queue else ""))
+    recent = radar.get("recent") or []
+    if recent:
+        lines.append("Schede chiuse di recente: " + "; ".join(
+            f"{q['symbol']} {q['status']}" + (f" ({str(q.get('note') or '; '.join(q.get('vetoes') or []))[:120]})"
+                                               if q.get("note") or q.get("vetoes") else "") for q in recent[:8]))
+    if radar.get("cooldown"):
+        lines.append("Ticker in cooldown dopo un veto: " + ", ".join(f"{c['symbol']} ({c['minutes']} min)"
+                                                                   for c in radar["cooldown"][:10]))
+    rejected = ctx.get("rejected") or []
+    if rejected:
+        lines.append("\nULTIME BOCCIATURE DELLA PIPELINE (motivo):")
+        for r in rejected[:12]:
+            lines.append(f"- {r.get('time', '')} {r['symbol']} [{r.get('stage')}] {r.get('status')}: "
+                         f"{str(r.get('reason') or '')[:160]}" + (f" (score {_fmt(r.get('score'), 0)})" if r.get("score") is not None else ""))
+    logs = ctx.get("logs") or []
+    if logs:
+        lines.append("\nLOG RECENTI (dal più vecchio al più recente):")
+        lines += [_clean(l["text"])[:220] for l in logs[-35:]]
+    return "\n".join(lines)
+
+
+def build_system_prompt(persona, ctx):
+    pending = _pending.get(persona)
+    extra = (f"\nPROPOSTA IN ATTESA DI CONFERMA: {pending['summary']} (se l'utente ne parla, ricordagli che basta rispondere "
+             "\"sì\" per applicarla o \"no\" per annullarla).") if pending else ""
+    return "\n\n".join([_PERSONA_STYLE.get(persona, _PERSONA_STYLE["coo"])
+                        + " Lavori nella sala operativa di un bot di trading e parli con il suo proprietario.",
+                        ARCHITECTURE, "STATO LIVE DEL SISTEMA\n" + live_state_text(ctx) + extra, _CHAT_RULES])
+
+
+_groq = None
+
+
+def _groq_client():
+    global _groq
+    if _groq is None:
+        import groq
+        _groq = groq.Groq(api_key=core.GROQ_KEY, timeout=CHAT_TIMEOUT_S, max_retries=1)
+    return _groq
+
+
+def _llm_chat(persona, message, ctx):
+    """Risposta conversazionale dell'LLM -> {"reply", "proposal"} oppure None se Groq non è disponibile."""
+    if not core.GROQ_KEY:
+        return None
+    history = [m for m in chat_history(persona) if m.get("text")][-CHAT_TURNS_IN_PROMPT - 1:-1]   # senza il messaggio appena salvato
+    messages = [{"role": "system", "content": build_system_prompt(persona, ctx)}]
+    messages += [{"role": "user" if m["role"] == "user" else "assistant", "content": m["text"][:1500]} for m in history]
+    messages.append({"role": "user", "content": message})
+    last_error = None
+    for model in core.GROQ_MODELS[:3]:
+        try:
+            res = _groq_client().chat.completions.create(model=model, max_tokens=900, temperature=0.4,
+                                                         response_format={"type": "json_object"}, messages=messages)
+            data = json.loads(res.choices[0].message.content)
+            reply = str(data.get("reply") or "").strip()
+            if not reply:
+                raise ValueError("risposta vuota")
+            proposal = data.get("proposal")
+            if isinstance(proposal, dict) and proposal.get("intent") in ACTION_INTENTS:
+                summary = str(proposal.get("summary") or "").strip()
+                proposal = normalize_command(proposal)
+                proposal["summary"] = summary or describe_command(proposal)
+            else:
+                proposal = None
+            return {"reply": reply, "proposal": proposal, "model": model}
+        except Exception as e:
+            last_error = e
+    print(f"[chat] Groq non disponibile, uso il parser a regole: {str(last_error)[:160]}", flush=True)
+    return None
+
+
+def describe_command(cmd):
+    """Descrizione leggibile di un'azione proposta."""
+    agent = AGENTS.get(cmd.get("agent") or "", {}).get("title", "agente non specificato")
+    label = _segment_label(cmd.get("kind"), cmd.get("value")) if cmd.get("value") else "segmento non specificato"
+    level = SENSITIVITY_LABELS.get(cmd.get("level") if cmd.get("level") is not None else 1)
+    return {"pause_agent": f"mettere in pausa {agent}", "resume_agent": f"riattivare {agent}",
+            "set_sensitivity": f"impostare la sensibilità di {agent} su {level}",
+            "block": f"bloccare i nuovi acquisti su {label}", "unblock": f"sbloccare i nuovi acquisti su {label}",
+            "clear_blocks": "rimuovere tutti i blocchi sugli acquisti",
+            "aggressiveness_up": "aumentare l'esposizione massima di 10 punti (fino al 50%)",
+            "aggressiveness_down": "ridurre l'esposizione massima di 10 punti (fino al 10%)",
+            "pause_bot": "mettere in pausa tutto il sistema", "resume_bot": "riattivare il sistema",
+            "advisor_mode": "passare in modalità Advisor (nessun ordine inviato)",
+            "auto_mode": "passare in modalità Auto-Trading (ordini eseguiti)"}.get(cmd["intent"], cmd["intent"])
+
+
+def _apply(persona, cmd, ctx, apply_bot_state):
+    """Esegue una proposta confermata dall'utente con i controlli del Centro di Comando."""
     try:
-        verdict, text, change = _decide(cmd, ctx, persona, force=bool(CONFIRM_RE.search(message)))
+        verdict, text, change = _decide(cmd, ctx, persona, force=True)
     except ValueError as e:
         verdict, text, change = "IMPOSSIBILE", str(e), None
     if change and "bot_active" in change:
         apply_bot_state(change["bot_active"])
         text = ("Sistema riattivato: gli agenti riprendono il lavoro." if change["bot_active"] else
-                "Sistema in pausa: nessuna nuova scansione né acquisto. Le posizioni aperte restano dove sono.")
-    reply = _push("agent", persona, text, verdict=verdict, intent=cmd["intent"], parser=source, change=change)
-    return reply
+                "Sistema in pausa: nessuna nuova scansione né acquisto. Le posizioni aperte restano protette dagli stop.")
+    return verdict, text, change
+
+
+def chat(persona, message, ctx, apply_bot_state):
+    """Messaggio al dirigente -> risposta. Le azioni vengono solo proposte e applicate dopo la conferma esplicita.
+
+    apply_bot_state(active) mette in pausa/riattiva il bot.
+    """
+    persona = persona if persona in PERSONAS else "coo"
+    message = (message or "").strip()[:800]
+    _push("user", persona, message)
+    pending = _pending.get(persona)
+    if pending and time.time() - pending["ts"] > PROPOSAL_TTL_SEC:
+        _pending.pop(persona, None)
+        pending = None
+
+    # Risposta a una proposta in sospeso: conferma -> esecuzione, annullamento -> nessuna modifica
+    if pending and CONFIRM_RE.search(message) and len(message) <= 80:
+        _pending.pop(persona, None)
+        verdict, text, change = _apply(persona, pending["cmd"], ctx, apply_bot_state)
+        return _push("agent", persona, text, verdict=verdict, intent=pending["cmd"]["intent"], parser="conferma",
+                     change=change)
+    if pending and CANCEL_RE.search(message) and len(message) <= 80:
+        _pending.pop(persona, None)
+        return _push("agent", persona, f"Va bene, nessuna modifica: ho annullato la proposta ({pending['summary']}).",
+                     verdict="INFO", intent="cancel", parser="conferma", change=None)
+
+    llm = _llm_chat(persona, message, ctx)
+    if llm:
+        proposal = llm["proposal"]
+        reply = llm["reply"]
+        if proposal:
+            _pending[persona] = {"cmd": proposal, "summary": proposal["summary"], "ts": time.time()}
+            # Conferma obbligatoria: la richiesta esplicita c'è sempre, anche se l'LLM l'ha omessa
+            reply += f"\n\nProposta: {proposal['summary']}. Confermi? Rispondi \"sì\" per applicarla o \"no\" per annullare."
+        return _push("agent", persona, reply, verdict="PROPOSTA" if proposal else "INFO",
+                     intent=proposal["intent"] if proposal else "chat", parser=f"Groq · {llm['model']}", change=None,
+                     proposal=proposal["summary"] if proposal else None)
+
+    # Riserva senza LLM: comandi riconosciuti dalle regole, sempre con conferma
+    cmd, source = parse_command(message)
+    if cmd["intent"] in ACTION_INTENTS:
+        summary = describe_command(cmd)
+        _pending[persona] = {"cmd": cmd, "summary": summary, "ts": time.time()}
+        text = (f"Assistente IA non disponibile (Groq offline), ho interpretato la richiesta come: {summary}. "
+                "Vuoi che proceda? Rispondi \"sì\" per confermare o \"no\" per annullare.")
+        return _push("agent", persona, text, verdict="PROPOSTA", intent=cmd["intent"], parser=source, change=None,
+                     proposal=summary)
+    text = ("Assistente IA non disponibile (Groq offline): posso solo riepilogare lo stato. " + status_text(ctx, persona))
+    return _push("agent", persona, text, verdict="INFO", intent=cmd["intent"], parser=source, change=None)
+
+
+def pending_proposal(persona):
+    p = _pending.get(persona)
+    return p["summary"] if p and time.time() - p["ts"] <= PROPOSAL_TTL_SEC else None
 
 
 def _push(role, persona, text, **extra):

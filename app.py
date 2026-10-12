@@ -175,7 +175,7 @@ def journal_operation(status, pos=None):
     """Tipo di operazione per il registro: STOP LOSS / TAKE PROFIT dai trigger difensivi, altrimenti SELL."""
     if status == "STOP_LOSS":
         return "STOP LOSS"
-    if status in ("TAKE_PROFIT", "SCALE_OUT"):
+    if status in ("TAKE_PROFIT", "SCALE_OUT", "DE_RISK"):
         return "TAKE PROFIT"
     if status == "BREAKEVEN_STOP":
         return "STOP LOSS"
@@ -327,7 +327,9 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         # Stop effettivo dell'Agente #6 (breakeven / trailing): poi lo aggiorna il loop del Guardian ogni 20 secondi
         with state_lock:
             for key, g in trailing.items():
-                bot_state["ledger_open"].setdefault(key, {})["effective_stop_pct"] = g.get("effective_stop_pct")
+                bot_state["ledger_open"].setdefault(key, {}).update(
+                    effective_stop_pct=g.get("effective_stop_pct"), hard_stop_pct=g.get("stop_pct"),
+                    target_pct=g.get("target_pct"), atr_pct=g.get("atr_pct"), stop_basis=g.get("stop_basis"))
         risk = core.risk_manager(positions, analysis, acc, cfg, log=log_message, stops=stops, trailing=trailing, ledger=ledger,
                                  market_open=market_open)
         sold = set()
@@ -540,12 +542,11 @@ def radar_loop():
                     core.release_memory()   # i dati del blocco appena scansionato non servono più
                     # Mercato USA chiuso: pulse silenzioso dei panieri azionari (si autolimita a 1 volta ogni 15 min)
                     core.run_closed_market_pulse(log=log_message)
-                # Controllo rapido degli stop (stop del CIO salvato nell'ordine, altrimenti quello di riserva)
+                # Controllo rapido degli stop dinamici ATR di ogni posizione
                 stops = bot_state.get("ledger_open", {})
-                fallback = core.get_config()["stop_loss_pct"]
                 for p in positions:
                     info = stops.get(core.normalize_symbol(p["symbol"])) or {}
-                    stop = core.clamp_stop_pct(info.get("stop_pct") or fallback)   # hard stop -1.5% / -2.5%
+                    stop = core.position_stop(p, info)["stop_pct"]   # hard stop 1.5 x ATR reale (fascia -1.2% / -3.5%)
                     # Agente #6: stop rialzato a breakeven o dal trailing ATR (aggiornato dal loop del Guardian)
                     if info.get("effective_stop_pct") is not None:
                         stop = max(stop, info["effective_stop_pct"])
@@ -585,6 +586,9 @@ def guardian_tick():
             entry = bot_state["ledger_open"].setdefault(key, {})
             entry["effective_stop_pct"] = g["effective_stop_pct"]
             entry["hold_rationale"] = g.get("hold_rationale")
+            # Stop e Target 1 dinamici sulla volatilità reale, per la dashboard
+            entry.update(hard_stop_pct=g.get("stop_pct"), target_pct=g.get("target_pct"), atr_pct=g.get("atr_pct"),
+                         stop_basis=g.get("stop_basis"))
     for p in positions:
         key, g = core.normalize_symbol(p["symbol"]), evals[core.normalize_symbol(p["symbol"])]
         if _guardian_state["stops"].get(key) != g["effective_stop_pct"]:
@@ -793,7 +797,9 @@ def positions_with_allocation():
         info = bot_state.get("ledger_open", {}).get(key, {})
         g = guardian.get(key) or {}
         out.append({**p, "allocation_pct": info.get("allocation_pct"), "conviction": info.get("conviction"),
-                    "stop_pct": core.clamp_stop_pct(info["stop_pct"]) if info.get("stop_pct") else None,
+                    # stop/target dinamici ATR calcolati dal Guardian (ogni 20 s)
+                    "stop_pct": info.get("hard_stop_pct"), "target_pct": info.get("target_pct"),
+                    "atr_pct": info.get("atr_pct"), "stop_basis": info.get("stop_basis"),
                     "effective_stop_pct": info.get("effective_stop_pct"), "opened_at": info.get("opened_at"),
                     "buy_thesis": g.get("buy_thesis"), "hold_rationale": g.get("hold_rationale"),
                     "exit_reason": g.get("exit_reason"), "trade_class": g.get("trade_class"), "horizon": g.get("horizon"),
@@ -866,20 +872,20 @@ def api_position_detail(symbol):
             rationale = {**rationale, "agents": live}
             rationale_source = "ultima valutazione disponibile (acquisto non registrato nel journal)"
     avg = pos["avg_entry_price"]
-    stop_pct = core.clamp_stop_pct(info.get("stop_pct") or core.get_config()["stop_loss_pct"])
-    package = rationale.get("risk_package") or {}
-    agents = rationale.get("agents") or {}
-    take_profit = package.get("target_price") or (agents.get("agent_03_risk") or {}).get("take_profit_price")
+    dyn = core.position_stop(pos, info)   # Stop e Target 1 sulla volatilità reale (ATR 14)
+    stop_pct = dyn["stop_pct"]
+    take_profit = round(avg * (1 + dyn["target_pct"] / 100), 6) if avg else None
     g = core.guardian_snapshot()["positions"].get(core.normalize_symbol(pos["symbol"])) or {}
     return jsonify({
         "position": pos,
         "opened_at": info.get("opened_at") or (entry or {}).get("timestamp"),
         "allocation_pct": info.get("allocation_pct"), "conviction": info.get("conviction"),
         "stop_loss": {"pct": stop_pct, "price": round(avg * (1 + stop_pct / 100), 6) if avg else None,
-                      "source": "hard stop 1.5x ATR (fascia 1.5-2.5%)" if info.get("stop_pct") else "hard stop di riserva (2.5%)",
-                      "effective_pct": info.get("effective_stop_pct")},
-        "take_profit": {"price": take_profit, "label": "Target 1 (2R): scaling out 50%, poi trailing senza tetto",
-                        "pct": round((take_profit / avg - 1) * 100, 2) if take_profit and avg else None},
+                      "source": f"hard stop {dyn['stop_basis']}" + (f" (ATR {dyn['atr_pct']:.2f}%)" if dyn["atr_pct"] else "")
+                                + ", fascia 1.2-3.5%",
+                      "atr_pct": dyn["atr_pct"], "effective_pct": info.get("effective_stop_pct")},
+        "take_profit": {"price": take_profit, "label": "Target 1 (2R = 2 x stop): scaling out 50%, poi trailing senza tetto",
+                        "pct": dyn["target_pct"]},
         "guardian": {"buy_thesis": g.get("buy_thesis"), "hold_rationale": g.get("hold_rationale"),
                      "exit_reason": g.get("exit_reason"), "trade_class": g.get("trade_class"), "horizon": g.get("horizon"),
                      "scale_out": g.get("scale_out"), "hold_updated_at": g.get("hold_updated_at")},
@@ -911,6 +917,67 @@ def api_position_close(symbol):
     with _cache_lock:
         _cache.clear()
     return jsonify({"status": "success", "message": f"Vendita di {pos['symbol']} inviata."})
+
+DE_RISK_SELL_PCT = 50.0
+
+@app.route("/api/position/de-risk", methods=["POST"])
+@require_token
+def api_position_de_risk():
+    """🛡️ RISCHIO ZERO: vende il 50% a mercato e porta lo stop del resto a breakeven + commissioni.
+
+    Solo su posizioni in profitto. Il restante 50% resta aperto e gestito dall'Agente #6 come runner
+    (Trailing ATR Stop standard), esattamente come dopo il Target 1.
+    """
+    if not alpaca_client:
+        return jsonify({"status": "error", "message": "Credenziali Alpaca non configurate."}), 503
+    data = request.get_json(silent=True) or {}
+    symbol = str(data.get("symbol") or "").strip()
+    if not symbol:
+        return jsonify({"status": "error", "message": "Specificare il simbolo della posizione"}), 400
+    pos = _find_position(symbol)
+    if not pos:
+        return jsonify({"status": "error", "message": f"Nessuna posizione aperta su {symbol}"}), 404
+    if "SHORT" in pos["side"]:
+        return jsonify({"status": "error", "message": f"{pos['symbol']}: Rischio Zero disponibile solo su posizioni long"}), 400
+    key = core.normalize_symbol(pos["symbol"])
+    state = core.guardian_position_state(pos)
+    check = core.portfolio_guardian().de_risk_check(pos["avg_entry_price"], pos["current_price"], pos["is_crypto"],
+                                                    scaled_out=bool(state.get("scaled")), sell_pct=DE_RISK_SELL_PCT)
+    if not check["ok"]:
+        return jsonify({"status": "error", "message": f"Rischio Zero non applicabile a {pos['symbol']}: {check['reason']}"}), 409
+    # Stesso lock del CIO e del Guardian: mai due vendite della stessa posizione in parallelo
+    if not scan_lock.acquire(blocking=False):
+        return jsonify({"status": "warning", "message": "Ciclo del CIO o del Guardian in corso: riprova tra qualche secondo."}), 409
+    try:
+        pending = core.get_pending_order_symbols(log=log_message)
+        if pending is None:
+            return jsonify({"status": "error", "message": "Stato degli ordini pendenti non disponibile: riprova."}), 503
+        if key in pending:
+            return jsonify({"status": "error", "message": f"{pos['symbol']}: c'è già un ordine pendente, riprova dopo l'esecuzione."}), 409
+        try:
+            order = core.close_position_pct(pos["symbol"], DE_RISK_SELL_PCT)
+        except Exception as e:
+            log_message(f"Errore Rischio Zero {pos['symbol']}: {e}")
+            return jsonify({"status": "error", "message": f"Vendita parziale di {pos['symbol']} non riuscita: {e}"}), 502
+        reason = f"Rischio Zero (dashboard): {check['reason']}"
+        record_sell(pos, journal_operation("DE_RISK"), order, pct=DE_RISK_SELL_PCT, reason=reason, source="manual",
+                    action="DE_RISK")
+    finally:
+        scan_lock.release()
+    with state_lock:   # il Radar usa subito il nuovo stop; il Guardian lo ricalcola (trailing ATR) al prossimo giro
+        bot_state["ledger_open"].setdefault(key, {})["effective_stop_pct"] = round(check["breakeven_pct"], 2)
+    note = "" if pos["is_crypto"] or core.is_market_open(log=lambda m: None) else " (mercato chiuso: eseguita all'apertura)"
+    log_message(f"🛡️ RISCHIO ZERO {pos['symbol']}: venduto {DE_RISK_SELL_PCT:.0f}% (ID: {getattr(order, 'id', '?')}), "
+                f"stop del resto a breakeven ${check['stop_price']:,.4f}{note}")
+    core.agent_say("Agente #6 Guardian", f"🛡️ Rischio Zero su {pos['symbol']}: {check['reason']}", "ok")
+    with _cache_lock:
+        _cache.clear()
+    return jsonify({"status": "success",
+                    "message": f"Rischio Zero attivo su {pos['symbol']}: venduto {DE_RISK_SELL_PCT:.0f}%, stop del resto a "
+                               f"breakeven ${check['stop_price']:,.4f}{note}.",
+                    "sold_pct": DE_RISK_SELL_PCT, "sold_qty": pos["qty"] * DE_RISK_SELL_PCT / 100,
+                    "breakeven_stop_pct": check["breakeven_pct"], "breakeven_stop_price": check["stop_price"],
+                    "order_id": str(getattr(order, "id", "") or "")})
 
 @app.route("/api/history")
 @require_login
@@ -1034,24 +1101,37 @@ def api_blocks():
     return jsonify({"status": "success", "blocks": cc.snapshot_state()["blocks"]})
 
 def _chat_context():
+    """Stato reale del sistema per l'assistente: conto, posizioni (con Guardian), VIX, sciame, bocciature e log."""
     radar = core.radar_snapshot()
     acc = cached("account_pnl", account_with_pnl)
     dd = (core.load_state().get("drawdown") or {})
-    return {"account": acc, "positions": cached("positions", get_open_positions), "radar": radar,
-            "vix": ((radar.get("channels") or {}).get("macro") or {}).get("vix"),
+    macro = (radar.get("channels") or {}).get("macro") or {}
+    with state_lock:
+        logs = list(bot_state["logs"])[-60:]
+        cio = dict(bot_state["cio"])
+    try:
+        rejected = core.pitch_audit().rejected(limit=15)["rows"]
+    except Exception:
+        rejected = []
+    return {"account": acc, "positions": positions_with_allocation(), "radar": radar, "macro": macro,
+            "vix": macro.get("vix"),
             "drawdown_blocked": time.time() < float(dd.get("block_until", 0) or 0)
-                                or (acc.get("daily_pnl_pct") or 0) <= core.DAILY_DRAWDOWN_LIMIT}
+                                or (acc.get("daily_pnl_pct") or 0) <= core.DAILY_DRAWDOWN_LIMIT,
+            "config": core.get_config(), "market_open": core.is_us_market_open(),
+            "bot_active": bot_state["active"], "bot_status": bot_state["status"], "last_scan": bot_state["last_scan"],
+            "cio": cio, "logs": logs, "rejected": rejected}
 
 @app.route("/api/chat", methods=["GET"])
 @require_login
 def api_chat_history():
     return jsonify({"messages": cc.chat_history(request.args.get("persona") or None),
-                    "personas": {k: v["name"] for k, v in cc.PERSONAS.items()}})
+                    "personas": {k: v["name"] for k, v in cc.PERSONAS.items()},
+                    "pending": {k: cc.pending_proposal(k) for k in cc.PERSONAS}})
 
 @app.route("/api/chat", methods=["POST"])
 @require_token
 def api_chat():
-    """Stanza dei Dipendenti AI: ordine al COO o al Risk Manager, valutato sui dati live e applicato se vantaggioso."""
+    """Stanza dei Dipendenti AI: assistente conversazionale (Groq) sui dati live; le azioni richiedono conferma."""
     data = request.get_json(silent=True) or {}
     message = str(data.get("message") or "").strip()
     if not message:
@@ -1062,7 +1142,7 @@ def api_chat():
         log_message(f"💬 [Chat] Contesto non disponibile: {e}")
         ctx = {"account": {}, "positions": [], "radar": {}, "vix": None, "drawdown_blocked": False}
     reply = cc.chat(data.get("persona", "coo"), message, ctx, set_bot_active)
-    log_message(f"💬 [{cc.PERSONAS[reply['persona']]['short']}] {reply['verdict']}: {reply['text']}")
+    log_message(f"💬 [{cc.PERSONAS[reply['persona']]['short']}] {reply['verdict']}: {core.summarize_reason(reply['text'], 200)}")
     if reply.get("change"):
         core.agent_say(cc.PERSONAS[reply["persona"]]["short"], f"Ordine applicato: {reply['text']}", "alert")
         with _cache_lock:

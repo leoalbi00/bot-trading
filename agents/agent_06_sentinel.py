@@ -5,7 +5,8 @@ Due funzioni:
    o con ordini pendenti (esposizione 50% e 4 posizioni sono la Safety Net dell'Agente #3).
 2. evaluate_position (monitoraggio continuo). NESSUN TIME-STOP: una posizione piatta, in consolidamento
    o in accumulo resta aperta finché la tesi è valida. Il tempo trascorso non chiude mai una posizione.
-   - Hard Stop Loss (1.5%-2.5%, Agente #3): sempre attivo;
+   - Hard Stop Loss dinamico (1.5 x ATR% nella fascia 1.2%-3.5%, Agente #3): sempre attivo, ricalcolato
+     sulla volatilità reale di ogni posizione (anche quelle aperte senza scheda di ingresso);
    - Target 1 (Scaling Out): a target_r x R (2R) si vende scale_out_pct% (50%) e lo stop del resto va a
      breakeven + commissioni;
    - Runner senza tetto ai profitti: il restante 50% è gestito SOLO dal Trailing Stop ATR (Chandelier Exit)
@@ -23,8 +24,10 @@ EXIT_LABELS = {
     "STOP_LOSS": "Hard Stop Loss", "TRAILING_STOP": "Trailing ATR Stop", "BREAKEVEN_STOP": "Stop a Breakeven",
     "THESIS_DECAY": "Thesis Decay (Agente #4)", "OFI_REVERSAL": "Orderbook Reversal (Agente #2)",
     "NEWS_SHOCK": "News Shock / Panico Macro", "ROTATION": "Rotazione verso SUPER_CONVICTION (tesi degradata)",
-    "MANUAL": "Vendita manuale", "PANIC": "PANIC - chiudi tutto",
+    "MANUAL": "Vendita manuale", "PANIC": "PANIC - chiudi tutto", "DE_RISK": "Rischio Zero (manuale)",
 }
+# Etichetta della prima metà incassata (Target 1 automatico o Rischio Zero manuale) nelle schede di uscita
+SCALE_LABELS = {"SCALE_OUT": "Target 2R", "DE_RISK": "Rischio Zero"}
 
 
 def _usd(value: Optional[float]) -> str:
@@ -75,6 +78,29 @@ class PortfolioGuardianAgent:
     def breakeven_pct(self, is_crypto: bool) -> float:
         """Breakeven + commissioni stimate (spread/fee crypto, fee regolamentari azioni)."""
         return self.fee_buffer_crypto_pct if is_crypto else self.fee_buffer_stock_pct
+
+    def de_risk_check(self, entry: float, price: float, is_crypto: bool, scaled_out: bool = False,
+                      sell_pct: float = 50.0) -> Dict[str, Any]:
+        """Rischio Zero (manuale): vende sell_pct% a mercato e porta lo stop del resto a breakeven + commissioni.
+
+        Ammesso solo con la posizione in profitto oltre il buffer commissioni (altrimenti lo stop a breakeven
+        scatterebbe subito) e se la prima metà non è già stata incassata. Il resto diventa il runner
+        gestito dal Trailing ATR Stop, come dopo il Target 1.
+        """
+        if entry <= 0 or price <= 0:
+            return {"ok": False, "reason": "prezzi non disponibili"}
+        pnl = (price / entry - 1) * 100
+        be = self.breakeven_pct(is_crypto)
+        if scaled_out:
+            return {"ok": False, "pnl_pct": round(pnl, 2),
+                    "reason": "metà posizione già incassata: il runner è già a breakeven con Trailing ATR Stop"}
+        if pnl <= be:
+            return {"ok": False, "pnl_pct": round(pnl, 2),
+                    "reason": f"posizione non in profitto sufficiente (PnL {pnl:+.2f}% ≤ breakeven + commissioni {be:+.2f}%)"}
+        return {"ok": True, "pnl_pct": round(pnl, 2), "sell_pct": sell_pct, "breakeven_pct": be,
+                "stop_price": entry * (1 + be / 100),
+                "reason": f"PnL {pnl:+.2f}%: incasso {sell_pct:.0f}%, restante {100 - sell_pct:.0f}% con stop a "
+                          f"breakeven + commissioni ({be:+.2f}%) e Trailing ATR Stop"}
 
     def evaluate_position(
         self,
@@ -200,7 +226,8 @@ class PortfolioGuardianAgent:
         if g.get("scaled_out"):
             parts.append(f"runner: stop {g['effective_stop_pct']:+.2f}% ({g.get('stop_source')})")
         else:
-            parts.append(f"Target 1 a {g.get('target_pct', 0):+.2f}%, hard stop {g.get('stop_pct', 0):+.2f}%")
+            parts.append(f"Target 1 a {g.get('target_pct', 0):+.2f}% ({self.target_r:g}R), "
+                         f"Stop a {g.get('stop_pct', 0):+.2f}% ({g.get('stop_basis') or 'hard stop'})")
         return ", ".join(parts)
 
     @staticmethod
@@ -209,11 +236,12 @@ class PortfolioGuardianAgent:
         """Scheda di uscita: es. "Chiuso 50% su Target 2R, restante 50% su Trailing ATR Stop a $XXX"."""
         label = EXIT_LABELS.get(action, action.replace("_", " ").title())
         level = stop_price if action in ("TRAILING_STOP", "BREAKEVEN_STOP", "STOP_LOSS") and stop_price else price
-        if action == "SCALE_OUT":
-            return (f"Chiuso {sell_pct:.0f}% su Target 2R a {_usd(price)}, restante {100 - sell_pct:.0f}% in corsa "
+        if action in SCALE_LABELS:
+            return (f"Chiuso {sell_pct:.0f}% su {SCALE_LABELS[action]} a {_usd(price)}, restante {100 - sell_pct:.0f}% in corsa "
                     "con Trailing ATR Stop (stop a breakeven + commissioni)")
         if scale_out:
             pct = float(scale_out.get("pct") or 50)
-            return (f"Chiuso {pct:.0f}% su Target 2R a {_usd(scale_out.get('price'))}, restante {100 - pct:.0f}% su "
+            first = SCALE_LABELS.get(scale_out.get("action"), "Target 2R")
+            return (f"Chiuso {pct:.0f}% su {first} a {_usd(scale_out.get('price'))}, restante {100 - pct:.0f}% su "
                     f"{label} a {_usd(level)}" + (f" ({detail})" if detail and action not in ("TRAILING_STOP",) else ""))
         return f"Chiuso {sell_pct:.0f}% su {label} a {_usd(level)}" + (f": {detail}" if detail else "")

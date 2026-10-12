@@ -9,6 +9,7 @@ import re
 import datetime as dt
 from zoneinfo import ZoneInfo
 import json
+import math
 import secrets
 import uuid
 import threading
@@ -567,6 +568,7 @@ _groq_client = None
 
 from agents.agent_07_chop import GROQ_TIMEOUT_S
 from agents.agent_03_risk import (MAX_EXPOSURE_PCT as RISK_MAX_EXPOSURE_PCT, MAX_POSITIONS as RISK_MAX_POSITIONS,
+                                  HARD_STOP_ATR_MULT, HARD_STOP_MAX_PCT, HARD_STOP_MIN_PCT,
                                   clamp_stop_pct, crypto_night_blocked, hard_stop_pct)
 
 
@@ -1063,7 +1065,7 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
     """FASE 2: classifica ogni posizione e calcola fondi ed esposizione.
 
     NESSUN TIME-STOP e nessuna uscita tecnica: una posizione piatta o in consolidamento resta aperta.
-    Stati: STOP_LOSS (hard stop 1.5-2.5%) e le uscite dell'Agente #6 -> SCALE_OUT (vendita parziale al Target 2R),
+    Stati: STOP_LOSS (hard stop 1.5 x ATR, fascia 1.2-3.5%) e le uscite dell'Agente #6 -> SCALE_OUT (vendita parziale al Target 2R),
            TRAILING_STOP, BREAKEVEN_STOP, THESIS_DECAY, OFI_REVERSAL, NEWS_SHOCK;
            OK, NO_DATA -> mantenute.
     sell_pct: quota da vendere (100 tranne lo scaling out).
@@ -1079,7 +1081,7 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
         opened = open_info.get(key, {}).get("opened_at")
         held_min = (now - opened).total_seconds() / 60 if opened else None  # None = oltre lo storico (90 gg)
         held_txt = "da oltre 90 giorni" if held_min is None else f"da {held_min:.0f} min"
-        stop = clamp_stop_pct((stops or {}).get(key, cfg["stop_loss_pct"]))
+        stop = clamp_stop_pct((stops or {}).get(key))   # stop ATR della posizione (volatility_agent)
         trail = (trailing or {}).get(key)
         if pl <= stop:
             status, reason = "STOP_LOSS", f"PnL {pl:.2f}% ≤ hard stop {stop:.2f}%"
@@ -1170,8 +1172,8 @@ BOARDROOM_STATE_PATH = os.path.join(DATA_DIR, "boardroom_state.json")
 SENTIMENT_VETO = -40
 ATR_MULT_STOCK = 1.5            # Chandelier Exit del runner: distanza dal picco = mult x ATR% giornaliero
 ATR_MULT_CRYPTO = 2.0
-STOP_TIGHTEST_PCT = -1.5       # Hard Stop Loss non negoziabile (Agente #3): tra -1.5% ...
-STOP_WIDEST_PCT = -2.5         # ... e -2.5%
+STOP_TIGHTEST_PCT = -HARD_STOP_MIN_PCT   # Hard Stop Loss non negoziabile (Agente #3): tra -1.2% ...
+STOP_WIDEST_PCT = -HARD_STOP_MAX_PCT     # ... e -3.5% (1.5 x ATR%)
 MACRO_RISK_OFF_FACTOR = 0.5
 VOLUME_LOW_RATIO = 0.8
 DAILY_DRAWDOWN_LIMIT = -5.0
@@ -1284,8 +1286,22 @@ def atr_pct(df):
 
 
 def dynamic_stop_pct(atr_percent, crypto=False):
-    """Hard stop non negoziabile dell'Agente #3: 1.5 x ATR% riportato tra -1.5% e -2.5% (azioni e crypto)."""
+    """Hard stop non negoziabile dell'Agente #3: max(1.2%, min(3.5%, 1.5 x ATR%)) (azioni e crypto)."""
     return hard_stop_pct(atr_percent)
+
+
+def hourly_atr_pct(yf_symbol, crypto=False):
+    """ATR(14) sul grafico orario riportato su base giornaliera (x radice delle ore di contrattazione).
+
+    Riserva quando le barre giornaliere non bastano (ticker quotati da poco, crypto nuove)."""
+    try:
+        df = yf.Ticker(yf_data_symbol(yf_symbol)).history(period="1mo", interval="1h")
+    except Exception:
+        return None
+    if len(df) < 20:
+        return None
+    hourly = atr_pct(df)
+    return round(hourly * math.sqrt(24 if crypto else 6.5), 2) if hourly and hourly > 0 else None
 
 
 def _peak_since(yf_symbol, opened_at):
@@ -1401,7 +1417,7 @@ def guardian_position_state(p, vix=None):
 def guardian_record_exit(pos, action, detail="", pct=100, stop_price=None):
     """Vendita inviata: genera exit_reason e aggiorna la memoria dello scaling out. Restituisce exit_reason.
 
-    SCALE_OUT: il resto è il runner (stop a breakeven + commissioni, trailing ATR senza tetto).
+    SCALE_OUT / DE_RISK: il resto è il runner (stop a breakeven + commissioni, trailing ATR senza tetto).
     Chiusura totale: lo stato resta finché Alpaca non conferma, poi passa tra le chiusure recenti (guardian_prune).
     """
     key = normalize_symbol(pos["symbol"])
@@ -1413,9 +1429,10 @@ def guardian_record_exit(pos, action, detail="", pct=100, stop_price=None):
                                                   scale_out=st.get("scale_out") if full else None,
                                                   stop_price=stop_price, detail=detail)
         st["exit_reason"] = reason
-        if action == "SCALE_OUT" and not full:
+        if action in ("SCALE_OUT", "DE_RISK") and not full:     # DE_RISK: Rischio Zero manuale dalla dashboard
             st["scaled"] = True
-            st["scale_out"] = {"price": pos.get("current_price"), "pct": pct, "at": now_local().isoformat(timespec="seconds")}
+            st["scale_out"] = {"price": pos.get("current_price"), "pct": pct, "action": action,
+                               "at": now_local().isoformat(timespec="seconds")}
         if full:
             st.update(closing=True, exit_action=action, exit_price=pos.get("current_price"),
                       closed_at=now_local().isoformat(timespec="seconds"))
@@ -1502,18 +1519,47 @@ def thesis_degraded(yf_symbol):
     return False, f"tesi intatta (OFI {ofi:+.2f})" if ofi is not None else "tesi intatta"
 
 
-def guardian_atr(yf_symbol):
-    """ATR% giornaliero con cache di 1 ora (None se le barre non sono disponibili)."""
+def guardian_atr_info(yf_symbol):
+    """(ATR% giornaliero, fonte) con cache di 1 ora: grafico giornaliero, altrimenti orario riportato al giorno.
+
+    (None, None) se nessuna barra è disponibile."""
     key = normalize_symbol(yf_symbol)
     with _guardian_cache_lock:
         cached = _guardian_cache["atr"].get(key)
     if cached and time.time() - cached[0] < GUARDIAN_ATR_TTL_SEC:
-        return cached[1]
+        return cached[1], cached[2]
     df = get_daily_bars(yf_symbol)
-    value = atr_pct(df) if df is not None else None
+    value, basis = (atr_pct(df), "giornaliero") if df is not None else (None, None)
+    if not value or value <= 0 or not math.isfinite(value):
+        value = hourly_atr_pct(yf_symbol, crypto=is_crypto(yf_symbol))
+        basis = "orario" if value else None
     with _guardian_cache_lock:
-        _guardian_cache["atr"][key] = (time.time(), value)
-    return value
+        _guardian_cache["atr"][key] = (time.time(), value, basis)
+    return value, basis
+
+
+def guardian_atr(yf_symbol):
+    """ATR% giornaliero con cache di 1 ora (None se le barre non sono disponibili)."""
+    return guardian_atr_info(yf_symbol)[0]
+
+
+def position_stop(p, info=None):
+    """Stop Loss e Target 1 dinamici di una posizione, ricalcolati sulla volatilità reale (ATR 14).
+
+    Stop_Loss_Pct = max(1.2%, min(3.5%, 1.5 x ATR%)), Target_1_Pct = 2 x Stop_Loss_Pct. Vale per ogni posizione,
+    anche per i ticker aperti senza scheda di ingresso. Solo se l'ATR non è leggibile da nessun grafico si usa lo
+    stop ATR salvato dal CIO all'ingresso, e in ultima istanza il limite largo della fascia.
+    -> {"stop_pct", "target_pct", "atr_pct", "stop_basis"}
+    """
+    atr, basis = guardian_atr_info(p["yf_symbol"])
+    if atr:
+        stop = dynamic_stop_pct(atr)
+        label = f"{HARD_STOP_ATR_MULT:g}x ATR" + (" orario" if basis == "orario" else "")
+    elif (info or {}).get("stop_pct"):
+        stop, label = clamp_stop_pct(info["stop_pct"]), "ATR all'ingresso (CIO)"
+    else:
+        stop, label = clamp_stop_pct(None), "ATR N/D: limite della fascia"
+    return {"stop_pct": stop, "target_pct": round(abs(stop) * TARGET_RISK_REWARD, 2), "atr_pct": atr, "stop_basis": label}
 
 
 def guardian_peak(yf_symbol, opened_at, price):
@@ -1533,7 +1579,7 @@ def guardian_peak(yf_symbol, opened_at, price):
         return c["max"]
 
 
-def guardian_evaluate(p, info, stop, atr, market_open, now=None):
+def guardian_evaluate(p, info, stop, atr, market_open, now=None, stop_basis=None):
     """Agente #6 su una posizione: hard stop, Target 1 (scaling out), runner con trailing ATR, uscite anticipate
     (Thesis Decay, Orderbook Reversal, News Shock) e scheda dinamica hold_rationale."""
     opened = info.get("opened_at")
@@ -1550,6 +1596,8 @@ def guardian_evaluate(p, info, stop, atr, market_open, now=None):
     g = agent.evaluate_position(entry=entry, price=price, peak=peak, stop_pct=clamp_stop_pct(stop), atr_pct=atr,
                                 is_crypto=p["is_crypto"], market_open=market_open, scaled_out=bool(st.get("scaled")),
                                 signals=sig)
+    g["stop_basis"] = stop_basis
+    g["atr_pct"] = atr
     elapsed = ((now - opened).total_seconds() / 60 if opened else
                (time.time() - st["registered_at"]) / 60 if st.get("registered_at") else None)
     trajectory, expected = agent.trajectory_status(st.get("path"), entry, price, elapsed)
@@ -1567,9 +1615,8 @@ def guardian_watch(positions, open_info, cfg, market_open):
     for p in positions:
         key = normalize_symbol(p["symbol"])
         info = open_info.get(key, {})
-        atr = guardian_atr(p["yf_symbol"])
-        stop = info.get("stop_pct") or (dynamic_stop_pct(atr) if atr else cfg["stop_loss_pct"])
-        out[key] = guardian_evaluate(p, info, stop, atr, market_open, now=now)
+        s = position_stop(p, info)
+        out[key] = guardian_evaluate(p, info, s["stop_pct"], s["atr_pct"], market_open, now=now, stop_basis=s["stop_basis"])
     _save_hold_rationales(out)
     return out
 
@@ -1588,7 +1635,7 @@ def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_ope
     """ATR e hard stop per ogni simbolo; per le posizioni aperte l'Agente #6 (Portfolio Guardian) calcola
     Target 1 (scaling out a 2R), runner a breakeven con trailing ATR, Thesis Decay, Orderbook Reversal e News Shock.
 
-    - stop iniziale di una posizione: quello del CIO salvato nel client_order_id, riportato nella fascia -1.5/-2.5%;
+    - hard stop di ogni posizione: 1.5 x ATR% reale nella fascia -1.2/-3.5% (position_stop), Target 1 a 2R;
     - picco: massimo dei prezzi dall'apertura (data letta dagli ordini Alpaca).
     Restituisce (vol, stops, guardian) dove guardian[chiave] contiene action/hit/reason/effective_stop_pct.
     La stessa valutazione gira anche nel loop indipendente del Guardian (guardian_watch, ogni 20 secondi).
@@ -1606,14 +1653,13 @@ def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_ope
     stops, guardian, parts = {}, {}, []
     for p in positions:
         key = normalize_symbol(p["symbol"])
-        v = vol.get(normalize_symbol(p["yf_symbol"]))
         info = open_info.get(key, {})
-        stop = clamp_stop_pct(info.get("stop_pct") or (v["stop_pct"] if v else cfg["stop_loss_pct"]))
-        stops[key] = stop
-        g = guardian_evaluate(p, info, stop, v["atr_pct"] if v else None, market_open, now=now)
+        s = position_stop(p, info)
+        stop = stops[key] = s["stop_pct"]
+        g = guardian_evaluate(p, info, stop, s["atr_pct"], market_open, now=now, stop_basis=s["stop_basis"])
         guardian[key] = g
-        parts.append(f"{p['symbol']} " + (f"ATR {v['atr_pct']:.1f}% " if v else "ATR N/D ")
-                     + f"hard stop {stop:.2f}%" + (" (CIO)" if info.get("stop_pct") else "")
+        parts.append(f"{p['symbol']} " + (f"ATR {s['atr_pct']:.2f}% " if s["atr_pct"] else "ATR N/D ")
+                     + f"stop {stop:+.2f}% / Target 1 {s['target_pct']:+.2f}% ({s['stop_basis']})"
                      + (f" → effettivo {g['effective_stop_pct']:+.2f}% [{g['stop_source']}]" if g["effective_stop_pct"] != stop else "")
                      + (f" · ⚠️ {g['action']}" if g["hit"] else f" · {g['hold_rationale']}"))
     _save_hold_rationales(guardian)
@@ -2434,7 +2480,7 @@ def gate_risk_atr(p, ctx):
     """Risk & ATR Specialist: stop dinamico ATR, drawdown, regime VIX/beta, negoziabilità e orari."""
     problems = []
     crypto = is_crypto(p["symbol"])
-    stop = dynamic_stop_pct(p["atr_pct"]) if p.get("atr_pct") else clamp_stop_pct(get_config()["stop_loss_pct"])
+    stop = dynamic_stop_pct(p.get("atr_pct"))
     if crypto and crypto_night_blocked():
         problems.append("blocco crypto overnight (22:00-08:00 CET): nessuna nuova apertura")
     if ctx["drawdown_blocked"]:

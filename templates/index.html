@@ -167,9 +167,9 @@
                         <form @submit.prevent="sendChat()" class="cmd flex items-center gap-2 px-2.5 h-9">
                             <span class="mono text-zinc-500 text-[12px]">›</span>
                             <input x-ref="cmd" x-model="chatInput" maxlength="800" :disabled="chatSending"
-                                   :placeholder="'Ordine al ' + personas[persona].short + ' — es. blocca crypto, riduci il rischio, stato'"
+                                   :placeholder="'Chiedi al ' + personas[persona].short + ' — es. perché il portafoglio è fermo?'"
                                    class="flex-1 min-w-0 text-[13px] text-zinc-100 placeholder-zinc-600">
-                            <span x-show="chatSending" class="text-[11px] text-zinc-500 mono">valuto…</span>
+                            <span x-show="chatSending" class="text-[11px] text-zinc-500 mono">penso…</span>
                             <span x-show="!chatSending" class="kbd hidden sm:inline">⌘K</span>
                             <button type="submit" class="btn btn-sm btn-primary" :disabled="chatSending || !chatInput.trim()">Invia</button>
                         </form>
@@ -181,6 +181,13 @@
                     </div>
                     <div x-ref="chat" class="border-t border-zinc-800 overflow-y-auto scroll-thin max-h-[380px] px-3 py-2 space-y-2.5">
                         <div x-show="!personaMessages().length" class="py-3 text-[12px] text-zinc-500" x-text="personas[persona].tagline"></div>
+                        <div x-show="chatPending[persona]" class="flex flex-wrap items-center gap-2 text-[11.5px] text-sky-300 border border-sky-500/30 rounded px-2 py-1.5 sticky top-0 bg-[#121215] z-10">
+                            <span class="min-w-0" x-text="'In attesa di conferma: ' + (chatPending[persona] || '')"></span>
+                            <span class="ml-auto flex gap-1.5">
+                                <button class="btn btn-sm btn-primary" @click="sendChat('sì, conferma')" :disabled="chatSending">Conferma</button>
+                                <button class="btn btn-sm" @click="sendChat('no, annulla')" :disabled="chatSending">Annulla</button>
+                            </span>
+                        </div>
                         <template x-for="m in personaMessages()" :key="m.id">
                             <div>
                                 <template x-if="m.role === 'user'">
@@ -194,7 +201,7 @@
                                             <span class="verdict" :class="verdictTone(m.verdict)" x-text="m.verdict || 'INFO'"></span>
                                             <span class="text-[11px] text-zinc-500" x-text="m.author"></span>
                                         </div>
-                                        <div class="text-[12.5px] text-zinc-300 leading-relaxed" x-text="m.text"></div>
+                                        <div class="text-[12.5px] text-zinc-300 leading-relaxed whitespace-pre-line" x-text="m.text"></div>
                                     </div>
                                 </template>
                             </div>
@@ -444,10 +451,11 @@
                             <th class="font-medium px-4 py-2.5 text-right">Valore</th>
                             <th class="font-medium px-4 py-2.5 text-right">P&amp;L</th>
                             <th class="font-medium px-4 py-2.5 text-right">%</th>
+                            <th class="font-medium px-4 py-2.5 text-right">Azioni</th>
                         </tr>
                     </thead>
                     <tbody class="num" x-show="!positions.length">
-                        <tr><td colspan="10" class="px-4 py-4 text-zinc-500 font-sans">Nessuna posizione aperta.</td></tr>
+                        <tr><td colspan="11" class="px-4 py-4 text-zinc-500 font-sans">Nessuna posizione aperta.</td></tr>
                     </tbody>
                     <template x-for="p in positions" :key="p.symbol">
                         <tbody class="num border-b border-zinc-800/70">
@@ -461,15 +469,23 @@
                                 <td class="px-4 py-2.5 text-right text-zinc-300" x-text="qty(p.qty)"></td>
                                 <td class="px-4 py-2.5 text-right text-zinc-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
                                 <td class="px-4 py-2.5 text-right text-zinc-400" x-text="p.conviction ?? '—'"></td>
-                                <td class="px-4 py-2.5 text-right text-zinc-400" x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></td>
+                                <td class="px-4 py-2.5 text-right text-zinc-400" :title="p.stop_basis ? 'Stop ' + p.stop_pct + '% (' + p.stop_basis + (p.atr_pct ? ', ATR ' + p.atr_pct + '%' : '') + ') · Target 1 +' + p.target_pct + '% (2R)' : ''">
+                                    <div x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></div>
+                                    <div x-show="p.target_pct != null && !p.scaled_out" class="text-[10px] text-emerald-500/80" x-text="'T1 +' + p.target_pct + '%'"></div>
+                                </td>
                                 <td class="px-4 py-2.5 text-right text-zinc-400" x-text="usd(p.avg_entry_price)"></td>
                                 <td class="px-4 py-2.5 text-right text-zinc-300" x-text="usd(p.current_price)"></td>
                                 <td class="px-4 py-2.5 text-right text-zinc-300" x-text="usd(p.market_value)"></td>
                                 <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></td>
                                 <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></td>
+                                <td class="px-4 py-2.5 text-right font-sans whitespace-nowrap">
+                                    <button @click.stop="deRisk(p)" :disabled="!canDeRisk(p) || deRisking === p.symbol" class="btn btn-sm"
+                                            :title="p.scaled_out ? 'Metà già incassata: il runner è già a breakeven' : (p.unrealized_pl > 0 ? 'Vende il 50% e porta lo stop del resto a breakeven + commissioni' : 'Disponibile solo con la posizione in profitto')"
+                                            x-text="deRisking === p.symbol ? 'invio…' : '🛡️ Attiva Rischio Zero'"></button>
+                                </td>
                             </tr>
                             <tr class="font-sans">
-                                <td colspan="10" class="px-4 pb-2.5 pt-0">
+                                <td colspan="11" class="px-4 pb-2.5 pt-0">
                                     <dl class="grid grid-cols-1 lg:grid-cols-3 gap-x-4 gap-y-1 text-[11px] leading-snug">
                                         <div class="min-w-0"><dt class="inline text-indigo-400">buy_thesis · </dt><dd class="inline text-zinc-300" x-text="p.buy_thesis || '—'"></dd></div>
                                         <div class="min-w-0"><dt class="inline text-amber-300">hold_rationale · </dt><dd class="inline text-zinc-300" x-text="p.hold_rationale || '—'"></dd></div>
@@ -869,6 +885,7 @@
                 <span class="text-[11px] num" :class="posNoticeError ? 'text-red-500' : 'text-emerald-500'" x-text="posNotice"></span>
                 <div class="flex gap-2">
                     <button @click="showPosition = false" class="btn">Chiudi</button>
+                    <button @click="deRisk(posDetail?.position)" :disabled="!posDetail || !canDeRisk({...posDetail.position, scaled_out: !!posDetail.guardian?.scale_out}) || deRisking" class="btn">🛡️ Attiva Rischio Zero</button>
                     <button @click="sellNow()" :disabled="selling || !posDetail" class="btn btn-danger">🔴 VENDI SUBITO</button>
                 </div>
             </div>

@@ -9,9 +9,9 @@ import pandas as pd
 MAX_EXPOSURE_PCT = 50.0            # esposizione totale massima del portafoglio, % del capitale (50%: un
                                    # SUPER_CONVICTION può usare tutta la taglia autorizzata)
 MAX_POSITIONS = 4                  # posizioni aperte contemporaneamente
-HARD_STOP_MIN_PCT = 1.5            # hard stop loss tra 1.5% ...
-HARD_STOP_MAX_PCT = 2.5            # ... e 2.5% dal prezzo d'ingresso
-HARD_STOP_ATR_MULT = 1.5           # 1.5 x ATR, riportato nella fascia 1.5-2.5%
+HARD_STOP_MIN_PCT = 1.2            # hard stop loss tra 1.2% ...
+HARD_STOP_MAX_PCT = 3.5            # ... e 3.5% dal prezzo d'ingresso
+HARD_STOP_ATR_MULT = 1.5           # Stop_Loss_Pct = max(1.2%, min(3.5%, 1.5 x ATR%)); Target 1 = 2 x Stop_Loss_Pct
 STANDARD_MAX_ALLOCATION_PCT = 25.0  # taglia massima di un trade standard
 SUPER_CONVICTION_MAX_ALLOCATION_PCT = 50.0  # taglia massima autorizzata per un trade SUPER_CONVICTION
 CRYPTO_NIGHT_TZ = ZoneInfo("Europe/Rome")   # CET/CEST
@@ -20,14 +20,14 @@ CRYPTO_NIGHT_END_HOUR = 8          # ... alle 08:00
 
 
 def hard_stop_pct(atr_pct: Optional[float]) -> float:
-    """Hard stop in % (negativo): 1.5 x ATR% riportato tra -1.5% e -2.5%; senza ATR il più largo consentito."""
+    """Hard stop in % (negativo): 1.5 x ATR% riportato tra -1.2% e -3.5%; senza ATR il più largo della fascia."""
     if not atr_pct or atr_pct <= 0 or not np.isfinite(atr_pct):
         return -HARD_STOP_MAX_PCT
     return -round(float(np.clip(HARD_STOP_ATR_MULT * atr_pct, HARD_STOP_MIN_PCT, HARD_STOP_MAX_PCT)), 2)
 
 
 def clamp_stop_pct(stop_pct: Optional[float]) -> float:
-    """Qualsiasi stop (anche salvato su ordini precedenti) riportato nella fascia non negoziabile -1.5% / -2.5%."""
+    """Qualsiasi stop (anche salvato su ordini precedenti) riportato nella fascia non negoziabile -1.2% / -3.5%."""
     if stop_pct is None:
         return -HARD_STOP_MAX_PCT
     return -round(float(np.clip(abs(stop_pct), HARD_STOP_MIN_PCT, HARD_STOP_MAX_PCT)), 2)
@@ -42,7 +42,7 @@ def crypto_night_blocked(now: Optional[datetime] = None) -> bool:
 class InstitutionalRiskAgent:
     """
     AGENTE #3: Comitato Rischi (Risk Safety Net)
-    - Hard Stop Loss non negoziabile: 1.5 x ATR nella fascia 1.5%-2.5%, target 1 a 2R
+    - Hard Stop Loss non negoziabile: 1.5 x ATR nella fascia 1.2%-3.5%, target 1 a 2R
     - Esposizione totale massima 50% del capitale, massimo 4 posizioni simultanee
     - Blocco crypto overnight (22:00-08:00 CET): nessuna nuova apertura
     - Sizing a rischio fisso, taglia massima 25% (50% solo per SUPER_CONVICTION, autorizzata qui)
@@ -135,7 +135,7 @@ class InstitutionalRiskAgent:
         max_allocation_pct: float = STANDARD_MAX_ALLOCATION_PCT,
     ) -> Dict[str, float]:
         """
-        Sizing a rischio fisso con Hard Stop: distanza dello stop = 1.5 x ATR riportata tra 1.5% e 2.5% del prezzo,
+        Sizing a rischio fisso con Hard Stop: distanza dello stop = 1.5 x ATR riportata tra 1.2% e 3.5% del prezzo,
         primo target (scaling out) a 2R. Taglia massima max_allocation_pct del capitale.
         """
         if current_price <= 0 or atr <= 0 or account_balance <= 0:

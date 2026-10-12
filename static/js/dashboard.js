@@ -13,17 +13,18 @@ function dashboard() {
         agents: [], blocks: { asset_classes: [], sectors: [], symbols: [] }, blockLabels: [], tuning: null, agentBusy: '',
         brainOpen: false, brainId: '', brain: null, brainTimer: null,
         // Stanza dei Dipendenti AI
-        persona: 'coo', chatMessages: [], chatInput: '', chatSending: false,
+        persona: 'coo', chatMessages: [], chatInput: '', chatSending: false, chatPending: {},
         personas: {
-            coo: { name: 'COO', short: 'COO', tagline: 'COO: pausa/attivazione agenti, blocchi per mercato o ticker, aggressività, modalità Advisor, stato del desk.' },
-            risk: { name: 'Risk Manager', short: 'Risk Manager', tagline: 'Risk Manager: stessi comandi, soglie di rischio più severe (VIX > 20 blocca gli aumenti di esposizione).' },
+            coo: { name: 'COO', short: 'COO', tagline: 'COO: chiedimi qualsiasi cosa su bot, mercati e portafoglio. Posso proporre modifiche (agenti, blocchi, aggressività, modalità): le applico solo dopo la tua conferma.' },
+            risk: { name: 'Risk Manager', short: 'Risk Manager', tagline: 'Risk Manager: stesse capacità, con un occhio più severo su rischi, drawdown e protezioni. Nessuna modifica senza la tua conferma.' },
         },
-        chatSuggestions: ['stato', 'blocca crypto', 'sblocca tutto', 'CIO selettivo', 'riduci il rischio', 'pausa CHOP'],
+        chatSuggestions: ['Come sta andando il portafoglio?', 'Perché il portafoglio è fermo?', 'Cosa stanno scansionando gli Scout?', 'Come funziona il Guardian?', 'Conviene ridurre il rischio?'],
         account: {}, positions: [], closedPositions: [], bot: { logs: [] },
         radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
         settings: { watchlist: [] }, envLocked: {},
         showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
         showPosition: false, posSymbol: '', posDetail: null, posLoading: false, posError: '', posNotice: '', posNoticeError: false, selling: false,
+        deRisking: '',
         showHistory: false, historyRows: [], historyOffline: true, historyLoading: false,
         audit: {}, auditTab: 'rejected', auditStage: '',
         auditTabs: [{ id: 'rejected', label: 'Bocciate (5h)' }, { id: 'executed', label: 'Approvate & Storico' }, { id: 'scorecard', label: 'Pagella Agenti' }],
@@ -149,7 +150,7 @@ function dashboard() {
         async loadChat() {
             try {
                 const res = await fetch('/api/chat');
-                if (res.ok) { this.chatMessages = (await res.json()).messages || []; this.scrollChat(); }
+                if (res.ok) { const d = await res.json(); this.chatMessages = d.messages || []; this.chatPending = d.pending || {}; this.scrollChat(); }
             } catch (e) { /* riprova */ }
         },
         personaMessages() { return this.chatMessages.filter(m => m.persona === this.persona); },
@@ -182,7 +183,7 @@ function dashboard() {
             }
         },
         verdictTone(v) {
-            return { ESEGUITO: 'text-emerald-500', SCONSIGLIATO: 'text-amber-500', IMPOSSIBILE: 'text-red-500' }[v] || 'text-indigo-400';
+            return { ESEGUITO: 'text-emerald-500', SCONSIGLIATO: 'text-amber-500', IMPOSSIBILE: 'text-red-500', PROPOSTA: 'text-sky-400' }[v] || 'text-indigo-400';
         },
 
         // ---------- toast ----------
@@ -469,6 +470,24 @@ function dashboard() {
                 if (res.ok) { this.fetchStatus(); setTimeout(() => { this.showPosition = false; }, 1200); }
             } finally {
                 this.selling = false;
+            }
+        },
+
+        // 🛡️ Rischio Zero: vende il 50% a mercato e porta lo stop del resto a breakeven + commissioni
+        canDeRisk(p) { return p && p.unrealized_pl > 0 && !p.scaled_out && !String(p.side || '').includes('SHORT'); },
+        async deRisk(p) {
+            const sym = p?.symbol;
+            if (!sym || this.deRisking) return;
+            if (!confirm(`Attivare RISCHIO ZERO su ${sym}?\n\n• vende subito il 50% a mercato\n• porta lo stop del restante 50% a breakeven + commissioni\n• il resto resta gestito dal Guardian con il Trailing ATR Stop`)) return;
+            this.deRisking = sym;
+            try {
+                const { res, data } = await this.api('/api/position/de-risk', 'POST', { symbol: sym });
+                const msg = data.message || (res.ok ? 'Rischio Zero attivato' : 'Errore');
+                this.addLog('🛡️ ' + msg, !res.ok);
+                if (this.showPosition) { this.posNotice = msg; this.posNoticeError = !res.ok; }
+                if (res.ok) this.fetchStatus();
+            } finally {
+                this.deRisking = '';
             }
         },
 
