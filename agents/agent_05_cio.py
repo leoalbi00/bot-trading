@@ -3,6 +3,10 @@ from typing import Dict, Any, Optional
 
 # Fusion Engine
 ENSEMBLE_WEIGHTS = {"quant": 0.50, "news": 0.35, "ofi": 0.15}
+# Senza un giudizio Groq valido (notizia assente, oltre 30 min, timeout) il News Score neutro 50 non è un'informazione:
+# il suo peso si ridistribuisce su Quant e OFI (≈ 0.77 / 0.23). Con News fisso a 50 l'Ensemble arrivava a 72 solo
+# con Quant e OFI quasi perfetti e nessuna scheda passava.
+NEWS_VALID_STATUS = "OK"
 ENTRY_THRESHOLD = 72.0             # Ensemble Score minimo d'ingresso: sotto si scarta (niente overtrading)
 SUPER_CONVICTION_THRESHOLD = 90.0  # classe SUPER_CONVICTION: sizing fino al 50% autorizzato dall'Agente #3
 
@@ -30,6 +34,7 @@ class CIOStrategistAgent:
     """
     AGENTE #5: Chief Investment Officer (CIO) - Fusion Engine
     - Ensemble_Score = Quant_Score x 0.50 + Groq_News_Score x 0.35 + Microstructure_OFI x 0.15
+      (senza notizia valida: Quant x 0.77 + OFI x 0.23)
     - Soglia d'ingresso: Ensemble >= 72, tutto il resto viene scartato
     - Classe: SUPER_CONVICTION (Ensemble >= 90) o STANDARD
     - Orizzonte: SWING_CATALYST (catalizzatore strutturale ad alto impatto) o INTRADAY_MOMENTUM
@@ -50,8 +55,16 @@ class CIOStrategistAgent:
         self.min_conviction_multiplier = min_conviction_multiplier
         self.weights = dict(ENSEMBLE_WEIGHTS)
 
-    def ensemble_score(self, quant: float, news: float, ofi_score: float) -> float:
-        score = quant * self.weights["quant"] + news * self.weights["news"] + ofi_score * self.weights["ofi"]
+    def weights_for(self, news_status: Optional[str]) -> Dict[str, float]:
+        """Pesi dell'Ensemble: senza notizia valida il peso delle news passa a Quant e OFI in proporzione."""
+        if news_status == NEWS_VALID_STATUS:
+            return dict(self.weights)
+        rest = self.weights["quant"] + self.weights["ofi"]
+        return {"quant": self.weights["quant"] / rest, "news": 0.0, "ofi": self.weights["ofi"] / rest}
+
+    def ensemble_score(self, quant: float, news: float, ofi_score: float, news_status: Optional[str] = NEWS_VALID_STATUS) -> float:
+        w = self.weights_for(news_status)
+        score = quant * w["quant"] + news * w["news"] + ofi_score * w["ofi"]
         return float(np.clip(score, 0.0, 100.0))
 
     def best_case_score(self, quant: float, ofi_score: float) -> float:
@@ -123,7 +136,8 @@ class CIOStrategistAgent:
         news = agent_04_macro_res.get("news") or {}
         news_impact = float(news.get("impact_score") or 0.0)
 
-        cio_score = self.ensemble_score(score_quant, score_news, score_ofi)
+        news_status = news.get("status")
+        cio_score = self.ensemble_score(score_quant, score_news, score_ofi, news_status)
         trade_class = self.trade_class(cio_score)
         horizon = self.horizon(bool(agent_04_macro_res.get("swing_catalyst")))
         agent_scores = {
@@ -135,7 +149,7 @@ class CIOStrategistAgent:
             "agent_id": self.agent_id,
             "cio_ensemble_score": round(cio_score, 2),
             "agent_scores": agent_scores,
-            "weights_used": dict(self.weights),
+            "weights_used": {k: round(v, 3) for k, v in self.weights_for(news_status).items()},
             "trade_class": trade_class,
             "horizon": horizon,
             "news_impact": news_impact,

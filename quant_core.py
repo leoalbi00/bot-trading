@@ -11,7 +11,7 @@ Flusso (trading_core.stream_scouts_to_agents):
                    se l'Ensemble può ancora arrivare a 72, News Radar + Groq via Agente #4 (timeout 2 s, veto);
                    scarta chi resta sotto la soglia d'ingresso
            STAGE 3 Executive & Risk Desk: Agente #3 (Safety Net), #6 (Portfolio Guardian), #5 (CIO, Fusion Engine
-                   Q x 0.50 + News x 0.35 + OFI x 0.15)
+                   Q x 0.50 + News x 0.35 + OFI x 0.15; senza notizia valida Q x 0.77 + OFI x 0.23)
       -> piano dell'Agente #5 (aperture; SUPER_CONVICTION con portafoglio pieno -> rotazione delle tesi degradate)
 L'Agente #7 (CHOP Watchdog) misura latenze, coda, RAM/CPU e fa auto-healing.
 Ogni passaggio viene registrato su console (a colori) e su file (quant_agents.log).
@@ -399,7 +399,8 @@ class QuantitativeTradingCore:
 
         ms2 = (time.perf_counter() - t2) * 1000
         self.watchdog.record_latency("stage2", ms2)
-        ensemble = self.agent_cio.ensemble_score(quant_score, float(res_macro.get("news_score", 50.0)), ofi_to_score(ofi))
+        ensemble = self.agent_cio.ensemble_score(quant_score, float(res_macro.get("news_score", 50.0)), ofi_to_score(ofi),
+                                                 nv.get("status"))
         deep_ok = force or ensemble >= self.agent_cio.buy_threshold
         logger.info(f"[STAGE 2 · DEEP FILTER] 🔎 {symbol} -> ensemble {ensemble:.1f} (soglia d'ingresso "
                     f"{self.agent_cio.buy_threshold:.0f}) -> {'PASSA → Stage 3' if deep_ok else 'FILTRATO (sotto soglia)'} ({ms2:.1f}ms)")

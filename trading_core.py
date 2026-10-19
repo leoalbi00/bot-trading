@@ -2413,7 +2413,8 @@ PIPELINE_BUY_SCORE = 72.0       # soglia d'ingresso dell'Agente #5 (Ensemble Sco
 
 
 def gate_quant_ensemble(p):
-    """Fusion Engine (Agente #5): ogni scheda deve avere un BUY con Ensemble >= 72 (Q x 0.50 + News x 0.35 + OFI x 0.15).
+    """Fusion Engine (Agente #5): ogni scheda deve avere un BUY con Ensemble >= 72 (Q x 0.50 + News x 0.35 + OFI x 0.15;
+    senza notizia valida Q x 0.77 + OFI x 0.23).
 
     Senza una valutazione recente la scheda non passa: nessun trade senza la validazione dei 7 agenti e di Groq.
     """
@@ -2942,7 +2943,7 @@ def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
         f"Schede approvate dal Comitato Rischi (canali 2 multi-timeframe, 3 order flow, 5 correlazioni):\n"
         f"{chr(10).join(pitch_lines) or '  (nessuna)'}\n\n"
         "Regole:\n"
-        f"- La convinzione è l'ENSEMBLE del Fusion Engine (Q x 0.50 + News x 0.35 + OFI x 0.15); allocazione coerente: "
+        f"- La convinzione è l'ENSEMBLE del Fusion Engine (Q x 0.50 + News x 0.35 + OFI x 0.15, senza notizia valida Q x 0.77 + OFI x 0.23); allocazione coerente: "
         f"{bands}. Sotto {MIN_CONVICTION} rispondi HOLD.\n"
         f"- Soffitto di sicurezza: {cfg['max_allocation_pct']:.0f}% per operazione (solo SUPER_CONVICTION oltre 25%), "
         f"esposizione totale {max_exposure_pct(cfg):.0f}%, massimo {RISK_MAX_POSITIONS} posizioni. "

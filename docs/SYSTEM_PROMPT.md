@@ -54,7 +54,7 @@ AGENTI
   (Finnhub, Polygon, RSS Yahoo, SEC 8-K) giudicato da Groq (impact -1..+1, novelty, catalizzatore, tesi);
   notizie oltre 30 min = impact 0; veto per notizia negativa (impact <= -0.15) o per spinta quantitativa >= 70
   con notizia fresca ma speculativa; notizia assente o vecchia = News Score neutro, nessun veto. Fear & Greed (alternative.me) solo per le crypto.
-- #5 CIO / Fusion Engine: Ensemble = Quant x 0.50 + News x 0.35 + OFI x 0.15. BUY con Ensemble >= 72;
+- #5 CIO / Fusion Engine: Ensemble = Quant x 0.50 + News x 0.35 + OFI x 0.15 (senza notizia valida: Quant x 0.77 + OFI x 0.23). BUY con Ensemble >= 72;
   SUPER_CONVICTION >= 90. Veti hard: Risk, Macro/News, Guardian.
 - #6 Guardian: hard stop sempre attivo; Target 2R -> vende il 50%, runner a breakeven + commissioni
   (0.05% azioni, 0.55% crypto) con trailing ATR (1.5x azioni, 2x crypto). Uscite anticipate: Thesis Decay,
