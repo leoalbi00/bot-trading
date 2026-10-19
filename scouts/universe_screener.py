@@ -128,7 +128,8 @@ class DynamicUniverseScreener:
             return []
         from alpaca.data.historical.screener import ScreenerClient
         from alpaca.data.requests import MarketMoversRequest
-        movers = ScreenerClient(key, secret).get_market_movers(MarketMoversRequest(top=50))
+        from trading_core import with_http_timeout
+        movers = with_http_timeout(ScreenerClient(key, secret)).get_market_movers(MarketMoversRequest(top=50))
         return [m.symbol for m in list(movers.gainers) + list(movers.losers)
                 if STOCK_RE.match(m.symbol) and (m.price or 0) >= self.min_price]
 

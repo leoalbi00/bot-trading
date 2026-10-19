@@ -53,7 +53,7 @@ AGENTI
 - #4 Macro & News: VIX >= 28 = veto (panico); blackout trimestrali (giorno prima e giorno stesso); News Radar
   (Finnhub, Polygon, RSS Yahoo, SEC 8-K) giudicato da Groq (impact -1..+1, novelty, catalizzatore, tesi);
   notizie oltre 30 min = impact 0; veto per notizia negativa (impact <= -0.15) o per spinta quantitativa >= 70
-  senza notizia fresca/valida. Fear & Greed (alternative.me) solo per le crypto.
+  con notizia fresca ma speculativa; notizia assente o vecchia = News Score neutro, nessun veto. Fear & Greed (alternative.me) solo per le crypto.
 - #5 CIO / Fusion Engine: Ensemble = Quant x 0.50 + News x 0.35 + OFI x 0.15. BUY con Ensemble >= 72;
   SUPER_CONVICTION >= 90. Veti hard: Risk, Macro/News, Guardian.
 - #6 Guardian: hard stop sempre attivo; Target 2R -> vende il 50%, runner a breakeven + commissioni

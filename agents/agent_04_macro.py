@@ -8,8 +8,8 @@ Due compiti:
         "catalyst_type": "EARNINGS" | "M&A" | "REGULATORY" | "PRODUCT" | "MACRO",
         "thesis_summary": "max 15 parole"}
    - notizie più vecchie di 30 minuti (novelty > 30) valgono Impact 0;
-   - Groq fa da VALIDATORE e FILTRO DI VETO: spinta quantitativa alta ma notizia negativa, assente o
-     speculativa -> VETO;
+   - Groq fa da VALIDATORE e FILTRO DI VETO: notizia negativa, o spinta quantitativa alta con notizia fresca
+     ma speculativa -> VETO; notizia assente o vecchia -> News Score neutro, nessun veto;
    - Groq in timeout (limite di 2.0 s imposto dall'Agente #7) -> News Score 0 (neutro), il ciclo non si blocca.
 I fetcher HTTP e il client LLM sono iniettabili: i test offline girano senza rete.
 """
@@ -193,7 +193,7 @@ class MacroSentimentAgent:
     - VIX & Cross-Asset Stress Matrix (Yield Curve 10Y-2Y, DXY), Event Blackout Window
     - Central Bank Hawkish/Dovish NLP Scoring, COT, Economic Surprise, Contrarian Sentiment
     - News Radar multi-canale + Groq (JSON): impact, novelty, catalizzatore, tesi in 15 parole
-    - Veto: spinta quantitativa senza catalizzatore valido; Thesis Decay per le posizioni aperte
+    - Veto: notizia negativa o catalizzatore fresco speculativo; Thesis Decay per le posizioni aperte
     """
     def __init__(
         self,
@@ -391,22 +391,19 @@ class MacroSentimentAgent:
         """Filtro di veto di Groq (None = nessun veto).
 
         - notizia negativa (impact <= negative_impact): sempre veto per un long;
-        - spinta quantitativa alta (quant >= quant_push_threshold) senza catalizzatore: notizia assente,
-          più vecchia di 30 minuti o speculativa (impact < speculative_impact) -> veto;
-        - TIMEOUT / INVALID: News Score neutro e nessun veto (il ciclo non si blocca per Groq).
+        - spinta quantitativa alta (quant >= quant_push_threshold) con notizia fresca ma speculativa
+          (impact < speculative_impact) -> veto;
+        - NO_NEWS / STALE / TIMEOUT / INVALID: News Score neutro e nessun veto. Le notizie fresche (< 30 min)
+          mancano quasi sempre: vietarle bloccava ogni scheda forte, perché con News 50 l'Ensemble arriva a 72
+          solo con Quant alto. Senza catalizzatore decide l'Ensemble (Quant + order flow).
         """
         if not assessment:
             return None
         status, impact = assessment.get("status"), float(assessment.get("impact_score") or 0.0)
         if status == "OK" and impact <= self.negative_impact:
             return f"notizia negativa (impact {impact:+.2f}: {assessment.get('thesis_summary')})"
-        if quant_score is None or quant_score < self.quant_push_threshold or status in ("TIMEOUT", "INVALID"):
+        if quant_score is None or quant_score < self.quant_push_threshold or status != "OK":
             return None
-        if status == "NO_NEWS":
-            return f"spinta quantitativa {quant_score:.0f} senza notizie a supporto"
-        if status == "STALE":
-            return (f"spinta quantitativa {quant_score:.0f} con notizie vecchie "
-                    f"({assessment.get('novelty_index_minutes')} min > {NEWS_MAX_NOVELTY_MIN})")
         if impact < self.speculative_impact:
             return f"notizia speculativa (impact {impact:+.2f} < {self.speculative_impact:+.2f})"
         return None

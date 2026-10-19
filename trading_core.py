@@ -18,6 +18,7 @@ import time
 
 import dotenv
 import pandas as pd
+from requests.adapters import HTTPAdapter
 import ta
 import yfinance as yf
 from alpaca.trading.client import TradingClient
@@ -78,6 +79,8 @@ MIN_ORDER_USD = 10.0
 ORDER_TAG_PREFIX = "brd-"  # prefisso del client_order_id degli acquisti del bot
 _ORDER_STOP_RE = re.compile(r"^brd-s(\d+)-(?:a(\d+)-)?(?:c(\d+)-)?")
 HTTP_TIMEOUT = 10
+# alpaca-py non imposta timeout HTTP: una richiesta appesa terrebbe scan_lock occupato e bloccherebbe ogni acquisto
+ALPACA_TIMEOUT_S = 5
 
 # Desk multi-agente: soglie dello Score di Forza (0-100)
 SCORE_BUY = 75                 # > 75: candidato BUY
@@ -375,7 +378,29 @@ def get_secret_key():
 def _secret(key):
     return os.getenv(SECRET_FIELDS[key]) or get_config()[key]
 
-alpaca_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True) if ALPACA_KEY and ALPACA_SECRET else None
+class _TimeoutAdapter(HTTPAdapter):
+    """Applica ALPACA_TIMEOUT_S alle richieste che non ne specificano uno."""
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = ALPACA_TIMEOUT_S
+        return super().send(request, **kwargs)
+
+
+def with_http_timeout(client):
+    """Timeout rigido e un solo retry breve (default alpaca-py: 3 x 3 s su 429/504) per un client alpaca-py.
+
+    I costruttori dei client non espongono né timeout né retry: si impostano sulla sessione e sugli attributi.
+    """
+    session = getattr(client, "_session", None)
+    if session is not None:
+        session.mount("https://", _TimeoutAdapter())
+        session.mount("http://", _TimeoutAdapter())
+    client._retry, client._retry_wait = 1, 1
+    return client
+
+
+alpaca_client = (with_http_timeout(TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True))
+                 if ALPACA_KEY and ALPACA_SECRET else None)
 
 _gemini_client = None
 
@@ -3277,7 +3302,8 @@ def pipeline_diagnosis(window_sec=5 * 3600, eval_window_sec=3600):
     news_bad = sum(v for k, v in news_status.items() if k in ("NO_NEWS", "STALE"))
     if decisions and news_bad >= max(1, sum(news_status.values()) // 2):
         bottleneck.append(f"{news_bad} valutazioni su {sum(news_status.values())} senza notizie fresche (< 30 min): "
-                          "con spinta quantitativa >= 70 l'Agente #4 mette il veto e senza notizie l'Ensemble resta basso")
+                          "senza catalizzatore il News Score resta neutro (50) e l'Ensemble deve arrivare a 72 "
+                          "con Quant e order flow")
     out["bottleneck"] = bottleneck
     return out
 
@@ -3526,7 +3552,8 @@ def crypto_order_books(yf_symbols, depth=10):
     try:
         from alpaca.data.historical import CryptoHistoricalDataClient
         from alpaca.data.requests import CryptoLatestOrderbookRequest
-        client = CryptoHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET) if ALPACA_KEY and ALPACA_SECRET else CryptoHistoricalDataClient()
+        client = with_http_timeout(CryptoHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+                                   if ALPACA_KEY and ALPACA_SECRET else CryptoHistoricalDataClient())
         books = client.get_crypto_latest_orderbook(CryptoLatestOrderbookRequest(
             symbol_or_symbols=[to_alpaca_symbol(s) for s in crypto]))
     except Exception as e:
