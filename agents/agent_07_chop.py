@@ -38,7 +38,7 @@ def _rss_mb() -> float:
 
 class ChopWatchdog:
     def __init__(self, backlog_limit: int = 50, audit_interval: float = 30.0, scout_silence_s: float = 600.0,
-                 module_silence_s: float = 900.0, max_workers: int = 16, scale_step: int = 2,
+                 module_silence_s: float = 900.0, max_workers: int = 8, scale_step: int = 2,
                  scale_cooldown_s: float = 5.0, llm_timeout_s: float = GROQ_TIMEOUT_S):
         self.agent_id = "AGENT_07_CHOP_WATCHDOG"
         self.backlog_limit = backlog_limit

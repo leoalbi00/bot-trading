@@ -47,7 +47,9 @@ class Scout:
 
 
 class ScoutSwarm:
-    def __init__(self, size: int = 100, timeout_s: float = 2.0, threads: int = 16, watchdog=None):
+    # I detector sono calcoli puri sotto il GIL: più di 4 thread non accelerano lo sciame, ma tolgono la CPU
+    # al server web (su Render, durante una raffica, il bot smetteva di rispondere anche al /ping)
+    def __init__(self, size: int = 100, timeout_s: float = 2.0, threads: int = 4, watchdog=None):
         self.size = size
         self.timeout_s = timeout_s
         self.watchdog = watchdog
