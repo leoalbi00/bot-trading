@@ -8,8 +8,8 @@ Due compiti:
         "catalyst_type": "EARNINGS" | "M&A" | "REGULATORY" | "PRODUCT" | "MACRO",
         "thesis_summary": "max 15 parole"}
    - notizie più vecchie di 30 minuti (novelty > 30) valgono Impact 0;
-   - Groq fa da VALIDATORE e FILTRO DI VETO: spinta quantitativa alta ma notizia negativa, assente o
-     speculativa -> VETO;
+   - Groq fa da VALIDATORE e FILTRO DI VETO: notizia negativa -> VETO; notizia assente, vecchia o speculativa ->
+     News Score neutro o quasi, nessun veto;
    - Groq in timeout (limite di 2.0 s imposto dall'Agente #7) -> News Score 0 (neutro), il ciclo non si blocca.
 I fetcher HTTP e il client LLM sono iniettabili: i test offline girano senza rete.
 """
@@ -193,7 +193,7 @@ class MacroSentimentAgent:
     - VIX & Cross-Asset Stress Matrix (Yield Curve 10Y-2Y, DXY), Event Blackout Window
     - Central Bank Hawkish/Dovish NLP Scoring, COT, Economic Surprise, Contrarian Sentiment
     - News Radar multi-canale + Groq (JSON): impact, novelty, catalizzatore, tesi in 15 parole
-    - Veto: spinta quantitativa senza catalizzatore valido; Thesis Decay per le posizioni aperte
+    - Veto: notizia negativa; Thesis Decay per le posizioni aperte
     """
     def __init__(
         self,

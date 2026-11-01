@@ -618,7 +618,7 @@ crypto, solo long. Scout (universo dinamico a blocchi di {core.UNIVERSE_CHUNK_SI
 #2 Microstruttura, #4 Macro/News (Groq), #3 Risk, #6 Guardian -> Fusion Engine #5: Ensemble = Trend Score corretto da News e
 OFI, BUY se >= {core.PIPELINE_BUY_SCORE:.0f} -> Comitato Rischi -> CIO + Portfolio Allocator (budget di rischio dinamico, max 15 posizioni,
 esposizione fino al 95%) -> ordine. Guardian ogni {core.GUARDIAN_INTERVAL_SEC}s: hard stop 3x ATR (1.5-9%), Target 3R vende 50%,
-runner con trailing ATR. Agente #4: spinta quantitativa >= 70 senza notizia fresca (< 30 min) = veto."""
+runner con trailing ATR. Agente #4: veto solo su notizia negativa; notizia assente o vecchia = News Score neutro."""
 
 _PERSONA_STYLE = {
     "coo": "Sei il COO (Capo delle Operazioni) del desk: pratico, orientato all'operatività e ai risultati.",
