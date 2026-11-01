@@ -390,25 +390,15 @@ class MacroSentimentAgent:
     def news_veto(self, assessment: Optional[Dict[str, Any]], quant_score: Optional[float]) -> Optional[str]:
         """Filtro di veto di Groq (None = nessun veto).
 
-        - notizia negativa (impact <= negative_impact): sempre veto per un long;
-        - spinta quantitativa alta (quant >= quant_push_threshold) senza catalizzatore: notizia assente,
-          più vecchia di 30 minuti o speculativa (impact < speculative_impact) -> veto;
-        - TIMEOUT / INVALID: News Score neutro e nessun veto (il ciclo non si blocca per Groq).
+        Solo la notizia negativa (impact <= negative_impact) è un veto per un long. Assenza di notizie, notizie vecchie
+        o speculative lasciano il News Score neutro: con l'obbligo del catalizzatore l'Ensemble non poteva raggiungere
+        la soglia senza una notizia positiva degli ultimi 30 minuti e il capitale restava fermo.
         """
         if not assessment:
             return None
         status, impact = assessment.get("status"), float(assessment.get("impact_score") or 0.0)
         if status == "OK" and impact <= self.negative_impact:
             return f"notizia negativa (impact {impact:+.2f}: {assessment.get('thesis_summary')})"
-        if quant_score is None or quant_score < self.quant_push_threshold or status in ("TIMEOUT", "INVALID"):
-            return None
-        if status == "NO_NEWS":
-            return f"spinta quantitativa {quant_score:.0f} senza notizie a supporto"
-        if status == "STALE":
-            return (f"spinta quantitativa {quant_score:.0f} con notizie vecchie "
-                    f"({assessment.get('novelty_index_minutes')} min > {NEWS_MAX_NOVELTY_MIN})")
-        if impact < self.speculative_impact:
-            return f"notizia speculativa (impact {impact:+.2f} < {self.speculative_impact:+.2f})"
         return None
 
     def thesis_decay(self, entry_impact: Optional[float], assessment: Optional[Dict[str, Any]]) -> Optional[str]:

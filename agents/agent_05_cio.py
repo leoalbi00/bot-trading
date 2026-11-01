@@ -1,10 +1,13 @@
 import numpy as np
 from typing import Dict, Any, Optional
 
-# Fusion Engine
-ENSEMBLE_WEIGHTS = {"quant": 0.50, "news": 0.35, "ofi": 0.15}
-ENTRY_THRESHOLD = 72.0             # Ensemble Score minimo d'ingresso: sotto si scarta (niente overtrading)
-SUPER_CONVICTION_THRESHOLD = 90.0  # classe SUPER_CONVICTION: sizing fino al 50% autorizzato dall'Agente #3
+# Fusion Engine: il voto di base è il Trend Score (forza relativa + trend), notizie e order flow lo spostano.
+# Una notizia assente vale 50 e non sposta nulla: il trade non dipende dal catalizzatore ma può esserne rafforzato.
+NEWS_WEIGHT = 0.30
+OFI_WEIGHT = 0.05
+ENSEMBLE_WEIGHTS = {"quant": 1.0, "news": NEWS_WEIGHT, "ofi": OFI_WEIGHT}
+ENTRY_THRESHOLD = 70.0             # Trend Score 70 = rank 0.70 dell'universo: sotto si scarta
+SUPER_CONVICTION_THRESHOLD = 90.0  # classe SUPER_CONVICTION: taglia maggiorata dall'allocatore tramite il rank
 
 INTRADAY_MOMENTUM, SWING_CATALYST = "INTRADAY_MOMENTUM", "SWING_CATALYST"
 STANDARD, SUPER_CONVICTION = "STANDARD", "SUPER_CONVICTION"
@@ -29,11 +32,11 @@ def build_buy_thesis(symbol: str, price: Optional[float], quant_score: float, ne
 class CIOStrategistAgent:
     """
     AGENTE #5: Chief Investment Officer (CIO) - Fusion Engine
-    - Ensemble_Score = Quant_Score x 0.50 + Groq_News_Score x 0.35 + Microstructure_OFI x 0.15
-    - Soglia d'ingresso: Ensemble >= 72, tutto il resto viene scartato
+    - Ensemble_Score = Trend_Score + (News - 50) x 0.30 + (OFI - 50) x 0.05
+    - Soglia d'ingresso: Ensemble >= 70, tutto il resto viene scartato
     - Classe: SUPER_CONVICTION (Ensemble >= 90) o STANDARD
     - Orizzonte: SWING_CATALYST (catalizzatore strutturale ad alto impatto) o INTRADAY_MOMENTUM
-    - Hard Veto (Risk, Macro/News, Guardian), limiti di portafoglio per i trade non SUPER_CONVICTION
+    - Hard Veto (Risk, Macro/News, Guardian); la capacità del portafoglio la decide il Portfolio Allocator
     - Scheda di ingresso (buy_thesis) e routing di esecuzione
     """
     def __init__(
@@ -51,7 +54,7 @@ class CIOStrategistAgent:
         self.weights = dict(ENSEMBLE_WEIGHTS)
 
     def ensemble_score(self, quant: float, news: float, ofi_score: float) -> float:
-        score = quant * self.weights["quant"] + news * self.weights["news"] + ofi_score * self.weights["ofi"]
+        score = quant + (news - 50.0) * self.weights["news"] + (ofi_score - 50.0) * self.weights["ofi"]
         return float(np.clip(score, 0.0, 100.0))
 
     def best_case_score(self, quant: float, ofi_score: float) -> float:
@@ -151,14 +154,10 @@ class CIOStrategistAgent:
         if agent_06_guardian_res is not None and not agent_06_guardian_res.get("guardian_approved", True):
             vetoes.append(("VETO GUARDIAN", agent_06_guardian_res.get("reason", "PORTFOLIO_LIMIT")))
 
-        # 3. Limiti di portafoglio (Agente #3): un trade STANDARD non entra se il portafoglio è pieno;
-        #    un SUPER_CONVICTION sì, con rotazione delle sole tesi degradate o taglia ridotta alla cassa
+        # 3. La capacità del portafoglio non è un veto: una scheda valida non deve finire in cooldown perché in questo
+        #    momento manca capacità, la verifica l'allocatore quando il CIO compone il mandato
         net = agent_03_risk_res.get("safety_net") or {}
         needs_rotation = bool(net.get("slots_full") or (net and net.get("exposure_room_pct", 100.0) <= 0.5))
-        if needs_rotation and cio_score >= self.buy_threshold and trade_class != SUPER_CONVICTION and agent_06_guardian_res is not None:
-            why = (f"{net.get('positions')}/{net.get('max_positions')} posizioni" if net.get("slots_full")
-                   else f"esposizione {net.get('exposure_pct')}% al limite {net.get('max_exposure_pct')}%")
-            vetoes.append(("VETO RISK", f"Safety Net: {why} (solo un SUPER_CONVICTION può ruotare capitale)"))
 
         if vetoes:
             return {
@@ -169,7 +168,7 @@ class CIOStrategistAgent:
                 "execution_plan": None
             }
 
-        # 4. Soglia d'ingresso: Ensemble >= 72
+        # 4. Soglia d'ingresso
         if cio_score >= self.buy_threshold:
             decision = "BUY"
             conviction_factor = (cio_score - self.buy_threshold) / (100.0 - self.buy_threshold)
@@ -198,8 +197,8 @@ class CIOStrategistAgent:
         return {
             **common,
             "final_decision": decision,
-            "reason": (f"{trade_class} {horizon} {decision} (Ensemble {round(cio_score, 2)} = Q {score_quant:.1f}x0.50 + "
-                       f"News {score_news:.1f}x0.35 + OFI {score_ofi:.1f}x0.15)"),
+            "reason": (f"{trade_class} {horizon} {decision} (Ensemble {round(cio_score, 2)} = Trend {score_quant:.1f}, "
+                       f"News {score_news:.1f}, OFI {score_ofi:.1f})"),
             "conviction_factor": round(conviction_factor, 2),
             "needs_rotation": needs_rotation and decision == "BUY",
             "buy_thesis": buy_thesis,

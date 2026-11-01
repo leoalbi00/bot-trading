@@ -8,6 +8,7 @@ import os
 import re
 import datetime as dt
 from zoneinfo import ZoneInfo
+import bisect
 import copy
 import json
 import math
@@ -83,7 +84,7 @@ HTTP_TIMEOUT = 10
 SCORE_BUY = 75                 # > 75: candidato BUY
 STRONG_BUY_SCORE = 85          # >= 85: STRONG BUY, allocazione maggiorata (25-30%)
 SCORE_SELL = 45                # < 45: candidato SELL / debolezza
-# MAX_RISK_PER_TRADE_PCT (2%) e il limite di drawdown giornaliero (5%) vengono dall'Agente #3: un'unica fonte
+# Il limite di drawdown giornaliero (5%) viene dall'Agente #3: un'unica fonte
 
 # ---------------------------------------------------------------------------
 # Configurazione dinamica (config.json)
@@ -120,8 +121,8 @@ DEFAULT_CONFIG = {
         "NVDA", "AAPL", "MSFT", "TSLA", "AMD", "GOOGL", "AMZN", "META", "PLTR", "COIN", "SMCI",
     ],
     "base_allocation_pct": 5.0,    # minimo della banda più bassa (compatibilità)
-    "max_allocation_pct": 50.0,   # soffitto di sicurezza: 50% solo per SUPER_CONVICTION (Ensemble >= 90)
-    "max_exposure_pct": 50.0,     # Risk Safety Net: mai oltre il 50% del capitale (tetto anche se configurato più alto)
+    "max_allocation_pct": 15.0,   # taglia massima di una posizione (vedi Portfolio Allocator)
+    "max_exposure_pct": 95.0,     # tetto dell'esposizione: quella del momento la calcola il Portfolio Allocator
     "stop_loss_pct": -5.0,
     "scan_interval_min": 15,
     "auto_execute_trades": True,
@@ -497,7 +498,9 @@ _groq_client = None
 from agents.agent_07_chop import GROQ_TIMEOUT_S
 from agents.agent_03_risk import (MAX_EXPOSURE_PCT as RISK_MAX_EXPOSURE_PCT, MAX_POSITIONS as RISK_MAX_POSITIONS,
                                   HARD_STOP_ATR_MULT, MAX_DAILY_DRAWDOWN_PCT,
-                                  MAX_RISK_PER_TRADE_PCT, clamp_stop_pct, crypto_night_blocked, hard_stop_pct)
+                                  clamp_stop_pct, crypto_night_blocked, hard_stop_pct)
+from agents.portfolio_allocator import (MAX_POSITION_PCT, MIN_DOLLAR_VOLUME, MIN_PRICE, MIN_RANK, TARGET_R,
+                                        TRAIL_ATR_MULT, TREND_EXIT_EMA50_RATIO, risk_limits, size_trade)
 
 
 def groq_news_llm(system, prompt):
@@ -895,7 +898,7 @@ def allocation_pct_for_score(score, cfg):
 
 
 def max_exposure_pct(cfg):
-    """Esposizione massima effettiva: quella configurata, mai oltre la Safety Net dell'Agente #3 (50%)."""
+    """Esposizione massima effettiva: quella configurata, mai oltre il tetto del Portfolio Allocator (95%)."""
     return min(float(cfg["max_exposure_pct"]), RISK_MAX_EXPOSURE_PCT)
 
 
@@ -905,7 +908,7 @@ def buy_budget(account, exposure, cfg, crypto=False, score=None, pct=None, facto
     - L'ordine è una percentuale del CAPITALE (equity) che cresce con lo score
       (vedi allocation_pct_for_score), non del buying power a margine.
     - L'esposizione totale (valore delle posizioni + nuovi ordini) non supera max_exposure_pct
-      del capitale, con tetto fisso al 50% (Risk Safety Net): il bot non usa mai il margine.
+      del capitale, con tetto al 95%: il bot non usa mai il margine.
     """
     try:
         equity = max(0.0, float(account.get("portfolio", account.get("equity", 0)) or 0))
@@ -969,7 +972,7 @@ def risk_manager(positions, analysis, account, cfg, log=print, stops=None, trail
     """FASE 2: classifica ogni posizione e calcola fondi ed esposizione.
 
     NESSUN TIME-STOP e nessuna uscita tecnica: una posizione piatta o in consolidamento resta aperta.
-    Stati: STOP_LOSS (hard stop 1.5 x ATR, fascia 1.2-3.5%) e le uscite dell'Agente #6 -> SCALE_OUT (vendita parziale al Target 2R),
+    Stati: STOP_LOSS (hard stop 3 x ATR, fascia 1.5-9%) e le uscite dell'Agente #6 -> SCALE_OUT (vendita parziale al Target 3R),
            TRAILING_STOP, BREAKEVEN_STOP, THESIS_DECAY, OFI_REVERSAL, NEWS_SHOCK;
            OK, NO_DATA -> mantenute.
     sell_pct: quota da vendere (100 tranne lo scaling out).
@@ -1062,7 +1065,7 @@ def _clean_score(value):
 # FUNZIONI DEL DESK SULLE POSIZIONI
 #   Market Analyst        -> market_analyst (RSI, MACD, SMA20/50, ROC, Score di Forza delle posizioni)
 #   Sentiment titoli      -> sentiment_score (veto BUY del Comitato Rischi se sentiment < -40)
-#   Volatility / Guardian -> volatility_agent, guardian_watch (ATR giornaliero, hard stop, Target 2R, trailing)
+#   Volatility / Guardian -> volatility_agent, guardian_watch (ATR giornaliero, hard stop, Target 3R, trailing)
 #   Drawdown Controller   -> drawdown_controller / current_drawdown (perdita giornaliera oltre 5% -> stop acquisti 24h)
 #   Post-Trade Auditor    -> sync_ledger, win_rates (storico Alpaca, win rate per ticker)
 #   CIO del desk          -> build_desk_cio_prompt + ask_desk_cio / quant_desk_cio, validate_desk_decision
@@ -1072,8 +1075,8 @@ TRADE_HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.json")
 BOARDROOM_STATE_PATH = os.path.join(DATA_DIR, "boardroom_state.json")
 
 SENTIMENT_VETO = -40
-ATR_MULT_STOCK = 1.5            # Chandelier Exit del runner: distanza dal picco = mult x ATR% giornaliero
-ATR_MULT_CRYPTO = 2.0
+ATR_MULT_STOCK = TRAIL_ATR_MULT  # Chandelier Exit del runner: distanza dal picco = mult x ATR% giornaliero
+ATR_MULT_CRYPTO = TRAIL_ATR_MULT
 DAILY_DRAWDOWN_LIMIT = -MAX_DAILY_DRAWDOWN_PCT   # -5%: stesso limite del circuit breaker dell'Agente #3
 DRAWDOWN_BLOCK_HOURS = 24
 AUDIT_MIN_TRADES = 3
@@ -1170,7 +1173,7 @@ def atr_pct(df):
 
 
 def dynamic_stop_pct(atr_percent, crypto=False):
-    """Hard stop non negoziabile dell'Agente #3: max(1.2%, min(3.5%, 1.5 x ATR%)) (azioni e crypto)."""
+    """Hard stop non negoziabile dell'Agente #3: max(1.5%, min(9%, 3 x ATR%)) (azioni e crypto)."""
     return hard_stop_pct(atr_percent)
 
 
@@ -1209,7 +1212,7 @@ GUARDIAN_ENTRY_MATCH_PCT = 0.5   # prezzo medio cambiato oltre lo 0.5%: nuova po
 GUARDIAN_CLOSED_MAX = 30         # chiusure recenti (con exit_reason) conservate in guardian_positions.json
 THESIS_NEWS_DROP = 0.3           # rotazione: tesi degradata se l'impact delle notizie fresche scende di 0.3 dall'ingresso
 GUARDIAN_STATE_PATH = os.path.join(DATA_DIR, "guardian_positions.json")
-_guardian_cache = {"atr": {}, "peak": {}, "ofi": {}}
+_guardian_cache = {"atr": {}, "peak": {}, "ofi": {}, "trend": {}}
 _guardian_cache_lock = threading.RLock()
 
 
@@ -1305,7 +1308,7 @@ def guardian_position_state(p, vix=None, scaled_hint=None):
 
     scaled_hint: vendita parziale già avvenuta secondo lo storico ordini di Alpaca (sync_ledger). Serve quando lo
     stato locale manca (es. deploy su un disco non persistente): senza, il runner tornerebbe allo hard stop e il
-    Guardian rivenderebbe un altro 50% al Target 2R.
+    Guardian rivenderebbe un altro 50% al Target 3R.
     """
     key, entry = normalize_symbol(p["symbol"]), p.get("avg_entry_price") or p["current_price"]
     with _guardian_cache_lock:
@@ -1484,10 +1487,30 @@ def guardian_atr(yf_symbol):
     return guardian_atr_info(yf_symbol)[0]
 
 
+def guardian_trend_break(yf_symbol):
+    """Motivo dell'uscita se l'ultima chiusura giornaliera è sotto il 97% della EMA50, altrimenti None (cache 1 ora)."""
+    key = normalize_symbol(yf_symbol)
+    with _guardian_cache_lock:
+        cached = _guardian_cache["trend"].get(key)
+    if cached and time.time() - cached[0] < GUARDIAN_ATR_TTL_SEC:
+        return cached[1]
+    df = get_daily_bars(yf_symbol)
+    reason = None
+    if df is not None:
+        close = completed_daily_close(df)
+        if len(close) >= 55:
+            price, ema50 = float(close.iloc[-1]), float(_ema(close, 50).iloc[-1])
+            if price < ema50 * TREND_EXIT_EMA50_RATIO:
+                reason = f"chiusura ${price:,.2f} sotto la EMA50 ${ema50:,.2f} di oltre il 3%"
+    with _guardian_cache_lock:
+        _guardian_cache["trend"][key] = (time.time(), reason)
+    return reason
+
+
 def position_stop(p, info=None):
     """Stop Loss e Target 1 dinamici di una posizione, ricalcolati sulla volatilità reale (ATR 14).
 
-    Stop_Loss_Pct = max(1.2%, min(3.5%, 1.5 x ATR%)), Target_1_Pct = 2 x Stop_Loss_Pct. Vale per ogni posizione,
+    Stop_Loss_Pct = max(1.5%, min(9%, 3 x ATR%)), Target_1_Pct = 3 x Stop_Loss_Pct. Vale per ogni posizione,
     anche per i ticker aperti senza scheda di ingresso. Solo se l'ATR non è leggibile da nessun grafico si usa lo
     stop ATR salvato dal CIO all'ingresso, e in ultima istanza il limite largo della fascia.
     -> {"stop_pct", "target_pct", "atr_pct", "stop_basis"}
@@ -1533,6 +1556,7 @@ def guardian_evaluate(p, info, stop, atr, market_open, now=None, stop_basis=None
     vix = (latest_channels().get("macro") or {}).get("vix")
     st = guardian_position_state(p, vix, scaled_hint=info.get("scaled_out"))
     sig = guardian_signals(q, vix, st.get("vix0"), st.get("entry_news_impact"), key=normalize_symbol(p["symbol"]))
+    sig["trend_break"] = guardian_trend_break(p["yf_symbol"])
     agent = portfolio_guardian()
     g = agent.evaluate_position(entry=entry, price=price, peak=peak, stop_pct=clamp_stop_pct(stop), atr_pct=atr,
                                 is_crypto=p["is_crypto"], market_open=market_open, scaled_out=bool(st.get("scaled")),
@@ -1563,7 +1587,7 @@ def guardian_watch(positions, open_info, cfg, market_open):
 
 
 def portfolio_guardian():
-    """Agente #6 (Portfolio Guardian): Target 1 a 2R, runner con Chandelier Exit agli stessi moltiplicatori ATR del desk."""
+    """Agente #6 (Portfolio Guardian): Target 1 a 3R, runner con Chandelier Exit agli stessi moltiplicatori ATR del desk."""
     global _guardian
     if _guardian is None:
         from agents.agent_06_sentinel import PortfolioGuardianAgent
@@ -1574,9 +1598,9 @@ def portfolio_guardian():
 
 def volatility_agent(symbols, positions, cfg, log=print, ledger=None, market_open=True):
     """ATR e hard stop per ogni simbolo; per le posizioni aperte l'Agente #6 (Portfolio Guardian) calcola
-    Target 1 (scaling out a 2R), runner a breakeven con trailing ATR, Thesis Decay, Orderbook Reversal e News Shock.
+    Target 1 (scaling out a 3R), runner a breakeven con trailing ATR, Thesis Decay, Orderbook Reversal e News Shock.
 
-    - hard stop di ogni posizione: 1.5 x ATR% reale nella fascia -1.2/-3.5% (position_stop), Target 1 a 2R;
+    - hard stop di ogni posizione: 3 x ATR% reale nella fascia -1.5/-9% (position_stop), Target 1 a 3R;
     - picco: massimo dei prezzi dall'apertura (data letta dagli ordini Alpaca).
     Restituisce (vol, stops, guardian) dove guardian[chiave] contiene action/hit/reason/effective_stop_pct.
     La stessa valutazione gira anche nel loop indipendente del Guardian (guardian_watch, ogni 20 secondi).
@@ -1677,7 +1701,7 @@ def sync_ledger(days=90, log=print):
     orders.sort(key=lambda o: o.filled_at or o.submitted_at)
 
     lots, trades = {}, []
-    partial = {}    # simbolo -> vendita parziale dopo l'apertura (Target 2R, Rischio Zero o rotazione parziale)
+    partial = {}    # simbolo -> vendita parziale dopo l'apertura (Target 3R, Rischio Zero o rotazione parziale)
     for o in orders:
         qty = float(o.filled_qty or 0)
         price = float(o.filled_avg_price or 0)
@@ -1801,7 +1825,7 @@ def startup_system_sync(log=print):
 #   Tier 1  Micro-Scout paralleli (pool di SCOUT_MAX_WORKERS thread, calcoli puramente matematici)
 #   Tier 2  Chief of Staff / Orchestrator (coda, TTL 15 min, cooldown 60 min, stati atomici)
 #   Tier 3  Comitato Rischi: 3 gatekeeper in parallelo con potere di veto
-#   Tier 4  CIO Portfolio Manager (Groq) con convinzione 0-100 e sizing dinamico 8%-50% (CONVICTION_BANDS)
+#   Tier 4  CIO Portfolio Manager (Groq) con convinzione 0-100; taglia dal Portfolio Allocator
 #   Tier 5  Execution Desk + Post-Trade Auditor (vedi app.py / sync_ledger / performance_stats)
 # Dati: 5 canali di intelligence (macro & VIX, multi-timeframe, order flow, sentiment, correlazioni).
 # I thread di scansione NON inviano ordini: gli ordini partono solo dal CIO.
@@ -1885,13 +1909,16 @@ ROC_CHASE_MAX = 15.0            # movimento già esteso: non si insegue il prezz
 FNG_EXTREME_FEAR = 15           # Crypto Fear & Greed sotto 15: veto sulle crypto
 HIGH_BETA = 1.3                 # con VIX > 25 gli asset ad alto beta vengono bloccati
 EARNINGS_VETO_HOURS = 24
-TARGET_RISK_REWARD = 2.0
+TARGET_RISK_REWARD = TARGET_R
+TREND_BOOK_TTL_SEC = 24 * 3600  # momentum dei ticker visti dallo sciame: rank calcolato sull'universo, non sul blocco
+TREND_BOOK_MIN = 30             # sotto questo numero di ticker il rank non è significativo
+MOMENTUM_MIN_BARS = 130
 
-# Sizing dinamico del CIO in base alla convinzione = Ensemble Score dell'Agente #5 (percentuale del capitale)
-# 90+: SUPER_CONVICTION, fino al 50% autorizzato dall'Agente #3; sotto 72 nessun trade (no overtrading)
-CONVICTION_BANDS = [(90, 35.0, 50.0), (80, 15.0, 25.0), (72, 8.0, 15.0)]
-MIN_CONVICTION = CONVICTION_BANDS[-1][0]
-SUPER_CONVICTION_SCORE = CONVICTION_BANDS[0][0]
+# Convinzione = Ensemble Score dell'Agente #5. La taglia la decide il Portfolio Allocator, non più bande fisse
+MIN_CONVICTION = 70
+SUPER_CONVICTION_SCORE = 90
+MAX_BUYS_PER_CYCLE = 4          # acquisti per ciclo del CIO: la liquidità si reinveste subito, non uno alla volta
+EQUITY_PEAK_KEY = "equity_peak"
 
 # Soglia dello score tecnico per trasformare un'anomalia in scheda: 50 con volatilità standard (VIX < 20),
 # 75 con volatilità elevata o VIX non disponibile
@@ -1908,7 +1935,6 @@ def scout_pitch_threshold(macro):
     """Soglia di attivazione delle anomalie degli Scout in base al regime di volatilità (VIX)."""
     vix = (macro or {}).get("vix")
     return SCOUT_PITCH_SCORE_STANDARD if vix is not None and vix < VIX_STANDARD_MAX else SCORE_BUY
-ROTATE_SELL_STEPS = (30, 50, 100)   # quote vendibili in rotazione (solo tesi degradate, solo per SUPER_CONVICTION)
 CIO_MIN_GAP_SEC = 180           # il CIO può essere svegliato da una scheda approvata al massimo ogni 3 minuti
 
 # Stati del ciclo di vita di una scheda (Trade Pitch)
@@ -2270,7 +2296,7 @@ def earnings_within(yf_symbol, hours=EARNINGS_VETO_HOURS):
 
 def macro_channel(daily_refs):
     """Canale 1: VIX e trend di SPY, QQQ e BTC (prezzo rispetto all'EMA50 giornaliera)."""
-    out = {"vix": None, "risk_contraction": False, "indices": {}}
+    out = {"vix": None, "risk_contraction": False, "indices": {}, "trend_up": {}}
     vix = daily_refs.get("^VIX")
     if vix is not None and len(vix):
         out["vix"] = round(float(vix["Close"].iloc[-1]), 2)
@@ -2282,6 +2308,12 @@ def macro_channel(daily_refs):
         price, ema50 = float(df["Close"].iloc[-1]), float(_ema(df["Close"], 50).iloc[-1])
         out["indices"][sym] = {"price": round(price, 2), "ema50": round(ema50, 2),
                                "trend": "RIALZISTA" if price > ema50 else "RIBASSISTA"}
+    # Regime del Portfolio Allocator: prezzo sopra la EMA100 giornaliera
+    for sym, key in (("SPY", "stock"), ("BTC-USD", "crypto")):
+        df = daily_refs.get(sym)
+        if df is not None and len(df) >= 105:
+            close = completed_daily_close(df)
+            out["trend_up"][key] = bool(close.iloc[-1] > _ema(close, 100).iloc[-1])
     stocks_off = out["indices"].get("SPY", {}).get("trend") == "RIBASSISTA"
     crypto_off = out["indices"].get("BTC-USD", {}).get("trend") == "RIBASSISTA"
     out["regime"] = {
@@ -2289,6 +2321,68 @@ def macro_channel(daily_refs):
         "crypto": "RISK-OFF" if out["risk_contraction"] or crypto_off else "RISK-ON",
     }
     return out
+
+
+# ---------------------------------------------------------------- Trend e forza relativa
+_trend_book = {}
+_trend_book_lock = threading.Lock()
+
+
+def completed_daily_close(df):
+    """Chiusure giornaliere senza la barra di oggi, ancora in formazione."""
+    close = df["Close"].dropna()
+    if len(close) and close.index[-1].date() >= now_local().date():
+        return close.iloc[:-1]
+    return close
+
+
+def trend_features(sym, f1d):
+    """Trend e momentum giornalieri di un ticker: None se le barre o la liquidità non bastano."""
+    if f1d is None or len(f1d) < MOMENTUM_MIN_BARS:
+        return None
+    close = completed_daily_close(f1d)
+    if len(close) < MOMENTUM_MIN_BARS:
+        return None
+    volume = f1d["Volume"].reindex(close.index).fillna(0.0)
+    dollar_volume = float((close * volume).iloc[-20:].median())
+    price = float(close.iloc[-1])
+    if dollar_volume < MIN_DOLLAR_VOLUME or (price < MIN_PRICE and not is_crypto(sym)):
+        return None
+    annual_vol = float(close.pct_change().iloc[-63:].std()) * math.sqrt(252)
+    if not annual_vol or not math.isfinite(annual_vol):
+        return None
+    ema20, ema50 = float(_ema(close, 20).iloc[-1]), float(_ema(close, 50).iloc[-1])
+    return {"momentum": (float(close.iloc[-6]) / float(close.iloc[-127]) - 1) / annual_vol,
+            "trend_ok": price > ema20 > ema50}
+
+
+def trend_score(rank, trend_ok):
+    """Da 70 (rank 0.70) a 100 per i titoli in trend tra i più forti, 40-60 per tutti gli altri."""
+    if rank is None:
+        return None
+    if trend_ok and rank >= MIN_RANK:
+        return round(70.0 + 30.0 * (rank - MIN_RANK) / (1.0 - MIN_RANK), 2)
+    return round(40.0 + 20.0 * rank, 2)
+
+
+def apply_trend_rank(results):
+    """Aggiorna il registro del momentum e assegna a ogni scout rank (0-1) e Trend Score sull'universo visto finora."""
+    now = time.time()
+    with _trend_book_lock:
+        for r in results:
+            if r.get("trend"):
+                _trend_book[normalize_symbol(r["symbol"])] = (now, r["trend"]["momentum"])
+        for k, v in list(_trend_book.items()):
+            if now - v[0] > TREND_BOOK_TTL_SEC:
+                _trend_book.pop(k, None)
+        values = sorted(v[1] for v in _trend_book.values())
+    if len(values) < TREND_BOOK_MIN:
+        return
+    for r in results:
+        if r.get("trend"):
+            rank = bisect.bisect_right(values, r["trend"]["momentum"]) / len(values)
+            r["trend_rank"] = round(rank, 4)
+            r["trend_score"] = trend_score(rank, r["trend"]["trend_ok"])
 
 
 # ---------------------------------------------------------------- Tier 1: micro-scout
@@ -2317,7 +2411,7 @@ def micro_scout(sym, sector, f15, f1h, f1d, ref_daily, pitch_score=SCORE_BUY):
     return {
         "symbol": sym, "sector": sector, "score": score, "ind": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in ind.items()},
         "mtf": mtf, "mtf_aligned": aligned, "vwap": vwap, "vwap_dist_pct": vwap_dist,
-        "rvol": ind.get("vol_ratio"), "beta": beta, "corr": corr, "atr_pct": atr,
+        "rvol": ind.get("vol_ratio"), "beta": beta, "corr": corr, "atr_pct": atr, "trend": trend_features(sym, f1d),
         "anomalies": anomalies, "pitch": bool(anomalies) and score > pitch_score, "pitch_threshold": pitch_score,
         "elapsed_ms": round((time.thread_time() - started) * 1000, 1),
     }
@@ -2384,11 +2478,11 @@ def gate_risk_atr(p, ctx):
 
 
 PIPELINE_ORIGIN = "Pipeline Quant"
-PIPELINE_BUY_SCORE = 72.0       # soglia d'ingresso dell'Agente #5 (Ensemble Score)
+PIPELINE_BUY_SCORE = 70.0       # soglia d'ingresso dell'Agente #5 (Ensemble Score)
 
 
 def gate_quant_ensemble(p):
-    """Fusion Engine (Agente #5): ogni scheda deve avere un BUY con Ensemble >= 72 (Q x 0.50 + News x 0.35 + OFI x 0.15).
+    """Fusion Engine (Agente #5): ogni scheda deve avere un BUY con Ensemble >= 70 (Trend Score corretto da News e OFI).
 
     Senza una valutazione recente la scheda non passa: nessun trade senza la validazione dei 7 agenti e di Groq.
     """
@@ -2493,7 +2587,7 @@ def risk_committee(pitch, ctx, fng):
     quant_gate = gate_quant_ensemble(pitch)
     gates.append(quant_gate)
     vetoes = [f"{g['agent']}: {g['reason']}" for g in gates if g["veto"]]
-    # Il Fusion Engine decide: con Ensemble >= 72 lo score tecnico dello Scout non serve più come soglia
+    # Il Fusion Engine decide: sopra la soglia d'ingresso lo score tecnico dello Scout non serve più
     ensemble_ok = (quant_gate.get("ensemble_score") or 0) >= PIPELINE_BUY_SCORE
     threshold = pitch.get("pitch_threshold", SCORE_BUY)
     if score <= threshold and not ensemble_ok:
@@ -2606,6 +2700,7 @@ def prune_runtime_caches():
         # Il picco delle posizioni aperte viene riletto ogni 15 minuti (ts aggiornato): restano solo quelle vive
         _prune_cache(_guardian_cache["peak"], 6 * 3600, ts=lambda v: v["ts"])
         _prune_cache(_guardian_cache["ofi"], 6 * 3600, ts=lambda v: v["ts"])
+        _prune_cache(_guardian_cache["trend"], 6 * 3600)
 
 
 def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotate=False, exposure_usd=None,
@@ -2712,6 +2807,7 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         results = [r for r in pool.map(run_one, tickers) if r]
     scouts_ms = round((time.perf_counter() - t_sc) * 1000, 1)
     max_scout_ms = max((r["elapsed_ms"] for r in results), default=0)
+    apply_trend_rank(results)
 
     # Sciame di 100 Scout + pipeline a 3 Stage (7 agenti). Le schede dello sciame classico e le posizioni
     # aperte arrivano sempre allo Stage 3; i BUY approvati dallo Stage 3 diventano nuove schede.
@@ -2721,11 +2817,14 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             macro, fng, held_keys=held_keys, log=log, pending=pending, exposure_usd=exposure_usd,
             positions_count=positions_count,
             force=[r["symbol"] for r in results if r["pitch"] or normalize_symbol(r["symbol"]) in held_keys],
-            scout_meta={r["symbol"]: {"rvol": r["rvol"], "score": r["score"], "atr_pct": r.get("atr_pct")} for r in results})
+            scout_meta={r["symbol"]: {"rvol": r["rvol"], "score": r["score"], "atr_pct": r.get("atr_pct"),
+                                      "trend_score": r.get("trend_score")} for r in results})
         for r in results:
-            if r["pitch"] or not (market_open or is_crypto(r["symbol"])) or not r.get("tradable", True):
+            if not (market_open or is_crypto(r["symbol"])) or not r.get("tradable", True):
                 continue
             q = quant_rationale(r["symbol"], max_age_sec=120)
+            # Un'anomalia senza BUY del Fusion Engine non diventa scheda: finirebbe solo in cooldown per 60 minuti
+            r["pitch"] = False
             if q and q["agent_05_cio"]["decision"] == "BUY" and r["score"] < PIPELINE_MIN_TA_SCORE:
                 agent_say("Pipeline", f"{r['symbol']} → BUY dallo Stage 3 (ensemble {q['agent_05_cio']['score']}) non promosso: "
                                       f"score tecnico {r['score']} < {PIPELINE_MIN_TA_SCORE} (tecnica ribassista)", "muted")
@@ -2866,14 +2965,6 @@ def latest_channels():
     return dict(_registry_view().get("channels") or {})
 
 
-def conviction_band(conviction):
-    """(min %, max %) del capitale per la convinzione indicata, oppure None se < MIN_CONVICTION (72)."""
-    for floor, lo, hi in CONVICTION_BANDS:
-        if conviction is not None and conviction >= floor:
-            return lo, hi
-    return None
-
-
 DESK_CIO_SYSTEM_PROMPT = (
     "Sei il CIO Portfolio Manager di una sala mercati istituzionale che gestisce un conto paper (simulato) Alpaca. "
     "Le tue risposte vengono lette da un programma: rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo. "
@@ -2901,7 +2992,6 @@ def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
     hold_lines = [f"  - {h['symbol']}: valore ${h['market_value']:,.0f} ({h['weight_pct']:.1f}% del capitale), "
                   f"PnL {h['pnl_pct']:+.2f}%, tesi {'DEGRADATA' if h.get('degraded') else 'INTATTA'} ({h.get('thesis_note', 'N/D')})"
                   for h in holdings]
-    bands = "; ".join(f"convinzione {f}+ → {lo:.0f}-{hi:.0f}%" for f, lo, hi in CONVICTION_BANDS)
     fng_line = f"[4 Sentiment crypto] Fear & Greed {fng['value']} ({fng['label']})\n" if fng else ""
     return (
         "Sei il CIO Portfolio Manager. Analizza SOLO le schede approvate dal Comitato Rischi e decidi autonomamente "
@@ -2917,20 +3007,17 @@ def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
         f"Schede approvate dal Comitato Rischi (canali 2 multi-timeframe, 3 order flow, 5 correlazioni):\n"
         f"{chr(10).join(pitch_lines) or '  (nessuna)'}\n\n"
         "Regole:\n"
-        f"- La convinzione è l'ENSEMBLE del Fusion Engine (Q x 0.50 + News x 0.35 + OFI x 0.15); allocazione coerente: "
-        f"{bands}. Sotto {MIN_CONVICTION} rispondi HOLD.\n"
-        f"- Soffitto di sicurezza: {cfg['max_allocation_pct']:.0f}% per operazione (solo SUPER_CONVICTION oltre 25%), "
-        f"esposizione totale {max_exposure_pct(cfg):.0f}%, massimo {RISK_MAX_POSITIONS} posizioni. "
-        "In regime RISK-OFF l'allocazione viene dimezzata.\n"
+        "- Scegli la scheda migliore. Taglia e stop li calcola il Portfolio Allocator dal budget di rischio: non devi "
+        "deciderli.\n"
+        f"- La convinzione è l'ENSEMBLE del Fusion Engine (Trend Score corretto da notizie e order flow). Sotto "
+        f"{MIN_CONVICTION} rispondi HOLD.\n"
         f"- ROTATE solo per una scheda SUPER_CONVICTION (ensemble >= {SUPER_CONVICTION_SCORE}) e SOLO vendendo una posizione "
-        f"con tesi DEGRADATA (sell_pct tra {', '.join(map(str, ROTATE_SELL_STEPS))}). Mai vendere posizioni con tesi "
-        "INTATTA, anche se piatte o aperte da tempo: in quel caso la taglia si riduce alla liquidità disponibile.\n"
-        "- Non esiste SELL discrezionale: le uscite sono gestite dal Guardian (stop, Target 2R, trailing, uscite anticipate). "
+        "con tesi DEGRADATA. Mai vendere posizioni con tesi INTATTA, anche se piatte o aperte da tempo.\n"
+        "- Non esiste SELL discrezionale: le uscite sono gestite dal Guardian (stop, Target, trailing, trend, uscite anticipate). "
         "HOLD se nessuna scheda merita capitale.\n\n"
         "Restituisci la risposta in formato JSON pulito:\n"
         '{\n  "action": "BUY" | "ROTATE" | "HOLD",\n  "buy_symbol": "TICKER",\n  "sell_symbol": "TICKER",\n'
-        '  "sell_pct": 30 | 50 | 100,\n  "conviction_score": 0-100,\n  "allocation_pct": 8-50,\n'
-        '  "dynamic_stop_loss_pct": valore_negativo,\n  "reason": "Motivazione che cita i 5 canali di intelligence"\n}\n'
+        '  "conviction_score": 0-100,\n  "reason": "Motivazione che cita i 5 canali di intelligence"\n}\n'
         "Usa i ticker esattamente come scritti sopra e stringa vuota per i campi non usati."
     )
 
@@ -2986,37 +3073,43 @@ def pitch_conviction(p):
 
 
 def quant_desk_cio(pitches, holdings, account):
-    """CIO quantitativo di riserva: convinzione = score della scheda migliore, taglia a metà banda."""
+    """CIO quantitativo: sceglie la scheda con l'Ensemble più alto; la taglia la calcola il Portfolio Allocator."""
     if not pitches:
         return {"action": "HOLD", "buy_symbol": "", "sell_symbol": "", "reason": "[Quant] Nessuna scheda approvata"}
     best = max(pitches, key=pitch_conviction)
     conviction = pitch_conviction(best)
-    band = conviction_band(conviction)
-    if not band:
+    if conviction < MIN_CONVICTION:
         return {"action": "HOLD", "buy_symbol": "", "sell_symbol": "", "reason": f"[Quant] Convinzione {conviction} < {MIN_CONVICTION}"}
-    decision = {"action": "BUY", "buy_symbol": best["symbol"], "sell_symbol": "", "conviction_score": conviction,
-                "allocation_pct": (band[0] + band[1]) / 2, "dynamic_stop_loss_pct": best["package"]["stop_pct"],
-                "reason": f"[Quant] {best['symbol']} scheda più convincente (score {best['score']}, ensemble {best.get('ensemble')})"}
-    return decision
+    return {"action": "BUY", "buy_symbol": best["symbol"], "sell_symbol": "", "conviction_score": conviction,
+            "reason": f"[Quant] {best['symbol']} scheda più convincente (score {best['score']}, ensemble {best.get('ensemble')})"}
+
+
+def desk_limits(channels, account, cfg):
+    """Limiti di rischio del momento: regime (SPY/VIX), drawdown del conto e tetti della configurazione."""
+    macro = channels.get("macro") or {}
+    trend = macro.get("trend_up") or {}
+    limits = risk_limits(bool(trend.get("stock", True)), macro.get("vix"), account.get("drawdown_pct") or 0.0)
+    limits["gross_pct"] = min(limits["gross_pct"], max_exposure_pct(cfg))
+    return limits
 
 
 def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_keys=()):
-    """Applica Safety Net, bande di convinzione e Rotazione Intelligente alla decisione del CIO.
+    """Trasforma la scelta del CIO in un mandato esecutivo: la taglia viene sempre dal Portfolio Allocator.
 
-    - Nessun SELL discrezionale: le uscite sono solo quelle del Guardian (stop, Target 2R, trailing, uscite anticipate).
-    - Massimo 4 posizioni ed esposizione totale 50% (Agente #3); nessuna nuova crypto tra le 22:00 e le 08:00 CET.
-    - Liquidità insufficiente: solo un SUPER_CONVICTION (Ensemble >= 90) può ruotare capitale, e SOLO da posizioni
-      con tesi degradata (holdings[i]["degraded"]); con tesi intatte la taglia si riduce alla cassa rimanente.
+    - Nessun SELL discrezionale: le uscite sono solo quelle del Guardian (stop, Target, trailing, trend, uscite anticipate).
+    - Il CIO sceglie il titolo, non la taglia: allocazione e stop proposti dall'IA vengono ignorati.
+    - Budget di rischio esaurito: solo un SUPER_CONVICTION (Ensemble >= 90) può ruotare capitale, e SOLO da posizioni
+      con tesi degradata (holdings[i]["degraded"]).
+    - Nessuna nuova crypto tra le 22:00 e le 08:00 CET o con BTC sotto trend.
     Restituisce la decisione esecutiva con: buy_amount, allocation_pct effettiva, sell_pct, stop, note.
     """
     hold = lambda why: {"action": "HOLD", "buy_symbol": "", "sell_symbol": "", "reason": why, "notes": []}
     action = (d or {}).get("action", "HOLD")
     pitch_map = {normalize_symbol(p["symbol"]): p for p in pitches}
     hold_map = {normalize_symbol(h["yf_symbol"]): h for h in holdings if normalize_symbol(h["symbol"]) not in sold_keys}
-    notes = []
 
     if action == "HOLD":
-        return {**d, "notes": notes}
+        return {**d, "notes": []}
     if action == "SELL":
         return hold(f"SELL discrezionale su {d.get('sell_symbol') or '?'} ignorato: le uscite sono solo quelle del Guardian "
                     "(nessun time-stop, nessuna chiusura di tesi valide)")
@@ -3027,86 +3120,52 @@ def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_ke
     crypto = is_crypto(pitch["symbol"])
     if crypto and crypto_night_blocked():
         return hold(f"{pitch['symbol']}: blocco crypto overnight (22:00-08:00 CET), nessuna nuova apertura")
+    if crypto and not ((channels.get("macro") or {}).get("trend_up") or {}).get("crypto", True):
+        return hold(f"{pitch['symbol']}: BTC sotto trend, nessuna nuova apertura crypto")
     # La convinzione è l'Ensemble del Fusion Engine: il CIO non può alzarla
     ensemble = pitch_conviction(pitch)
     conviction = min(d.get("conviction_score") if d.get("conviction_score") is not None else ensemble, ensemble)
-    band = conviction_band(conviction)
-    if not band:
+    if conviction < MIN_CONVICTION:
         return hold(f"Convinzione {conviction} sotto {MIN_CONVICTION}: nessuna operazione su {pitch['symbol']}")
     super_conviction = conviction >= SUPER_CONVICTION_SCORE
-    requested = d.get("allocation_pct")
-    pct = band[0] if requested is None else max(band[0], min(band[1], requested))
-    if requested is not None and pct != requested:
-        notes.append(f"allocazione {requested}% riportata nella banda {band[0]:.0f}-{band[1]:.0f}%")
-    if pct > cfg["max_allocation_pct"]:
-        notes.append(f"soffitto max_allocation_pct {cfg['max_allocation_pct']:.0f}%")
-        pct = cfg["max_allocation_pct"]
-    regime = ((channels.get("macro") or {}).get("regime") or {}).get("crypto" if crypto else "stock")
-    if regime == "RISK-OFF":
-        pct = pct / 2
-        notes.append("regime RISK-OFF: allocazione dimezzata")
-    stop = d.get("dynamic_stop_loss_pct")
-    stop = clamp_stop_pct(-abs(stop) if stop else pitch["package"]["stop_pct"])
-    # Sizing coerente con lo stop: allo stop non si perde più di MAX_RISK_PER_TRADE_PCT del capitale
-    risk_cap = MAX_RISK_PER_TRADE_PCT / abs(stop) * 100
-    if pct > risk_cap:
-        notes.append(f"allocazione {pct:.1f}% → {risk_cap:.1f}% (stop {stop:.1f}%: rischio max {MAX_RISK_PER_TRADE_PCT:.0f}% del capitale)")
-        pct = risk_cap
-    target_amount = round(account["equity"] * pct / 100, 2)
+    stop = clamp_stop_pct(pitch["package"]["stop_pct"])
+    limits = desk_limits(channels, account, cfg)
+    open_risk = sum(h.get("open_risk") or 0.0 for h in hold_map.values())
+    crypto_exposure = sum(abs(h["market_value"]) for h in hold_map.values() if is_crypto(h["yf_symbol"]))
     funds = account["funds_crypto"] if crypto else account["funds"]
-    out = {**d, "action": "BUY", "buy_symbol": pitch["symbol"], "conviction_score": conviction, "allocation_pct": round(pct, 2),
-           "dynamic_stop_loss_pct": stop, "target_amount": round(target_amount, 2), "notes": notes, "sell_symbol": "",
-           "sell_pct": None, "trade_class": "SUPER_CONVICTION" if super_conviction else "STANDARD",
+    sized = size_trade(account["equity"], account["exposure"], funds, open_risk, len(hold_map), limits, abs(stop), rank=pitch.get("trend_rank"), crypto=crypto,
+                       crypto_exposure=crypto_exposure)
+    notes = [f"regime {limits['regime']:.2f}, drawdown x{limits['drawdown_scale']:.2f}, rischio aperto "
+             f"{open_risk / account['equity'] * 100 if account['equity'] else 0:.2f}%/{limits['heat_pct']:.2f}%"]
+    out = {**d, "action": "BUY", "buy_symbol": pitch["symbol"], "conviction_score": conviction, "dynamic_stop_loss_pct": stop,
+           "notes": notes, "sell_symbol": "", "sell_pct": None, "trade_class": "SUPER_CONVICTION" if super_conviction else "STANDARD",
            "horizon": pitch.get("package", {}).get("horizon")}
+    amount = min(sized["amount"], account["equity"] * cfg["max_allocation_pct"] / 100)
+    if amount > 0:
+        out.update(buy_amount=amount, target_amount=amount, allocation_pct=round(amount / account["equity"] * 100, 2))
+        notes.append(sized["reason"])
+        return out
 
-    slots_full = len(hold_map) >= RISK_MAX_POSITIONS
     degraded = sorted((h for h in hold_map.values() if h.get("degraded")), key=lambda h: h["pnl_pct"])
-    if not super_conviction:
-        if slots_full:
-            return hold(f"Safety Net: {len(hold_map)}/{RISK_MAX_POSITIONS} posizioni aperte, {pitch['symbol']} "
-                        f"(ensemble {conviction}) non è SUPER_CONVICTION")
-        if funds >= max(MIN_ORDER_USD, target_amount / 2):
-            out["buy_amount"] = round(min(target_amount, funds), 2)
-            if out["buy_amount"] < target_amount:
-                notes.append(f"taglia ridotta alla liquidità disponibile (${funds:,.0f})")
-            return out
-        return hold(f"Liquidità ${funds:,.0f} insufficiente per {pitch['symbol']} (servono almeno ${target_amount / 2:,.0f}); "
-                    "nessuna rotazione per un trade non SUPER_CONVICTION")
-
-    # SUPER_CONVICTION: rotazione SOLO da tesi degradate, altrimenti taglia ridotta alla cassa
-    needed = max(0.0, target_amount - funds)
-    if (needed > 0 or slots_full) and degraded:
+    if super_conviction and degraded:
         h = next((x for x in degraded if normalize_symbol(x["yf_symbol"]) == normalize_symbol(d.get("sell_symbol") or "")),
                  degraded[0])
-        needed_pct = needed / h["market_value"] * 100 if h["market_value"] else 100.0
-        sell_pct = 100 if slots_full else _snap_sell_pct(d.get("sell_pct") or needed_pct, minimum=needed_pct)
+        amount = min(abs(h["market_value"]), account["equity"] * MAX_POSITION_PCT / 100, account["equity"] * cfg["max_allocation_pct"] / 100)
         notes.append(f"rotazione da {h['yf_symbol']}: tesi degradata ({h.get('thesis_note')})")
-        out.update(action="ROTATE", sell_symbol=h["yf_symbol"], sell_pct=sell_pct,
-                   buy_amount=round(min(target_amount, funds + h["market_value"] * sell_pct / 100), 2))
+        out.update(action="ROTATE", sell_symbol=h["yf_symbol"], sell_pct=100, buy_amount=round(amount, 2), target_amount=round(amount, 2),
+                   allocation_pct=round(amount / account["equity"] * 100, 2))
         return out
-    if slots_full:
-        return hold(f"SUPER_CONVICTION {pitch['symbol']} ({conviction}): {len(hold_map)}/{RISK_MAX_POSITIONS} posizioni "
-                    "con tesi tutte intatte, nessuna vendita forzata")
-    out["buy_amount"] = round(min(target_amount, funds), 2)
-    if out["buy_amount"] < MIN_ORDER_USD:
-        return hold(f"SUPER_CONVICTION {pitch['symbol']}: liquidità ${funds:,.0f} esaurita e tesi in portafoglio intatte, "
-                    "nessuna vendita forzata")
-    if out["buy_amount"] < target_amount:
-        notes.append(f"SUPER_CONVICTION: tesi in portafoglio intatte, taglia ridotta alla cassa (${funds:,.0f})")
-    return out
+    return hold(f"{pitch['symbol']} (ensemble {conviction}): {sized['reason']}")
 
 
-def _snap_sell_pct(value, minimum=0.0):
-    """Arrotonda la quota da vendere ai passi consentiti (30/50/100) senza scendere sotto il necessario."""
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        value = 100.0
-    target = max(value, minimum)
-    for step in ROTATE_SELL_STEPS:
-        if target <= step:
-            return step
-    return 100
+def account_after_buy(account, holdings, final, stop_pct_value):
+    """Aggiorna conto e posizioni dopo un acquisto inviato: il mandato successivo dello stesso ciclo li vede già."""
+    amount = final["buy_amount"]
+    account.update(exposure=account["exposure"] + amount, funds=max(0.0, account["funds"] - amount),
+                   funds_crypto=max(0.0, account["funds_crypto"] - amount))
+    holdings.append({"symbol": final["buy_symbol"], "yf_symbol": final["buy_symbol"], "market_value": amount,
+                     "weight_pct": final["allocation_pct"], "pnl_pct": 0.0, "score": None, "status": "OK", "degraded": False,
+                     "thesis_note": "appena acquistata", "open_risk": amount * abs(stop_pct_value) / 100})
 
 
 def close_position_pct(alpaca_symbol, pct):
@@ -3503,6 +3562,13 @@ def events_for_agents(yf_symbol):
     return events
 
 
+def equity_drawdown_pct(equity, state):
+    """Drawdown del conto dal massimo storico (% <= 0): il massimo è salvato nello stato del boardroom."""
+    peak = max(float(state.get(EQUITY_PEAK_KEY) or 0), initial_capital() or 0.0, equity or 0.0)
+    state[EQUITY_PEAK_KEY] = peak
+    return (equity / peak - 1) * 100 if peak else 0.0
+
+
 def account_balance_for_agents():
     """Capitale del conto per il sizing dell'Agente #3 (cache 60s; riserva: capitale iniziale o 10.000)."""
     if time.time() - _balance_cache["ts"] < 60 and _balance_cache["value"]:
@@ -3799,7 +3865,7 @@ def last_entry_execution(symbol):
 #   Universo reale dal Dynamic Universe Screener (solo elenchi pubblici; se la rete manca si usa la cache o
 #   i panieri statici) e prezzi SINTETICI. Percorre tutti i blocchi della rotazione con il flusso di produzione:
 #   run_scout_swarm (100 Scout + Stage 1-3) -> Comitato Rischi -> APPROVED_BY_RISK -> CIO del desk -> ordine SIMULATO,
-#   poi il ciclo di vita di una posizione nel Guardian (buy_thesis -> hold_rationale -> Target 2R -> runner -> exit_reason).
+#   poi il ciclo di vita di una posizione nel Guardian (buy_thesis -> hold_rationale -> Target 3R -> runner -> exit_reason).
 #   News Radar e Groq SIMULATI (MSFT: Groq lento per provare il timeout di 2 s). Nessun ordine inviato; registro e
 #   guardian_positions.json in una cartella temporanea. SIM_VERBOSE=1 mostra ogni riga degli agenti.
 # ===========================================================================
@@ -3927,7 +3993,7 @@ if __name__ == "__main__":
         inbox = cio_inbox()
     chop_audit(log=say, force=True)
 
-    # Ciclo di vita di una posizione nel Guardian: ingresso -> piatto (nessun time-stop) -> Target 2R -> runner -> trailing
+    # Ciclo di vita di una posizione nel Guardian: ingresso -> piatto (nessun time-stop) -> Target 3R -> runner -> trailing
     print("\n--- 🧿 Agente #6 Guardian · posizione simulata ---", flush=True)
     sim_sym = next((h["yf_symbol"] for h in holdings[1:]), "NVDA")
     q_sim = quant_rationale(sim_sym, max_age_sec=None)
@@ -3937,7 +4003,7 @@ if __name__ == "__main__":
     _peak_since = lambda sym, opened: None
     opened = now_local() - dt.timedelta(hours=5)
     pos = {"symbol": sim_sym, "yf_symbol": sim_sym, "is_crypto": is_crypto(sim_sym), "qty": 100.0, "avg_entry_price": entry_px}
-    for label, px in (("piatta da 5 ore", 100.2), ("Target 2R", 104.0), ("runner in corsa", 112.0), ("ritracciamento", 106.5)):
+    for label, px in (("piatta da 5 ore", 100.2), ("Target 3R", 104.0), ("runner in corsa", 112.0), ("ritracciamento", 106.5)):
         pos.update(current_price=px, market_value=px * pos["qty"], unrealized_plpc=(px / entry_px - 1) * 100)
         g = guardian_watch([pos], {normalize_symbol(sim_sym): {"opened_at": opened, "stop_pct": -2.0}}, get_config(), True)[normalize_symbol(sim_sym)]
         st = guardian_snapshot()["positions"][normalize_symbol(sim_sym)]

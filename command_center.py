@@ -436,7 +436,7 @@ def _decide(cmd, ctx, persona, force, dry_run=False):
                                    "Se vuole ridurre l'attività, posso rendere più selettivi il Quant o il CIO."), None
         if aid == "06" and open_pos and not force:
             return "SCONSIGLIATO", (f"Comandante, il Guardian sta proteggendo {open_pos} posizioni aperte: incassa i profitti "
-                                    "al Target 2R e chiude subito in caso di inversione. Sospenderlo lascerebbe solo gli "
+                                    "al Target 3R e chiude subito in caso di inversione. Sospenderlo lascerebbe solo gli "
                                     "stop di riserva del Radar. Consiglio di mantenerlo attivo (scriva \"conferma\" per "
                                     "forzare l'ordine)."), None
         if aid == "05" and not force:
@@ -468,7 +468,7 @@ def _decide(cmd, ctx, persona, force, dry_run=False):
         meta = AGENTS[aid]
         level = cmd["level"] if cmd["level"] is not None else 1
         if not meta["tunable"]:
-            return "IMPOSSIBILE", (f"{meta['title']} lavora con parametri di sicurezza fissi (stop 1.5x ATR nella fascia 1.2-3.5%, Target 1 a 2R) "
+            return "IMPOSSIBILE", (f"{meta['title']} lavora con parametri di sicurezza fissi (stop 3x ATR nella fascia 1.5-9%, Target 1 a 3R) "
                                    "che non conviene toccare. Posso invece regolare la sensibilità di Quant, Micro, "
                                    "Macro/News o CIO."), None
         if dry_run:
@@ -529,13 +529,12 @@ def _decide(cmd, ctx, persona, force, dry_run=False):
             return "SCONSIGLIATO", (f"Comandante, il VIX è a {vix}: i mercati sono nervosi (soglia {p['vix_max']:.0f} per il "
                                     f"{p['short']}). Alzare l'aggressività{hint} ora aumenterebbe le perdite potenziali più "
                                     "dei guadagni attesi. Consiglio di mantenere la soglia attuale."), None
-        if cur >= 50:
-            return "IMPOSSIBILE", ("Siamo già al massimo consentito dalla Safety Net: 50% del capitale investito e 50% "
-                                   "di cassa protetta. Oltre questa soglia una sola giornata negativa potrebbe intaccare "
-                                   "seriamente il capitale."
+        if cur >= 95:
+            return "IMPOSSIBILE", ("Siamo già al tetto dell'allocatore: 95% massimo investito con regime favorevole. "
+                                   "L'esposizione del momento scende da sola con VIX alto, SPY sotto trend o drawdown."
                                    + (f" Non esiste una leva di aggressività per singolo settore{hint}: posso però "
                                       "bloccare gli altri settori per concentrare il capitale." if hint else "")), None
-        new = min(50.0, cur + 10)
+        new = min(95.0, cur + 10)
         if dry_run:
             return "OK", None, None
         core.update_config({"max_exposure_pct": new})
@@ -602,23 +601,23 @@ Flusso: Scout -> Stage 1-3 (Agenti #1 #2 #4 -> Fusion Engine #5, con #3 e #6) ->
 - Universo e Scout: universo dinamico dei soli asset negoziabili su Alpaca (S&P 500, Nasdaq-100, screener Yahoo, movers Alpaca e crypto /USD di Alpaca ordinate per volume), scansionato a rotazione in blocchi di {core.UNIVERSE_CHUNK_SIZE} ticker (a mercato USA chiuso solo crypto); la watchlist è inclusa in ogni blocco. Un giro completo dell'universo richiede più blocchi; senza universo dinamico si ruotano panieri statici. 100 Scout in 6 categorie (breakout, volatilità, orderbook, volumi, balene, mean reversion). Le anomalie diventano "schede" (pitch) con TTL {core.PROPOSAL_TTL_MIN} minuti.
 - Agente #1 Quant: statistica sulle candele 1h chiuse (esponente di Hurst, Z-score, volatilità GARCH(1,1), stabilità spettrale di Koopman, limiti conformal, traiettoria attesa). Voto 0-100.
 - Agente #2 Microstruttura: OFI dal book L2 di Alpaca per le crypto, stimato dalle candele per le azioni (Alpaca non fornisce L2 azionario); VPIN, iceberg, RVOL, lambda di Kyle. OFI <= -0.5 su una posizione = uscita anticipata.
-- Agente #3 Risk Manager (non sospendibile): hard stop dinamico Stop = max(1.2%, min(3.5%, 1.5 x ATR% giornaliero)) ricalcolato sulla volatilità reale di ogni posizione, Target 1 = 2 x Stop, CVaR, beta, sizing, veto. Safety Net: esposizione massima 50% del capitale, massimo 4 posizioni, perdita massima per trade {core.MAX_RISK_PER_TRADE_PCT:g}% del capitale, nessuna nuova crypto tra le 22:00 e le 08:00. Circuit breaker e Drawdown Controller: perdita giornaliera oltre {abs(core.DAILY_DRAWDOWN_LIMIT):g}% (rispetto al massimo tra chiusura precedente e picco intraday) blocca i nuovi acquisti per 24 ore.
+- Agente #3 Risk Manager (non sospendibile): hard stop dinamico Stop = max(1.5%, min(9%, 3 x ATR% giornaliero)) ricalcolato sulla volatilità reale di ogni posizione, Target 1 = 3 x Stop, CVaR, beta, veto. Capacità: Portfolio Allocator con budget di rischio (rischio aperto fino all'8% del capitale, esposizione fino al 95%, rischio base 0.75% per trade, taglia max 15%), ridotto da SPY sotto EMA100, VIX alto e drawdown del conto, massimo 15 posizioni, nessuna nuova crypto tra le 22:00 e le 08:00. Circuit breaker e Drawdown Controller: perdita giornaliera oltre {abs(core.DAILY_DRAWDOWN_LIMIT):g}% (rispetto al massimo tra chiusura precedente e picco intraday) blocca i nuovi acquisti per 24 ore.
 - Agente #4 Macro & News: VIX (>= 28 = panico, veto sui nuovi ingressi; > {core.VIX_RISK_CONTRACTION:.0f} = contrazione del rischio, asset ad alto beta bloccati), regime di mercato (SPY, QQQ e BTC rispetto alla EMA50 giornaliera), blackout trimestrali. News Radar (Finnhub, Polygon, RSS Yahoo, SEC 8-K) valutato da Groq: impact, catalizzatore, tesi; notizie più vecchie di 30 minuti valgono 0; spinta quantitativa forte senza notizia fresca = veto. Il Fear & Greed (alternative.me) vale solo per le crypto.
-- Agente #5 CIO / Fusion Engine: Ensemble Score = Quant x 0.50 + News x 0.35 + OFI x 0.15. Ingresso solo con Ensemble >= {core.PIPELINE_BUY_SCORE:.0f}. Convinzione -> allocazione: 72-79 = 8-15%, 80-89 = 15-25%, 90+ SUPER_CONVICTION = 35-50%; in regime RISK-OFF allocazione dimezzata. Può ruotare capitale solo da posizioni con tesi degradata verso un SUPER_CONVICTION. Nessuna vendita discrezionale: le uscite sono solo del Guardian.
+- Agente #5 CIO / Fusion Engine: Ensemble Score = Trend Score (trend giornaliero + forza relativa nell'universo) + (News - 50) x 0.30 + (OFI - 50) x 0.05: la notizia assente non blocca il trade, quella negativa è un veto. Ingresso solo con Ensemble >= {core.PIPELINE_BUY_SCORE:.0f}. Il CIO sceglie il titolo, la taglia la calcola il Portfolio Allocator; fino a {core.MAX_BUYS_PER_CYCLE} acquisti per ciclo e risveglio appena si libera liquidità. Può ruotare capitale solo da posizioni con tesi degradata verso un SUPER_CONVICTION. Nessuna vendita discrezionale: le uscite sono solo del Guardian.
 - Comitato Rischi: ogni scheda passa da 3 gatekeeper (Tecnico & Liquidità, Sentiment & Compliance, Risk & ATR) più il controllo del Fusion Engine; un solo veto la respinge (cooldown 60 minuti).
-- Agente #6 Guardian: ogni {core.GUARDIAN_INTERVAL_SEC} secondi su ogni posizione. Hard stop sempre attivo; Target 1 a {core.TARGET_RISK_REWARD:.0f}R: vende il 50% e porta lo stop del resto a breakeven + commissioni; il runner segue il Trailing ATR Stop (Chandelier, 1.5x ATR azioni, 2x crypto) senza tetto. Uscite anticipate solo per Thesis Decay (#4), Orderbook Reversal (#2), News Shock (VIX >= 28 o +20% dall'ingresso). NESSUN time-stop.
+- Agente #6 Guardian: ogni {core.GUARDIAN_INTERVAL_SEC} secondi su ogni posizione. Hard stop sempre attivo; Target 1 a {core.TARGET_RISK_REWARD:.0f}R: vende il 50% e porta lo stop del resto a breakeven + commissioni; il runner segue il Trailing ATR Stop (Chandelier, 3x ATR) senza tetto. Esce se la chiusura giornaliera scende sotto il 97% della EMA50. Uscite anticipate solo per Thesis Decay (#4), Orderbook Reversal (#2), News Shock (VIX >= 28, o VIX >= 25 e +20% dall'ingresso). NESSUN time-stop.
 - Agente #7 CHOP Watchdog: salute dello sciame, auto-healing degli scout bloccati, timeout di Groq a 2 secondi, audit ogni 30 secondi.
 - Rischio Zero (pulsante sul portafoglio): su una posizione in profitto vende subito il 50% e porta lo stop del resto a breakeven + commissioni; il resto resta gestito dal Guardian.
 - Modalità: Auto-Trading (ordini inviati) o Advisor (solo suggerimenti). Le azioni USA si negoziano lun-ven 09:30-16:00 New York; le crypto h24.
-- Centro di Comando: pausa/attivazione agenti (#3 mai), sensibilità (Standard/Selettivo/Rigoroso) di #1 #2 #4 #5, blocchi su asset class/settori/ticker, aggressività = esposizione massima tra 10% e 50%."""
+- Centro di Comando: pausa/attivazione agenti (#3 mai), sensibilità (Standard/Selettivo/Rigoroso) di #1 #2 #4 #5, blocchi su asset class/settori/ticker, aggressività = tetto di esposizione tra 10% e 95%."""
 
 # Versione breve nel System Prompt (limite di token al minuto del piano gratuito Groq); quella completa (ARCHITECTURE)
 # il COO la legge con lo strumento architettura_bot quando una domanda riguarda il funzionamento in dettaglio
 ARCHITECTURE_BRIEF = f"""BOT (sintesi; dettagli con lo strumento architettura_bot): Quant Desk multi-agente su conto Alpaca paper, azioni USA +
 crypto, solo long. Scout (universo dinamico a blocchi di {core.UNIVERSE_CHUNK_SIZE} ticker) -> Stage 1-3 con Agenti #1 Quant,
-#2 Microstruttura, #4 Macro/News (Groq), #3 Risk, #6 Guardian -> Fusion Engine #5: Ensemble = Quant x 0.50 + News x 0.35 +
-OFI x 0.15, BUY se >= {core.PIPELINE_BUY_SCORE:.0f} -> Comitato Rischi -> CIO (taglia 8-50% per convinzione, max 4 posizioni,
-esposizione 50%) -> ordine. Guardian ogni {core.GUARDIAN_INTERVAL_SEC}s: hard stop 1.5x ATR (1.2-3.5%), Target 2R vende 50%,
+#2 Microstruttura, #4 Macro/News (Groq), #3 Risk, #6 Guardian -> Fusion Engine #5: Ensemble = Trend Score corretto da News e
+OFI, BUY se >= {core.PIPELINE_BUY_SCORE:.0f} -> Comitato Rischi -> CIO + Portfolio Allocator (budget di rischio dinamico, max 15 posizioni,
+esposizione fino al 95%) -> ordine. Guardian ogni {core.GUARDIAN_INTERVAL_SEC}s: hard stop 3x ATR (1.5-9%), Target 3R vende 50%,
 runner con trailing ATR. Agente #4: spinta quantitativa >= 70 senza notizia fresca (< 30 min) = veto."""
 
 _PERSONA_STYLE = {
@@ -1059,7 +1058,7 @@ def describe_command(cmd):
             "set_sensitivity": f"impostare la sensibilità di {agent} su {level}",
             "block": f"bloccare i nuovi acquisti su {label}", "unblock": f"sbloccare i nuovi acquisti su {label}",
             "clear_blocks": "rimuovere tutti i blocchi sugli acquisti",
-            "aggressiveness_up": "aumentare l'esposizione massima di 10 punti (fino al 50%)",
+            "aggressiveness_up": "aumentare il tetto di esposizione di 10 punti (fino al 95%)",
             "aggressiveness_down": "ridurre l'esposizione massima di 10 punti (fino al 10%)",
             "pause_bot": "mettere in pausa tutto il sistema", "resume_bot": "riattivare il sistema",
             "advisor_mode": "passare in modalità Advisor (nessun ordine inviato)",

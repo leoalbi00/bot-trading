@@ -2,33 +2,39 @@
 
 Due funzioni:
 1. pre_trade_check (Stage 3): un nuovo ingresso è ammesso solo se il ticker non è già in portafoglio
-   o con ordini pendenti (esposizione 50% e 4 posizioni sono la Safety Net dell'Agente #3).
+   o con ordini pendenti (la capacità del portafoglio è del Portfolio Allocator).
 2. evaluate_position (monitoraggio continuo). NESSUN TIME-STOP: una posizione piatta, in consolidamento
    o in accumulo resta aperta finché la tesi è valida. Il tempo trascorso non chiude mai una posizione.
-   - Hard Stop Loss dinamico (1.5 x ATR% nella fascia 1.2%-3.5%, Agente #3): sempre attivo, ricalcolato
+   - Hard Stop Loss dinamico (3 x ATR% nella fascia 1.5%-9%, Agente #3): sempre attivo, ricalcolato
      sulla volatilità reale di ogni posizione (anche quelle aperte senza scheda di ingresso);
-   - Target 1 (Scaling Out): a target_r x R (2R) si vende scale_out_pct% (50%) e lo stop del resto va a
+   - Target 1 (Scaling Out): a target_r x R (3R) si vende scale_out_pct% (50%) e lo stop del resto va a
      breakeven + commissioni;
    - Runner senza tetto ai profitti: il restante 50% è gestito SOLO dal Trailing Stop ATR (Chandelier Exit)
      che segue il picco a distanza mult x ATR%;
+   - Trend Break: chiusura giornaliera sotto il 97% della EMA50;
    - Uscite anticipate prima dello stop, e solo queste:
      1. Thesis Decay: l'Agente #4 rileva una smentita o il decadimento del catalizzatore (notizie fresche);
      2. Orderbook Reversal: l'Agente #2 registra OFI <= -0.5 sul book L2 reale, confermato da due valutazioni
         consecutive (il desk non passa l'OFI stimato dalle candele, usato per le azioni);
-     3. News Shock / Panico Macro: VIX >= 28 o VIX salito di oltre il 20% dall'ingresso.
+     3. News Shock / Panico Macro: VIX >= 28, oppure VIX >= 25 e salito di oltre il 20% dall'ingresso.
 R = distanza dello stop iniziale. Scaling out e uscite anticipate rispettano, per le azioni, l'apertura del
 mercato (a mercato chiuso i dati sono fermi); gli stop (hard, breakeven, trailing) sono sempre attivi.
 """
 from typing import Any, Dict, Optional, Tuple
 
+from agents.portfolio_allocator import TARGET_R, TRAIL_ATR_MULT
+
+VIX_SPIKE_MIN_LEVEL = 25.0   # il rialzo del VIX dall'ingresso conta solo sotto stress: da 15 a 18 non è un News Shock
+
 EXIT_LABELS = {
     "STOP_LOSS": "Hard Stop Loss", "TRAILING_STOP": "Trailing ATR Stop", "BREAKEVEN_STOP": "Stop a Breakeven",
     "THESIS_DECAY": "Thesis Decay (Agente #4)", "OFI_REVERSAL": "Orderbook Reversal (Agente #2)",
     "NEWS_SHOCK": "News Shock / Panico Macro", "ROTATION": "Rotazione verso SUPER_CONVICTION (tesi degradata)",
+    "TREND_BREAK": "Trend rotto (sotto la EMA50 giornaliera)",
     "MANUAL": "Vendita manuale", "PANIC": "PANIC - chiudi tutto", "DE_RISK": "Rischio Zero (manuale)",
 }
 # Etichetta della prima metà incassata (Target 1 automatico o Rischio Zero manuale) nelle schede di uscita
-SCALE_LABELS = {"SCALE_OUT": "Target 2R", "DE_RISK": "Rischio Zero"}
+SCALE_LABELS = {"SCALE_OUT": "Target 3R", "DE_RISK": "Rischio Zero"}
 
 
 def _usd(value: Optional[float]) -> str:
@@ -38,15 +44,15 @@ def _usd(value: Optional[float]) -> str:
 class PortfolioGuardianAgent:
     def __init__(
         self,
-        target_r: float = 2.0,
+        target_r: float = TARGET_R,
         scale_out_pct: float = 50.0,
         vix_panic: float = 28.0,
         vix_spike_pct: float = 20.0,
         ofi_reversal: float = -0.5,
         fee_buffer_crypto_pct: float = 0.55,   # ordini a mercato = taker: ~0.25% per lato su Alpaca crypto + spread
         fee_buffer_stock_pct: float = 0.05,
-        atr_mult_stock: float = 1.5,
-        atr_mult_crypto: float = 2.0,
+        atr_mult_stock: float = TRAIL_ATR_MULT,
+        atr_mult_crypto: float = TRAIL_ATR_MULT,
     ):
         self.agent_id = "AGENT_06_PORTFOLIO_GUARDIAN"
         self.target_r = target_r
@@ -174,6 +180,10 @@ class PortfolioGuardianAgent:
             return exit_("SCALE_OUT", f"PnL {pnl:+.2f}% ≥ Target 1 {target:.2f}% ({self.target_r:.0f}R): incasso "
                                       f"{self.scale_out_pct:.0f}%, runner a breakeven con Trailing ATR Stop", self.scale_out_pct)
 
+        # Trend rotto: la tesi d'ingresso è il trend giornaliero, senza quello la posizione non ha più motivo
+        if sig.get("trend_break"):
+            return exit_("TREND_BREAK", f"{sig['trend_break']}, uscita a PnL {pnl:+.2f}%")
+
         # Uscite anticipate: solo se la tesi è concretamente caduta
         if sig.get("thesis_decay"):
             return exit_("THESIS_DECAY", f"Agente #4: {sig['thesis_decay']}, uscita anticipata a PnL {pnl:+.2f}%")
@@ -185,7 +195,7 @@ class PortfolioGuardianAgent:
         vix, vix0 = sig.get("vix"), sig.get("vix_at_entry")
         if vix is not None and vix >= self.vix_panic:
             return exit_("NEWS_SHOCK", f"Panico macro: VIX {vix:.1f} ≥ {self.vix_panic:.0f}, liquidazione a PnL {pnl:+.2f}%")
-        if vix and vix0 and vix > vix0 * (1 + self.vix_spike_pct / 100):
+        if vix and vix0 and vix >= VIX_SPIKE_MIN_LEVEL and vix > vix0 * (1 + self.vix_spike_pct / 100):
             return exit_("NEWS_SHOCK", f"News Shock: VIX {vix0:.1f} → {vix:.1f} (+{(vix / vix0 - 1) * 100:.0f}% dall'ingresso), "
                                        f"liquidazione a PnL {pnl:+.2f}%")
         return out
@@ -235,7 +245,7 @@ class PortfolioGuardianAgent:
     @staticmethod
     def exit_reason(action: str, price: Optional[float], sell_pct: float = 100, scale_out: Optional[Dict[str, Any]] = None,
                     stop_price: Optional[float] = None, detail: str = "") -> str:
-        """Scheda di uscita: es. "Chiuso 50% su Target 2R, restante 50% su Trailing ATR Stop a $XXX"."""
+        """Scheda di uscita: es. "Chiuso 50% su Target 3R, restante 50% su Trailing ATR Stop a $XXX"."""
         label = EXIT_LABELS.get(action, action.replace("_", " ").title())
         level = stop_price if action in ("TRAILING_STOP", "BREAKEVEN_STOP", "STOP_LOSS") and stop_price else price
         if action in SCALE_LABELS:
@@ -243,7 +253,7 @@ class PortfolioGuardianAgent:
                     "con Trailing ATR Stop (stop a breakeven + commissioni)")
         if scale_out:
             pct = float(scale_out.get("pct") or 50)
-            first = SCALE_LABELS.get(scale_out.get("action"), "Target 2R")
+            first = SCALE_LABELS.get(scale_out.get("action"), "Target 3R")
             return (f"Chiuso {pct:.0f}% su {first} a {_usd(scale_out.get('price'))}, restante {100 - pct:.0f}% su "
                     f"{label} a {_usd(level)}" + (f" ({detail})" if detail and action not in ("TRAILING_STOP",) else ""))
         return f"Chiuso {sell_pct:.0f}% su {label} a {_usd(level)}" + (f": {detail}" if detail else "")

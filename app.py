@@ -12,6 +12,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 import trading_core as core
 import command_center as cc
+from agents import portfolio_allocator as allocator
 from trading_core import alpaca_client
 
 KEEP_ALIVE_INTERVAL = 600  # secondi tra un self-ping e l'altro
@@ -290,6 +291,44 @@ def rotate_capital(pos, sell_pct, target, amount, cfg, auto_trade, pending, stop
                             stop_pct=stop_pct, allocation_pct=allocation_pct, conviction=conviction,
                             operation="ASSET SWAP", rationale=rationale, price=price))
 
+def position_open_risk(pos, trailing, stops):
+    """Perdita aperta dal prezzo attuale allo stop effettivo della posizione (breakeven e trailing inclusi)."""
+    key = core.normalize_symbol(pos["symbol"])
+    stop = (trailing.get(key) or {}).get("effective_stop_pct")
+    if stop is None:
+        stop = stops.get(key)
+    return allocator.open_risk_usd(pos["market_value"], pos["unrealized_plpc"], core.clamp_stop_pct(None) if stop is None else stop)
+
+def deploy_liquidity(inbox, first, holdings, account, cfg, channels, blocked, auto_trade, pending, source):
+    """Dopo il primo mandato del ciclo investe le altre schede valide finché c'è budget di rischio."""
+    core.account_after_buy(account, holdings, first, first["dynamic_stop_loss_pct"])
+    bought = {core.normalize_symbol(first["buy_symbol"])}
+    for _ in range(core.MAX_BUYS_PER_CYCLE - 1):
+        rest = [p for p in inbox if core.normalize_symbol(p["symbol"]) not in bought]
+        if not rest:
+            return
+        final = core.validate_desk_decision(core.quant_desk_cio(rest, holdings, account), rest, holdings, account, cfg, channels,
+                                            sold_keys=blocked)
+        if final["action"] != "BUY":
+            log_message(f"💼 [CIO] Reinvestimento fermo: {final['reason']}")
+            return
+        pitch = next(p for p in rest if core.normalize_symbol(p["symbol"]) == core.normalize_symbol(final["buy_symbol"]))
+        package = pitch.get("package") or {}
+        details = {"source": source, "conviction": final.get("conviction_score"), "allocation_pct": final.get("allocation_pct"),
+                   "reason": final["reason"]}
+        rationale = {"agents": core.quant_rationale(final["buy_symbol"]), "desk_cio": details, "risk_package": package}
+        order = execute_buy(final["buy_symbol"], final["buy_amount"], auto_trade, pending,
+                            label=f"ACQUISTO CIO {final['allocation_pct']}%", stop_pct=final["dynamic_stop_loss_pct"],
+                            allocation_pct=final["allocation_pct"], conviction=final["conviction_score"], rationale=rationale,
+                            price=package.get("entry_price"))
+        core.record_cio_outcome(final["buy_symbol"], bool(order), describe_decision(final),
+                                details={**details, "amount": final["buy_amount"], "stop_pct": final["dynamic_stop_loss_pct"],
+                                         "entry_price": package.get("entry_price")})
+        if not order:
+            return
+        bought.add(core.normalize_symbol(final["buy_symbol"]))
+        core.account_after_buy(account, holdings, final, final["dynamic_stop_loss_pct"])
+
 def describe_decision(d):
     if d["action"] == "ROTATE":
         return f"ROTATE {d.get('sell_pct') or 100:.0f}% {d['sell_symbol']} → {d['buy_symbol']}"
@@ -343,7 +382,7 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
             bot_state["ledger_synced"] = True   # date di apertura note: il loop del Guardian può decidere le uscite
             bot_state["performance"] = perf
 
-        # Difesa del portafoglio: hard stop, Target 2R, trailing ATR, uscite anticipate (mai time-stop né stallo)
+        # Difesa del portafoglio: hard stop, Target 3R, trailing ATR, trend, uscite anticipate (mai time-stop né stallo)
         held_yf = [p["yf_symbol"] for p in positions]
         analysis = core.market_analyst(held_yf, log=log_message) if positions else {}
         drawdown = core.drawdown_controller(acc, state, log=log_message)
@@ -374,6 +413,8 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                                  stop_price=(trailing.get(key) or {}).get("trigger"))
             if (order or not auto_trade) and r["status"] != "SCALE_OUT":   # dopo lo scaling out il runner resta
                 sold.add(key)
+            if order:
+                request_cio(f"liquidità liberata da {pos['symbol']}")
         core.save_state(state)
 
         # Tier 4: CIO sulle sole schede approvate dal Comitato Rischi
@@ -391,7 +432,9 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         exposure = risk["exposure"]
         funds_stock, _ = core.buy_budget(acc, exposure, cfg, crypto=False, pct=100)
         funds_crypto, _ = core.buy_budget(acc, exposure, cfg, crypto=True, pct=100)
-        account_ctx = {"equity": risk["equity"], "exposure": exposure, "funds": funds_stock, "funds_crypto": funds_crypto}
+        account_ctx = {"equity": risk["equity"], "exposure": exposure, "funds": funds_stock, "funds_crypto": funds_crypto,
+                       "drawdown_pct": core.equity_drawdown_pct(risk["equity"], state)}
+        core.save_state(state)
         holdings = []
         for r in risk["positions"]:
             if core.normalize_symbol(r["pos"]["symbol"]) in sold:
@@ -402,12 +445,13 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                              "market_value": r["pos"]["market_value"],
                              "weight_pct": r["pos"]["market_value"] / risk["equity"] * 100 if risk["equity"] else 0,
                              "pnl_pct": r["pos"]["unrealized_plpc"], "score": r["score"], "status": r["status"],
-                             "degraded": degraded, "thesis_note": note})
+                             "degraded": degraded, "thesis_note": note, "open_risk": position_open_risk(r["pos"], trailing, stops)})
 
         if inbox:
             decision, source = core.ask_desk_cio(core.build_desk_cio_prompt(inbox, holdings, account_ctx, channels, cfg), log=log_message)
-            if not decision:
-                log_message("🧮 Nessuna IA disponibile: decide il CIO quantitativo di riserva.")
+            if not decision or decision["action"] == "HOLD":
+                # Le schede hanno già superato tutti i filtri: un HOLD dell'IA non deve lasciare ferma la liquidità
+                log_message(f"🧮 {'IA in HOLD' if decision else 'Nessuna IA disponibile'}: decide il CIO quantitativo.")
                 decision, source = core.quant_desk_cio(inbox, holdings, account_ctx), "Quant"
             log_message(f"💼 [CIO] Mandato proposto ({source}): {describe_decision(decision)}, convinzione "
                         f"{decision.get('conviction_score')}, allocazione {decision.get('allocation_pct')}% — "
@@ -465,6 +509,8 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
                                     details={**((entry_rationale or {}).get("desk_cio") or {}),
                                              "amount": final.get("buy_amount"), "stop_pct": final.get("dynamic_stop_loss_pct"),
                                              "entry_price": entry_price})
+        if executed and final["action"] == "BUY":
+            deploy_liquidity(inbox, final, holdings, account_ctx, cfg, channels, sold | pending, auto_trade, pending, source)
         if suspended:
             # La scheda resta APPROVED_BY_RISK: il CIO la rivaluta appena finito il ciclo di avvio, prima che scada
             request_cio(f"scheda {final['buy_symbol']} sospesa nel ciclo di avvio")
@@ -578,7 +624,7 @@ def radar_loop():
                 stops = bot_state.get("ledger_open", {})
                 for p in positions:
                     info = stops.get(core.normalize_symbol(p["symbol"])) or {}
-                    stop = core.position_stop(p, info)["stop_pct"]   # hard stop 1.5 x ATR reale (fascia -1.2% / -3.5%)
+                    stop = core.position_stop(p, info)["stop_pct"]   # hard stop 3 x ATR reale (fascia -1.5% / -9%)
                     # Agente #6: stop rialzato a breakeven o dal trailing ATR (aggiornato dal loop del Guardian)
                     if info.get("effective_stop_pct") is not None:
                         stop = max(stop, info["effective_stop_pct"])
@@ -592,7 +638,8 @@ def radar_loop():
         time.sleep(max(5, tick - (time.time() - started)))
 
 # Uniche uscite ammesse: nessun time-stop, nessuna chiusura per stallo o per età della posizione
-GUARDIAN_EXITS = ("STOP_LOSS", "SCALE_OUT", "TRAILING_STOP", "BREAKEVEN_STOP", "THESIS_DECAY", "OFI_REVERSAL", "NEWS_SHOCK")
+GUARDIAN_EXITS = ("STOP_LOSS", "SCALE_OUT", "TRAILING_STOP", "BREAKEVEN_STOP", "TREND_BREAK", "THESIS_DECAY", "OFI_REVERSAL",
+                  "NEWS_SHOCK")
 _guardian_state = {"stops": {}, "advised": set(), "refresh": 0.0}
 
 def guardian_tick():
@@ -663,13 +710,14 @@ def guardian_tick():
             if order:
                 with _cache_lock:
                     _cache.clear()
+                request_cio(f"liquidità liberata da {pos['symbol']}")
     finally:
         scan_lock.release()
 
 def guardian_loop():
     """Agente #6 (Portfolio Guardian): loop indipendente ogni 20 secondi su tutte le posizioni aperte.
 
-    Hard stop, Target 2R (scaling out 50%), runner con trailing ATR, Thesis Decay, Orderbook Reversal e News Shock
+    Hard stop, Target 3R (scaling out 50%), runner con trailing ATR, Trend Break, Thesis Decay, Orderbook Reversal e News Shock
     vengono eseguiti appena scattano, senza attendere il CIO; hold_rationale viene aggiornato a ogni giro.
     Parte solo dopo il primo ciclo del CIO (date di apertura e stop sincronizzati da Alpaca).
     """
@@ -919,7 +967,7 @@ def api_position_detail(symbol):
                       "source": f"hard stop {dyn['stop_basis']}" + (f" (ATR {dyn['atr_pct']:.2f}%)" if dyn["atr_pct"] else "")
                                 + ", fascia 1.2-3.5%",
                       "atr_pct": dyn["atr_pct"], "effective_pct": info.get("effective_stop_pct")},
-        "take_profit": {"price": take_profit, "label": "Target 1 (2R = 2 x stop): scaling out 50%, poi trailing senza tetto",
+        "take_profit": {"price": take_profit, "label": "Target 1 (3R = 3 x stop): scaling out 50%, poi trailing senza tetto",
                         "pct": dyn["target_pct"]},
         "guardian": {"buy_thesis": g.get("buy_thesis"), "hold_rationale": g.get("hold_rationale"),
                      "exit_reason": g.get("exit_reason"), "trade_class": g.get("trade_class"), "horizon": g.get("horizon"),
@@ -1007,6 +1055,7 @@ def api_position_de_risk():
         reason = f"Rischio Zero (dashboard): {check['reason']}"
         record_sell(pos, journal_operation("DE_RISK"), order, pct=DE_RISK_SELL_PCT, reason=reason, source="manual",
                     action="DE_RISK")
+        request_cio(f"liquidità liberata da {pos['symbol']} (Rischio Zero)")
     finally:
         scan_lock.release()
     with state_lock:   # il Radar usa subito il nuovo stop; il Guardian lo ricalcola (trailing ATR) al prossimo giro

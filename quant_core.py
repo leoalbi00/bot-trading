@@ -8,10 +8,10 @@ Flusso (trading_core.stream_scouts_to_agents):
            STAGE 1 Fast-Quant (< 5 ms): Hurst, Z-Score, Volatility Spike + segnali degli Scout;
                    scarta il rumore (ticker senza Scout attivati o con prezzo casuale)
            STAGE 2 Deep Filter: Agente #1 completo (GARCH, Traiettoria Attesa), Agente #2 (VPIN, OFI);
-                   se l'Ensemble può ancora arrivare a 72, News Radar + Groq via Agente #4 (timeout 2 s, veto);
+                   se il titolo è in trend tra i più forti, News Radar + Groq via Agente #4 (timeout 2 s, veto);
                    scarta chi resta sotto la soglia d'ingresso
            STAGE 3 Executive & Risk Desk: Agente #3 (Safety Net), #6 (Portfolio Guardian), #5 (CIO, Fusion Engine
-                   Q x 0.50 + News x 0.35 + OFI x 0.15)
+                   Trend Score corretto da notizie e order flow)
       -> piano dell'Agente #5 (aperture; SUPER_CONVICTION con portafoglio pieno -> rotazione delle tesi degradate)
 L'Agente #7 (CHOP Watchdog) misura latenze, coda, RAM/CPU e fa auto-healing.
 Ogni passaggio viene registrato su console (a colori) e su file (quant_agents.log).
@@ -188,7 +188,7 @@ class QuantitativeTradingCore:
     """
     def __init__(
         self,
-        portfolio_max_slots: int = 4,
+        portfolio_max_slots: int = 15,
         num_workers: int = 4,
         swarm_size: int = SWARM_SIZE,
         news_provider: Optional[Callable[[str], Dict[str, Any]]] = None,
@@ -316,7 +316,9 @@ class QuantitativeTradingCore:
         rvol, scout_score = meta.get("rvol"), meta.get("score")
         rvol_bypass = (rvol is not None and rvol > RVOL_STAGE1_BYPASS and scout_score is not None
                        and scout_score >= STAGE1_BYPASS_MIN_SCORE)
-        passed = force or rvol_bypass or (fast["interesting"] and bool(bullish))
+        trend = meta.get("trend_score")
+        trend_pass = trend is not None and trend >= self.agent_cio.buy_threshold
+        passed = force or rvol_bypass or trend_pass or (fast["interesting"] and bool(bullish))
         ms1 = (time.perf_counter() - t1) * 1000
         self.watchdog.record_latency("stage1", ms1)
         self.watchdog.count("received")
@@ -353,11 +355,15 @@ class QuantitativeTradingCore:
                     f"OFI: {_fmt(mm.get('order_flow_imbalance', 'N/D'))} ({mm.get('ofi_source', 'N/D')}) "
                     f"-> Score: {_fmt(res_micro.get('microstructure_score'), 2)}")
 
+        # Il voto di base dell'Ensemble è il Trend Score: la verifica sullo storico non mostra potere predittivo nello
+        # score di Hurst/Z-Score, che resta nel rationale come "hurst_score"
+        if trend is not None:
+            res_quant = {**res_quant, "hurst_score": res_quant.get("quant_score"), "quant_score": trend}
         quant_score = float(res_quant.get("quant_score", 50.0))
         ofi = mm.get("order_flow_imbalance")
         best = self.agent_cio.best_case_score(quant_score, ofi_to_score(ofi))
-        if not force and best < self.agent_cio.buy_threshold:
-            # Nemmeno una notizia perfetta porterebbe l'Ensemble a 72: Groq non viene interrogato
+        if not force and (best < self.agent_cio.buy_threshold or (trend is not None and not trend_pass)):
+            # Fuori dal trend, o nemmeno una notizia perfetta porterebbe l'Ensemble in soglia: Groq non viene interrogato
             ms2 = (time.perf_counter() - t2) * 1000
             self.watchdog.record_latency("stage2", ms2)
             logger.info(f"[STAGE 2 · DEEP FILTER] 🔎 {symbol} -> ensemble massimo raggiungibile {best:.1f} "
@@ -524,7 +530,7 @@ class QuantitativeTradingCore:
     def evaluate_capital_recycling_swap(self, new_opportunity: Dict[str, Any]) -> Dict[str, Any]:
         """
         Piano di allocazione dell'Agente #5. Il bot è long-only: solo i BUY aprono posizioni.
-        - Slot liberi (max 4 posizioni): apertura.
+        - Slot liberi: apertura (la taglia e il budget di rischio li verifica il Portfolio Allocator).
         - Portafoglio pieno: entra solo un SUPER_CONVICTION (Ensemble >= 90). Il desk esecutivo potrà liquidare
           SOLO posizioni con tesi degradata (OFI negativo o News Score sceso); con tesi intatte la taglia del
           nuovo trade si riduce alla cassa rimanente. Nessuna posizione viene chiusa perché piatta o vecchia.

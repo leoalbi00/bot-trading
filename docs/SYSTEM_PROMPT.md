@@ -47,18 +47,21 @@ AGENTI
   85-95; -15 con instabilità di Koopman.
 - #2 Microstruttura: OFI dal book L2 Alpaca (crypto) o stimato dalle candele (azioni), VPIN, iceberg (volume e
   range relativi alle medie dell'asset), liquidity void, RVOL, lambda di Kyle.
-- #3 Risk: hard stop = max(1.2%, min(3.5%, 1.5 x ATR% giornaliero)), Target 1 = 2R, CVaR 99%, beta,
-  rischio 2% del capitale per trade, esposizione max 50%, max 4 posizioni, nessuna nuova crypto 22:00-08:00,
+- #3 Risk: hard stop = max(1.5%, min(9%, 3 x ATR% giornaliero)), Target 1 = 3R, CVaR 99%, beta,
+  nessuna nuova crypto 22:00-08:00; capacità dal Portfolio Allocator (agents/portfolio_allocator.py): budget di rischio
+  aperto fino all'8%, esposizione fino al 95%, rischio base 0.75%, taglia max 15%, max 15 posizioni, tutto ridotto da
+  regime (SPY sotto EMA100, VIX) e drawdown del conto;
   circuit breaker a -5% giornaliero (stesso limite del Drawdown Controller).
 - #4 Macro & News: VIX >= 28 = veto (panico); blackout trimestrali (giorno prima e giorno stesso); News Radar
   (Finnhub, Polygon, RSS Yahoo, SEC 8-K) giudicato da Groq (impact -1..+1, novelty, catalizzatore, tesi);
-  notizie oltre 30 min = impact 0; veto per notizia negativa (impact <= -0.15) o per spinta quantitativa >= 70
-  senza notizia fresca/valida. Fear & Greed (alternative.me) solo per le crypto.
-- #5 CIO / Fusion Engine: Ensemble = Quant x 0.50 + News x 0.35 + OFI x 0.15. BUY con Ensemble >= 72;
+  notizie oltre 30 min = impact 0; veto solo per notizia negativa (impact <= -0.15). Fear & Greed (alternative.me) solo per le crypto.
+- #5 CIO / Fusion Engine: Ensemble = Trend Score + (News - 50) x 0.30 + (OFI - 50) x 0.05. Trend Score: 70-100 per i
+  titoli liquidi con prezzo > EMA20 > EMA50 e momentum nel 30% più forte dell'universo. BUY con Ensemble >= 70;
   SUPER_CONVICTION >= 90. Veti hard: Risk, Macro/News, Guardian.
-- #6 Guardian: hard stop sempre attivo; Target 2R -> vende il 50%, runner a breakeven + commissioni
-  (0.05% azioni, 0.55% crypto) con trailing ATR (1.5x azioni, 2x crypto). Uscite anticipate: Thesis Decay,
-  Orderbook Reversal (OFI L2 <= -0.5 confermato in 2 valutazioni), News Shock (VIX >= 28 o +20% dall'ingresso).
+- #6 Guardian: hard stop sempre attivo; Target 3R -> vende il 50%, runner a breakeven + commissioni
+  (0.05% azioni, 0.55% crypto) con trailing 3x ATR; uscita se la chiusura giornaliera è sotto il 97% della EMA50.
+  Uscite anticipate: Thesis Decay, Orderbook Reversal (OFI L2 <= -0.5 confermato in 2 valutazioni), News Shock
+  (VIX >= 28, oppure VIX >= 25 e +20% dall'ingresso).
   Nessun time-stop.
 - #7 CHOP: heartbeat, latenze, coda, RAM/CPU, timeout Groq 2 s per le notizie, auto-healing.
 
@@ -67,10 +70,10 @@ LEVEL 2: COMITATO RISCHI E CIO
   informativo per le schede della pipeline tranne RSI estremo e movimento esteso), Sentiment & Compliance
   (sentiment titoli >= -40, nessuna trimestrale entro 24h, F&G crypto >= 15), Risk & ATR (blocco notturno crypto,
   drawdown, VIX > 25 con beta > 1.3, negoziabilità, mercato aperto), Quant Ensemble (BUY dello Stage 3).
-  Un veto -> REJECTED_BY_RISK e cooldown 60 min.
-- CIO: solo schede APPROVED_BY_RISK. Convinzione = Ensemble (il CIO non può alzarla). Allocazione:
-  72-79 -> 8-15%, 80-89 -> 15-25%, 90+ -> 35-50%; dimezzata in RISK-OFF; tetto max_allocation_pct;
-  rischio allo stop <= 2% del capitale. ROTATE solo per SUPER_CONVICTION e solo da posizioni con tesi degradata.
+  Un veto -> REJECTED_BY_RISK e cooldown 60 min; il portafoglio pieno non è un veto.
+- CIO: solo schede APPROVED_BY_RISK. Convinzione = Ensemble (il CIO non può alzarla). Il CIO sceglie il titolo, la taglia
+  la calcola il Portfolio Allocator; fino a 4 acquisti per ciclo; un HOLD dell'IA passa al CIO quantitativo; ogni vendita
+  risveglia il CIO. ROTATE solo per SUPER_CONVICTION e solo da posizioni con tesi degradata.
   Nessun SELL discrezionale. Groq con timeout 15 s per chiamata e budget totale 30 s.
 
 ================================================================================

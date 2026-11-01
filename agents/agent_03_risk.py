@@ -5,31 +5,32 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-# Risk Safety Net (non negoziabile)
-MAX_EXPOSURE_PCT = 50.0            # esposizione totale massima del portafoglio, % del capitale (50%: un
-                                   # SUPER_CONVICTION può usare tutta la taglia autorizzata)
-MAX_POSITIONS = 4                  # posizioni aperte contemporaneamente
-HARD_STOP_MIN_PCT = 1.2            # hard stop loss tra 1.2% ...
-HARD_STOP_MAX_PCT = 3.5            # ... e 3.5% dal prezzo d'ingresso
-HARD_STOP_ATR_MULT = 1.5           # Stop_Loss_Pct = max(1.2%, min(3.5%, 1.5 x ATR%)); Target 1 = 2 x Stop_Loss_Pct
+from agents.portfolio_allocator import (MAX_GROSS_PCT, MAX_POSITIONS, MAX_POSITION_PCT, STOP_ATR_MULT, STOP_MAX_PCT,
+                                        STOP_MIN_PCT, TARGET_R)
+
+# Risk Safety Net (non negoziabile): i limiti del momento li calcola il Portfolio Allocator
+MAX_EXPOSURE_PCT = MAX_GROSS_PCT   # esposizione massima con regime favorevole, % del capitale
+HARD_STOP_MIN_PCT = STOP_MIN_PCT   # hard stop loss tra 1.5% ...
+HARD_STOP_MAX_PCT = STOP_MAX_PCT   # ... e 9% dal prezzo d'ingresso
+HARD_STOP_ATR_MULT = STOP_ATR_MULT # Stop_Loss_Pct = max(1.5%, min(9%, 3 x ATR%)); Target 1 = 3 x Stop_Loss_Pct
 MAX_RISK_PER_TRADE_PCT = 2.0       # perdita massima allo stop per operazione, % del capitale (unica fonte: anche trading_core)
 MAX_DAILY_DRAWDOWN_PCT = 5.0       # circuit breaker: perdita giornaliera oltre il 5% -> nessun nuovo ingresso (Drawdown Controller)
-STANDARD_MAX_ALLOCATION_PCT = 25.0  # taglia massima di un trade standard
-SUPER_CONVICTION_MAX_ALLOCATION_PCT = 50.0  # taglia massima autorizzata per un trade SUPER_CONVICTION
+STANDARD_MAX_ALLOCATION_PCT = MAX_POSITION_PCT  # taglia massima di una posizione
+SUPER_CONVICTION_MAX_ALLOCATION_PCT = MAX_POSITION_PCT
 CRYPTO_NIGHT_TZ = ZoneInfo("Europe/Rome")   # CET/CEST
 CRYPTO_NIGHT_START_HOUR = 22       # nessuna NUOVA apertura crypto dalle 22:00 ...
 CRYPTO_NIGHT_END_HOUR = 8          # ... alle 08:00
 
 
 def hard_stop_pct(atr_pct: Optional[float]) -> float:
-    """Hard stop in % (negativo): 1.5 x ATR% riportato tra -1.2% e -3.5%; senza ATR il più largo della fascia."""
+    """Hard stop in % (negativo): 3 x ATR% riportato tra -1.5% e -9%; senza ATR il più largo della fascia."""
     if not atr_pct or atr_pct <= 0 or not np.isfinite(atr_pct):
         return -HARD_STOP_MAX_PCT
     return -round(float(np.clip(HARD_STOP_ATR_MULT * atr_pct, HARD_STOP_MIN_PCT, HARD_STOP_MAX_PCT)), 2)
 
 
 def clamp_stop_pct(stop_pct: Optional[float]) -> float:
-    """Qualsiasi stop (anche salvato su ordini precedenti) riportato nella fascia non negoziabile -1.2% / -3.5%."""
+    """Qualsiasi stop (anche salvato su ordini precedenti) riportato nella fascia non negoziabile -1.5% / -9%."""
     if stop_pct is None:
         return -HARD_STOP_MAX_PCT
     return -round(float(np.clip(abs(stop_pct), HARD_STOP_MIN_PCT, HARD_STOP_MAX_PCT)), 2)
@@ -44,13 +45,13 @@ def crypto_night_blocked(now: Optional[datetime] = None) -> bool:
 class InstitutionalRiskAgent:
     """
     AGENTE #3: Comitato Rischi (Risk Safety Net)
-    - Hard Stop Loss non negoziabile: 1.5 x ATR nella fascia 1.2%-3.5%, target 1 a 2R
-    - Esposizione totale massima 50% del capitale, massimo 4 posizioni simultanee
+    - Hard Stop Loss non negoziabile: 3 x ATR nella fascia 1.5%-9%, target 1 a 3R
+    - Capacità del portafoglio: budget di rischio del Portfolio Allocator (regime, drawdown, volatilità)
     - Blocco crypto overnight (22:00-08:00 CET): nessuna nuova apertura
-    - Sizing a rischio fisso, taglia massima 25% (50% solo per SUPER_CONVICTION, autorizzata qui)
+    - Sizing a rischio, taglia massima di una posizione MAX_POSITION_PCT
     - Expected Shortfall (CVaR 99%), Beta vs Benchmark, Circuit Breaker sul drawdown giornaliero
-    Portafoglio pieno o senza margine di esposizione non è un veto qui: lo decide il CIO, perché un trade
-    SUPER_CONVICTION può ancora entrare (rotazione delle sole tesi degradate o taglia ridotta).
+    Portafoglio pieno non è un veto qui: lo decide l'allocatore quando il CIO compone il mandato, così una scheda
+    valida non finisce in cooldown solo perché in quel momento manca capacità.
     """
     def __init__(self, max_daily_drawdown_pct: float = MAX_DAILY_DRAWDOWN_PCT / 100,
                  max_risk_per_trade_pct: float = MAX_RISK_PER_TRADE_PCT / 100,
@@ -138,8 +139,8 @@ class InstitutionalRiskAgent:
         max_allocation_pct: float = STANDARD_MAX_ALLOCATION_PCT,
     ) -> Dict[str, float]:
         """
-        Sizing a rischio fisso con Hard Stop: distanza dello stop = 1.5 x ATR riportata tra 1.2% e 3.5% del prezzo,
-        primo target (scaling out) a 2R. Taglia massima max_allocation_pct del capitale.
+        Sizing a rischio con Hard Stop: distanza dello stop = 3 x ATR riportata tra 1.5% e 9% del prezzo,
+        primo target (scaling out) a 3R. Taglia massima max_allocation_pct del capitale.
         """
         if current_price <= 0 or atr <= 0 or account_balance <= 0:
             return {"position_units": 0.0, "position_value": 0.0, "stop_loss_price": 0.0, "take_profit_price": 0.0}
@@ -149,7 +150,7 @@ class InstitutionalRiskAgent:
         stop_distance = current_price * stop_pct / 100
 
         stop_loss_price = max(0.0, current_price - stop_distance)
-        take_profit_price = current_price + (stop_distance * 2.0)  # Target 1 (scaling out) a 2R
+        take_profit_price = current_price + (stop_distance * TARGET_R)  # Target 1 (scaling out)
 
         position_units = risk_amount / stop_distance if stop_distance > 0 else 0.0
         position_value = position_units * current_price
@@ -183,7 +184,7 @@ class InstitutionalRiskAgent:
     ) -> Dict[str, Any]:
         """
         Pipeline Esecutiva completa dell'Agente #3.
-        portfolio: {"exposure_pct", "positions"} per i limiti di esposizione (50%) e posizioni (4).
+        portfolio: {"exposure_pct", "positions"} per i limiti di esposizione e posizioni.
         current_daily_drawdown_pct: perdita del giorno come frazione positiva (0.05 = -5%), letta da Alpaca dal desk.
         atr_pct: ATR(14) GIORNALIERO in % del prezzo, lo stesso del gate Risk & ATR e del Guardian: stop e sizing
                  coincidono con lo stop reale dell'ordine. Senza, ATR delle barre di df (orarie) riportato su base
@@ -256,7 +257,7 @@ class InstitutionalRiskAgent:
             reason = f"RISK_SCORE_TOO_LOW ({risk_score:.0f} < 50: CVaR99 {cvar_99:.2%}, beta {beta:.2f})"
         else:
             reason = (f"OK (risk score {risk_score:.0f}, CVaR99 {cvar_99:.2%}, hard stop {sizing_info['stop_loss_pct']:.2f}% "
-                      f"(1.5x ATR {atr_source} {atr / current_price * 100:.2f}%), "
+                      f"({HARD_STOP_ATR_MULT:g}x ATR {atr_source} {atr / current_price * 100:.2f}%), "
                       f"esposizione {net['exposure_pct']:.0f}%/{net['max_exposure_pct']:.0f}%, "
                       f"{net['positions']}/{net['max_positions']} posizioni)")
 

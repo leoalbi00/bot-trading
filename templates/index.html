@@ -470,7 +470,7 @@
                                 <td class="px-4 py-2.5 text-right text-zinc-300" x-text="qty(p.qty)"></td>
                                 <td class="px-4 py-2.5 text-right text-zinc-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
                                 <td class="px-4 py-2.5 text-right text-zinc-400" x-text="p.conviction ?? '—'"></td>
-                                <td class="px-4 py-2.5 text-right text-zinc-400" :title="p.stop_basis ? 'Stop ' + p.stop_pct + '% (' + p.stop_basis + (p.atr_pct ? ', ATR ' + p.atr_pct + '%' : '') + ') · Target 1 +' + p.target_pct + '% (2R)' : ''">
+                                <td class="px-4 py-2.5 text-right text-zinc-400" :title="p.stop_basis ? 'Stop ' + p.stop_pct + '% (' + p.stop_basis + (p.atr_pct ? ', ATR ' + p.atr_pct + '%' : '') + ') · Target 1 +' + p.target_pct + '% (3R)' : ''">
                                     <div x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></div>
                                     <div x-show="p.target_pct != null && !p.scaled_out" class="text-[10px] text-emerald-500/80" x-text="'T1 +' + p.target_pct + '%'"></div>
                                 </td>
@@ -837,7 +837,7 @@
                                 <div class="text-[11px] text-zinc-500 font-sans" x-text="posDetail.stop_loss.source + (posDetail.stop_loss.effective_pct != null && posDetail.stop_loss.effective_pct !== posDetail.stop_loss.pct ? ' · stop effettivo del Guardian ' + posDetail.stop_loss.effective_pct + '%' : '')"></div>
                             </div>
                             <div class="border border-zinc-800 rounded p-3">
-                                <div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Target 1 (2R)</div>
+                                <div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Target 1 (3R)</div>
                                 <div class="text-emerald-500" x-text="posDetail.take_profit.price ? price(posDetail.take_profit.price) + (posDetail.take_profit.pct != null ? ' (+' + posDetail.take_profit.pct + '%)' : '') : '—'"></div>
                                 <div class="text-[11px] text-zinc-500 font-sans" x-text="posDetail.take_profit.label || 'target del Comitato Rischi / Agente #3'"></div>
                             </div>

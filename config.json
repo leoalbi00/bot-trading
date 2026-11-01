@@ -4,8 +4,8 @@
   "anti_sleep": true,
   "stop_loss_pct": -5.0,
   "scan_interval_min": 15,
-  "max_allocation_pct": 50.0,
-  "max_exposure_pct": 50.0,
+  "max_allocation_pct": 15.0,
+  "max_exposure_pct": 95.0,
   "watchlist": [
     "BTC-USD",
     "ETH-USD",
