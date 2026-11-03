@@ -30,6 +30,17 @@ TREND_EXIT_EMA50_RATIO = 0.97  # uscita se il prezzo chiude sotto il 97% della E
 MIN_RANK = 0.70                # solo il 30% più forte dell'universo
 MIN_DOLLAR_VOLUME = 50_000_000 # controvalore medio giornaliero minimo: l'universo validato è di titoli molto liquidi
 MIN_PRICE = 5.0
+REGIME_CONFIRM_DAYS = 3        # il regime azionario passa a "sotto trend" solo dopo 3 chiusure consecutive sotto la EMA100:
+                               # una sola chiusura sotto di pochi decimi tagliava l'esposizione da 95% a 33% (02/11/2026).
+                               # SPY 1995-2024: cambi di regime da 11.6 a 5.8 l'anno, Sharpe 0.69 -> 0.76; 2-5 giorni tutti meglio di 1.
+
+
+def trend_up_confirmed(closes, emas, confirm_days: int = REGIME_CONFIRM_DAYS) -> bool:
+    """False solo se le ultime `confirm_days` chiusure completate sono tutte sotto la loro EMA (sequenze allineate)."""
+    pairs = list(zip(closes, emas))[-confirm_days:]
+    if len(pairs) < confirm_days:
+        return True
+    return not all(float(c) < float(e) for c, e in pairs)
 
 
 def regime_scale(trend_up: bool, vix: Optional[float]) -> float:

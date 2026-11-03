@@ -525,7 +525,8 @@ from agents.agent_03_risk import (MAX_EXPOSURE_PCT as RISK_MAX_EXPOSURE_PCT, MAX
                                   HARD_STOP_ATR_MULT, MAX_DAILY_DRAWDOWN_PCT,
                                   clamp_stop_pct, crypto_night_blocked, hard_stop_pct)
 from agents.portfolio_allocator import (MAX_POSITION_PCT, MIN_DOLLAR_VOLUME, MIN_PRICE, MIN_RANK, TARGET_R,
-                                        TRAIL_ATR_MULT, TREND_EXIT_EMA50_RATIO, risk_limits, size_trade)
+                                        TRAIL_ATR_MULT, TREND_EXIT_EMA50_RATIO, risk_limits, size_trade,
+                                        trend_up_confirmed)
 
 
 def groq_news_llm(system, prompt):
@@ -2334,11 +2335,16 @@ def macro_channel(daily_refs):
         out["indices"][sym] = {"price": round(price, 2), "ema50": round(ema50, 2),
                                "trend": "RIALZISTA" if price > ema50 else "RIBASSISTA"}
     # Regime del Portfolio Allocator: prezzo sopra la EMA100 giornaliera
+    # (azioni: sotto trend solo dopo REGIME_CONFIRM_DAYS chiusure consecutive sotto la EMA100)
     for sym, key in (("SPY", "stock"), ("BTC-USD", "crypto")):
         df = daily_refs.get(sym)
         if df is not None and len(df) >= 105:
             close = completed_daily_close(df)
-            out["trend_up"][key] = bool(close.iloc[-1] > _ema(close, 100).iloc[-1])
+            ema = _ema(close, 100)
+            if key == "stock":
+                out["trend_up"][key] = trend_up_confirmed(close.values, ema.values)
+            else:
+                out["trend_up"][key] = bool(close.iloc[-1] > ema.iloc[-1])
     stocks_off = out["indices"].get("SPY", {}).get("trend") == "RIBASSISTA"
     crypto_off = out["indices"].get("BTC-USD", {}).get("trend") == "RIBASSISTA"
     out["regime"] = {

@@ -73,7 +73,9 @@ class Market:
         self.rank = ((px.shift(6) / px.shift(127) - 1) / vol).rank(axis=1, pct=True)
         self.trend = (self.px > self.ema20) & (self.ema20 > self.ema50)
         spy, btc = close["SPY"], close["BTC-USD"]
-        self.spy_up = (spy > spy.ewm(span=100).mean()).shift(1)
+        below = (spy < spy.ewm(span=100).mean()).astype(int)
+        # stesso filtro del bot: sotto trend solo dopo pa.REGIME_CONFIRM_DAYS chiusure consecutive sotto la EMA100
+        self.spy_up = (below.rolling(pa.REGIME_CONFIRM_DAYS).sum() < pa.REGIME_CONFIRM_DAYS).shift(1)
         self.spy_50 = (spy > spy.ewm(span=50).mean()).shift(1)
         self.btc_up = (btc > btc.ewm(span=100).mean()).shift(1)
         self.vix = close["^VIX"].shift(1)

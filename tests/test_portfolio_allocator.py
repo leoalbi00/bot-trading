@@ -217,3 +217,11 @@ def test_liquidity_wakes_the_cio():
     assert app.cio_wake.is_set() and "liquidità" in app.cio_trigger["reason"]
     app.cio_wake.clear()
     app.cio_trigger.update(reason="", urgent=False)
+
+
+def test_one_close_below_ema100_does_not_flip_the_regime():
+    # 02/11/2026: SPY 752.10 sotto la EMA100 755.09 per una sola chiusura -> l'esposizione non deve crollare al 33%
+    assert pa.trend_up_confirmed([769.36, 755.72, 752.10], [755.14, 755.15, 755.09]) is True
+    assert pa.trend_up_confirmed([754.0, 752.0, 750.0], [755.0, 755.0, 755.0]) is False
+    assert pa.trend_up_confirmed([750.0, 760.0, 750.0], [755.0, 755.0, 755.0]) is True
+    assert pa.trend_up_confirmed([750.0], [755.0]) is True   # storia insufficiente: nessun taglio
