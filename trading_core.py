@@ -131,6 +131,7 @@ DEFAULT_CONFIG = {
     "auto_execute_trades": True,
     "ai_provider": "groq",
     "keep_alive_enabled": True,
+    "core_spy_pct": 0.0,          # quota del capitale su SPY (core + satellite, agents/core_allocation.py); 0 = disattivato
     "bot_api_token": PLACEHOLDER_TOKEN,
 }
 
@@ -147,6 +148,7 @@ ENV_OVERRIDES = {
     "stop_loss_pct": "BOT_STOP_LOSS_PCT",
     "scan_interval_min": "BOT_SCAN_INTERVAL_MIN",
     "keep_alive_enabled": "BOT_KEEP_ALIVE",
+    "core_spy_pct": "BOT_CORE_SPY_PCT",
 }
 _TRUE = ("1", "true", "yes", "on", "si", "sì")
 _FALSE = ("0", "false", "no", "off")
@@ -235,6 +237,7 @@ def _validate_config(data, base):
     number("max_exposure_pct", 10.0, 400.0)
     number("stop_loss_pct", -50.0, -0.5)
     number("scan_interval_min", 1, 1440, int)
+    number("core_spy_pct", 0.0, 90.0)
 
     for key in ("auto_execute_trades", "keep_alive_enabled"):
         if key in data:
@@ -527,6 +530,7 @@ from agents.agent_03_risk import (MAX_EXPOSURE_PCT as RISK_MAX_EXPOSURE_PCT, MAX
 from agents.portfolio_allocator import (MAX_POSITION_PCT, MIN_DOLLAR_VOLUME, MIN_PRICE, MIN_RANK, TARGET_R,
                                         TRAIL_ATR_MULT, TREND_EXIT_EMA50_RATIO, risk_limits, size_trade,
                                         trend_up_confirmed)
+from agents import core_allocation as core_alloc
 
 
 def groq_news_llm(system, prompt):
@@ -900,6 +904,18 @@ def submit_notional_buy(yf_symbol, amount_usd, stop_pct=None, allocation_pct=Non
         side=OrderSide.BUY,
         time_in_force=TimeInForce.GTC if crypto else TimeInForce.DAY,
         client_order_id=f"{ORDER_TAG_PREFIX}{tag}-{uuid.uuid4().hex[:16]}",
+    )
+    return alpaca_client.submit_order(order_data)
+
+
+def submit_core_order(side, amount_usd):
+    """Ordine a importo su SPY per il core (agents/core_allocation.py): client_order_id "core-…", escluso dal registro del bot."""
+    order_data = MarketOrderRequest(
+        symbol=core_alloc.CORE_SYMBOL,
+        notional=round(amount_usd, 2),
+        side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+        time_in_force=TimeInForce.DAY,
+        client_order_id=f"{core_alloc.CORE_ORDER_PREFIX}{side.lower()}-{uuid.uuid4().hex[:16]}",
     )
     return alpaca_client.submit_order(order_data)
 
@@ -1731,8 +1747,8 @@ def sync_ledger(days=90, log=print):
     for o in orders:
         qty = float(o.filled_qty or 0)
         price = float(o.filled_avg_price or 0)
-        if qty <= 0 or price <= 0:
-            continue
+        if qty <= 0 or price <= 0 or (o.client_order_id or "").startswith(core_alloc.CORE_ORDER_PREFIX):
+            continue                  # gli ordini del core SPY non sono trade del bot
         key = normalize_symbol(o.symbol)
         side = str(getattr(o.side, "value", o.side)).lower()
         filled_at = o.filled_at.astimezone(TIMEZONE) if hasattr(o.filled_at, "astimezone") else None
@@ -3149,6 +3165,8 @@ def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_ke
     if not pitch:
         return hold(f"{action} scartato: {d.get('buy_symbol') or '?'} non è una scheda APPROVED_BY_RISK")
     crypto = is_crypto(pitch["symbol"])
+    if core_alloc.is_core(pitch["symbol"]) and float(cfg.get("core_spy_pct") or 0) > 0:
+        return hold(f"{pitch['symbol']} è gestito dal core del portafoglio: il bot non lo compra")
     if crypto and crypto_night_blocked():
         return hold(f"{pitch['symbol']}: blocco crypto overnight (22:00-08:00 CET), nessuna nuova apertura")
     if crypto and not ((channels.get("macro") or {}).get("trend_up") or {}).get("crypto", True):

@@ -225,3 +225,54 @@ def test_one_close_below_ema100_does_not_flip_the_regime():
     assert pa.trend_up_confirmed([754.0, 752.0, 750.0], [755.0, 755.0, 755.0]) is False
     assert pa.trend_up_confirmed([750.0, 760.0, 750.0], [755.0, 755.0, 755.0]) is True
     assert pa.trend_up_confirmed([750.0], [755.0]) is True   # storia insufficiente: nessun taglio
+
+
+# ---------------------------------------------------------------- Core SPY + satellite
+from agents import core_allocation as ca
+
+
+def test_core_rebalances_only_outside_the_band():
+    assert ca.rebalance(EQUITY, 0.0, 80, True) == {**ca.rebalance(EQUITY, 0.0, 80, True), "side": "BUY", "amount": 76000.0}
+    assert ca.rebalance(EQUITY, 75000.0, 80, True) is None                      # scarto 1% < banda 3%
+    down = ca.rebalance(EQUITY, 76000.0, 80, False)                             # SPY sotto trend: 80% x 33.25%
+    assert down["side"] == "SELL" and down["amount"] == 76000.0 - 26600.0
+    assert ca.rebalance(EQUITY, 0.0, 0, True) is None
+
+
+def test_satellite_account_hides_the_core_cash():
+    acc = {"portfolio": EQUITY, "cash": 90000.0, "buying_power": 90000.0, "non_marginable_buying_power": 90000.0, "last_equity": EQUITY}
+    sat = ca.satellite_account(acc, 80, 10000.0)       # core da 80k con 10k investiti: 70k di liquidità riservata
+    assert sat["portfolio"] == 20000.0 and sat["non_marginable_buying_power"] == 20000.0
+    assert ca.satellite_account(acc, 0, 0.0) is acc
+
+
+def test_bot_never_buys_the_core_symbol(monkeypatch):
+    cfg = {**core.get_config(), "core_spy_pct": 80.0}
+    final = core.validate_desk_decision(buy("SPY"), [pitch("SPY")], [], account(), cfg, CHANNELS)
+    assert final["action"] == "HOLD" and "core" in final["reason"]
+
+
+@pytest.fixture
+def with_core(monkeypatch, desk):
+    base = core.get_config
+    monkeypatch.setattr(core, "get_config", lambda: {**base(), "core_spy_pct": 80.0, "auto_execute_trades": True})
+    orders = []
+    monkeypatch.setattr(core, "submit_core_order", lambda side, amount: orders.append((side, amount)) or object())
+    return desk, orders
+
+
+def test_cycle_with_core_buys_spy_and_keeps_the_bot_in_its_sleeve(with_core):
+    bought, orders = with_core
+    assert app.run_trading_cycle(trigger="test")
+    assert orders == [("BUY", 68000.0)]    # obiettivo 76k, limitato alla liquidità vera (68k)
+    assert bought == []                     # 32k di posizioni del bot superano già la quota satellite (20k)
+
+
+def test_core_position_is_invisible_to_guardian_and_radar(monkeypatch):
+    base = core.get_config
+    monkeypatch.setattr(core, "get_config", lambda: {**base(), "core_spy_pct": 80.0})
+    spy = {"symbol": "SPY", "market_value": 76000.0}
+    monkeypatch.setattr(app, "fetch_open_positions", lambda: [spy, {"symbol": "NVDA", "market_value": 5000.0}])
+    assert [p["symbol"] for p in app.fetch_bot_positions()] == ["NVDA"]
+    monkeypatch.setattr(core, "get_config", base)
+    assert len(app.fetch_bot_positions()) == 2   # core disattivato: SPY torna un titolo qualsiasi

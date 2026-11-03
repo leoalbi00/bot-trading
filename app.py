@@ -13,6 +13,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import trading_core as core
 import command_center as cc
 from agents import portfolio_allocator as allocator
+from agents import core_allocation as core_alloc
 from trading_core import alpaca_client
 
 KEEP_ALIVE_INTERVAL = 600  # secondi tra un self-ping e l'altro
@@ -123,6 +124,59 @@ def fetch_open_positions():
     except Exception as e:
         log_message(f"Errore recupero posizioni: {e}")
         return None
+
+def core_spy_pct(cfg=None):
+    """Quota del capitale assegnata al core SPY (0 = core disattivato, SPY trattato come un titolo qualsiasi)."""
+    return float((cfg or core.get_config()).get("core_spy_pct") or 0)
+
+def fetch_bot_positions(all_positions=None):
+    """Posizioni gestite dal bot: senza il core SPY quando è attivo. None se Alpaca non risponde."""
+    positions = fetch_open_positions() if all_positions is None else all_positions
+    if positions is None or core_spy_pct() <= 0:
+        return positions
+    return core_alloc.split_positions(positions)[1]
+
+def bot_account(acc, all_positions, cfg=None):
+    """Conto visto dal bot: con il core attivo, capitale e liquidità della sola quota satellite."""
+    pct = core_spy_pct(cfg)
+    if pct <= 0:
+        return acc
+    core_pos = core_alloc.split_positions(all_positions or [])[0]
+    return core_alloc.satellite_account(acc, pct, abs(core_pos["market_value"]) if core_pos else 0.0)
+
+def rebalance_core(acc, all_positions, channels, cfg, auto_trade, pending, market_open):
+    """Porta SPY al controvalore obiettivo del core (quota x regime), solo a mercato aperto e oltre la banda del 3%."""
+    pct = core_spy_pct(cfg)
+    if pct <= 0 or not market_open or core.normalize_symbol(core_alloc.CORE_SYMBOL) in pending:
+        return None
+    trend = ((channels.get("macro") or {}).get("trend_up") or {}).get("stock")
+    if trend is None:
+        log_message("🏛️ [Core SPY] Regime di SPY non ancora calcolato dallo sciame: ribilanciamento rimandato.")
+        return None
+    core_pos = core_alloc.split_positions(all_positions)[0]
+    value = abs(core_pos["market_value"]) if core_pos else 0.0
+    order = core_alloc.rebalance(float(acc.get("portfolio") or 0), value, pct, bool(trend))
+    if not order:
+        return None
+    if order["side"] == "BUY":   # mai margine: solo liquidità vera
+        amount = min(order["amount"], max(0.0, float(acc.get("non_marginable_buying_power") or 0)))
+    else:
+        amount = min(order["amount"], value)
+    if amount < core_alloc.MIN_ORDER_USD:
+        return None
+    log_message(f"🏛️ [Core SPY] {order['side']} ${amount:,.2f} di SPY — {order['reason']}")
+    if not auto_trade:
+        log_message("🧭 [Advisor] Ribilanciamento del core solo suggerito, nessun ordine inviato.")
+        return None
+    try:
+        result = core.submit_core_order(order["side"], amount)
+    except Exception as e:
+        log_message(f"🏛️ [Core SPY] Ordine rifiutato: {type(e).__name__}: {e}")
+        return None
+    core.agent_say("Core SPY", f"{order['side']} ${amount:,.0f} di SPY · {order['reason']}", "ok")
+    with _cache_lock:
+        _cache.clear()
+    return result
 
 def has_valid_token():
     provided = request.headers.get("X-API-Key", "")
@@ -277,12 +331,14 @@ def rotate_capital(pos, sell_pct, target, amount, cfg, auto_trade, pending, stop
     if not filled:
         log_message(f"🔄 Vendita di {pos['symbol']} non ancora eseguita: l'acquisto di {target} è rimandato.")
         return False
-    positions_after = fetch_open_positions()
+    all_after = fetch_open_positions()
+    positions_after = fetch_bot_positions(all_after)
     if positions_after is None:
         log_message(f"🔄 Posizioni non leggibili da Alpaca dopo la vendita: acquisto di {target} rimandato.")
         return False
     exposure_after = sum(abs(p["market_value"]) for p in positions_after)
-    funds, _ = core.buy_budget(get_account_summary(), exposure_after, cfg, crypto=core.is_crypto(target), pct=100)
+    funds, _ = core.buy_budget(bot_account(get_account_summary(), all_after, cfg), exposure_after, cfg,
+                               crypto=core.is_crypto(target), pct=100)
     final_amount = min(amount, funds)
     if final_amount < core.MIN_ORDER_USD:
         log_message(f"🔄 Nessun reinvestimento in {target}: fondi entro il limite di esposizione ${funds:,.2f}.")
@@ -365,12 +421,14 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
             log_message("⚠️ Stato ordini pendenti sconosciuto: nessun ordine in questo ciclo.")
             pending = set()
         market_open = core.is_market_open(log=log_message)
-        positions = fetch_open_positions()
-        if positions is None:
+        all_positions = fetch_open_positions()
+        if all_positions is None:
             # "Alpaca non risponde" non è "nessuna posizione": con esposizione e slot sconosciuti non si compra
             log_message("⚠️ Posizioni non leggibili da Alpaca: nessun ordine in questo ciclo.")
-            positions, orders_allowed = [], False
-        acc = get_account_summary()
+            all_positions, orders_allowed = [], False
+        positions = fetch_bot_positions(all_positions)   # senza il core SPY: stop, rischio e uscite solo del bot
+        acc_total = get_account_summary()
+        acc = bot_account(acc_total, all_positions, cfg)
         state = core.load_state()
 
         # Post-Trade Auditor: storico e posizioni ricostruiti da Alpaca
@@ -385,7 +443,7 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         # Difesa del portafoglio: hard stop, Target 3R, trailing ATR, trend, uscite anticipate (mai time-stop né stallo)
         held_yf = [p["yf_symbol"] for p in positions]
         analysis = core.market_analyst(held_yf, log=log_message) if positions else {}
-        drawdown = core.drawdown_controller(acc, state, log=log_message)
+        drawdown = core.drawdown_controller(acc_total, state, log=log_message)   # perdita del giorno sull'intero conto
         if positions:
             core.refresh_held_evaluations(held_yf, log=log_message)   # letture fresche degli agenti per le uscite anticipate
         vol, stops, trailing = (core.volatility_agent(held_yf, positions, cfg, log=log_message, ledger=ledger,
@@ -419,6 +477,8 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
 
         # Tier 4: CIO sulle sole schede approvate dal Comitato Rischi
         channels = core.latest_channels()
+        if orders_allowed and not boot:
+            rebalance_core(acc_total, all_positions, channels, cfg, auto_trade, pending, market_open)
         held_keys = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
         inbox = [p for p in core.cio_inbox() if core.normalize_symbol(p["symbol"]) not in held_keys | pending]
         # Centro di Comando: CIO in pausa, blocchi del Comandante e sensibilità degli agenti
@@ -433,7 +493,8 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         funds_stock, _ = core.buy_budget(acc, exposure, cfg, crypto=False, pct=100)
         funds_crypto, _ = core.buy_budget(acc, exposure, cfg, crypto=True, pct=100)
         account_ctx = {"equity": risk["equity"], "exposure": exposure, "funds": funds_stock, "funds_crypto": funds_crypto,
-                       "drawdown_pct": core.equity_drawdown_pct(risk["equity"], state)}
+                       # drawdown dal massimo sull'intero conto: il massimo storico è salvato sul capitale totale
+                       "drawdown_pct": core.equity_drawdown_pct(float(acc_total.get("portfolio") or 0), state)}
         core.save_state(state)
         holdings = []
         for r in risk["positions"]:
@@ -606,7 +667,7 @@ def radar_loop():
         started = time.time()
         if bot_state["active"]:
             try:
-                positions = fetch_open_positions()
+                positions = fetch_bot_positions()
                 if positions is None:
                     raise RuntimeError("posizioni non leggibili da Alpaca: giro dello sciame saltato")
                 held = {core.normalize_symbol(p["yf_symbol"]) for p in positions}
@@ -644,7 +705,7 @@ _guardian_state = {"stops": {}, "advised": set(), "refresh": 0.0}
 
 def guardian_tick():
     """Un giro dell'Agente #6: stop effettivo di ogni posizione e uscite eseguite subito, senza attendere il CIO."""
-    positions = fetch_open_positions()
+    positions = fetch_bot_positions()   # il core SPY non ha stop: lo gestisce solo il ribilanciamento
     if positions is None:
         return                      # Alpaca non risponde: nessuna archiviazione né uscita su dati incerti
     live = {core.normalize_symbol(p["symbol"]) for p in positions}
