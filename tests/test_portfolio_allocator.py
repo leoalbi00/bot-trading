@@ -186,6 +186,8 @@ def desk(monkeypatch):
     inbox = [{**pitch(s, ensemble=e), "rvol": 1.5, "expires_epoch": core.time.time() + 600, "sector": "x", "mtf": {}, "anomalies": [],
               "vwap_dist_pct": 0.1, "beta": 1, "corr": 0.5} for s, e in (("AAA", 90), ("BBB", 85), ("CCC", 80), ("DDD", 75), ("EEE", 72))]
     bought = []
+    base_cfg = core.get_config
+    monkeypatch.setattr(core, "get_config", lambda: {**base_cfg(), "core_spy_pct": 0.0})   # bot senza core SPY
     monkeypatch.setattr(app, "fetch_open_positions", lambda: positions)
     monkeypatch.setattr(app, "get_account_summary", lambda: {"portfolio": EQUITY, "cash": 68000.0, "buying_power": 300000.0,
                                                              "non_marginable_buying_power": 68000.0, "last_equity": EQUITY})
@@ -274,5 +276,15 @@ def test_core_position_is_invisible_to_guardian_and_radar(monkeypatch):
     spy = {"symbol": "SPY", "market_value": 76000.0}
     monkeypatch.setattr(app, "fetch_open_positions", lambda: [spy, {"symbol": "NVDA", "market_value": 5000.0}])
     assert [p["symbol"] for p in app.fetch_bot_positions()] == ["NVDA"]
-    monkeypatch.setattr(core, "get_config", base)
+    monkeypatch.setattr(core, "get_config", lambda: {**base(), "core_spy_pct": 0.0})
     assert len(app.fetch_bot_positions()) == 2   # core disattivato: SPY torna un titolo qualsiasi
+
+
+def test_guardian_moves_stop_to_breakeven_after_one_r():
+    g = PortfolioGuardianAgent()
+    # stop -6% (1R = 6%): il titolo è salito a +6.5% e ora è a -0.5% -> esce a breakeven, non aspetta il -6%
+    out = g.evaluate_position(entry=100.0, price=99.5, peak=106.5, stop_pct=-6.0, atr_pct=2.0, is_crypto=False)
+    assert out["hit"] and out["action"] == "BREAKEVEN_STOP" and out["breakeven"]
+    # picco sotto 1R: lo stop resta quello iniziale e la posizione resta aperta
+    out = g.evaluate_position(entry=100.0, price=99.5, peak=105.0, stop_pct=-6.0, atr_pct=2.0, is_crypto=False)
+    assert not out["hit"] and out["effective_stop_pct"] == -6.0

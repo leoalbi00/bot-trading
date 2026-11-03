@@ -25,6 +25,10 @@ STOP_ATR_MULT = 3.0            # stop = 3 x ATR% giornaliero nella fascia sotto
 STOP_MIN_PCT = 1.5
 STOP_MAX_PCT = 9.0
 TARGET_R = 3.0                 # Target 1 (vende il 50%) a 3R
+BREAKEVEN_TRIGGER_R = 1.0      # stop a breakeven + commissioni appena il picco arriva a +1R, anche prima del Target 1.
+                               # Senza: il 30% delle perdite era stato a +1R e il 52-57% a +3% (backtest 11/2026).
+                               # Effetto su barre orarie: da neutro (11.8% -> 11.4% annuo, PF 1.06 -> 1.19, caso peggiore
+                               # dentro la barra) a +7 punti (2.5% -> 9.5%, caso migliore) nella verifica 07/2025-10/2026.
 TRAIL_ATR_MULT = 3.0           # Chandelier Exit del runner
 TREND_EXIT_EMA50_RATIO = 0.97  # uscita se il prezzo chiude sotto il 97% della EMA50 giornaliera
 MIN_RANK = 0.70                # solo il 30% più forte dell'universo

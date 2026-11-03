@@ -91,6 +91,9 @@ def enter(pos, sym, price, amount, stop, target_r, trail, ts):
 
 def effective_stop(sym, p):
     if not p["scaled"]:
+        # come l'Agente #6: breakeven + commissioni quando il picco arriva a pa.BREAKEVEN_TRIGGER_R
+        if p["peak"] >= p["entry"] + pa.BREAKEVEN_TRIGGER_R * (p["entry"] - p["stop"]):
+            return max(p["stop"], p["entry"] * (1 + FEE_BUFFER[sym in CRYPTO]))
         return p["stop"]
     return max(p["stop"], p["entry"] * (1 + FEE_BUFFER[sym in CRYPTO]), p["peak"] * (1 - p["trail"]))
 

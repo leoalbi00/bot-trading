@@ -22,7 +22,7 @@ mercato (a mercato chiuso i dati sono fermi); gli stop (hard, breakeven, trailin
 """
 from typing import Any, Dict, Optional, Tuple
 
-from agents.portfolio_allocator import TARGET_R, TRAIL_ATR_MULT
+from agents.portfolio_allocator import BREAKEVEN_TRIGGER_R, TARGET_R, TRAIL_ATR_MULT
 
 VIX_SPIKE_MIN_LEVEL = 25.0   # il rialzo del VIX dall'ingresso conta solo sotto stress: da 15 a 18 non è un News Shock
 
@@ -53,6 +53,7 @@ class PortfolioGuardianAgent:
         fee_buffer_stock_pct: float = 0.05,
         atr_mult_stock: float = TRAIL_ATR_MULT,
         atr_mult_crypto: float = TRAIL_ATR_MULT,
+        breakeven_trigger_r: Optional[float] = BREAKEVEN_TRIGGER_R,
     ):
         self.agent_id = "AGENT_06_PORTFOLIO_GUARDIAN"
         self.target_r = target_r
@@ -64,6 +65,7 @@ class PortfolioGuardianAgent:
         self.fee_buffer_stock_pct = fee_buffer_stock_pct
         self.atr_mult_stock = atr_mult_stock
         self.atr_mult_crypto = atr_mult_crypto
+        self.breakeven_trigger_r = breakeven_trigger_r
 
     # ------------------------------------------------------------------ Stage 3: ingresso
     def pre_trade_check(self, symbol_key: str, portfolio: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -142,6 +144,13 @@ class PortfolioGuardianAgent:
 
         effective, source = stop_pct, "hard stop"
         trailing_active, trigger, trail_pct = False, entry * (1 + stop_pct / 100), None
+        breakeven = scaled_out
+        # Una posizione arrivata a +1R non può più chiudere in perdita: stop a breakeven + commissioni
+        if not scaled_out and self.breakeven_trigger_r and peak_gain >= self.breakeven_trigger_r * r:
+            be = self.breakeven_pct(is_crypto)
+            if be > effective:
+                effective, trigger, breakeven = be, entry * (1 + be / 100), True
+                source = f"breakeven + commissioni (picco {peak_gain:+.2f}% ≥ {self.breakeven_trigger_r:g}R)"
         if scaled_out:
             be = self.breakeven_pct(is_crypto)
             if be > effective:
@@ -157,7 +166,7 @@ class PortfolioGuardianAgent:
 
         out = {"agent_id": self.agent_id, "pnl_pct": round(pnl, 2), "peak_gain_pct": round(peak_gain, 2),
                "r_pct": round(r, 2), "target_pct": round(target, 2), "effective_stop_pct": round(effective, 2),
-               "stop_pct": stop_pct, "stop_source": source, "breakeven": scaled_out, "active": trailing_active,
+               "stop_pct": stop_pct, "stop_source": source, "breakeven": breakeven, "active": trailing_active,
                "trail_pct": round(trail_pct, 2) if trail_pct else None, "trigger": trigger, "peak": peak,
                "scaled_out": scaled_out, "action": "HOLD", "hit": False, "sell_pct": 100,
                "reason": f"stop effettivo {effective:+.2f}% ({source})"}
