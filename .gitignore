@@ -20,8 +20,8 @@ data/pitch_audit_log.json*
 guardian_positions.json
 command_center.json
 
-# graphify knowledge graph (generato localmente)
-graphify-out/
+# graphify: il grafo è versionato, la cache di estrazione no
+graphify-out/cache/
 
 # Dipendenze npm non usate dalla dashboard (le librerie arrivano da CDN)
 node_modules/
