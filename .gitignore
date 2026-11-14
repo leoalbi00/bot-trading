@@ -20,8 +20,11 @@ data/pitch_audit_log.json*
 guardian_positions.json
 command_center.json
 
-# graphify: il grafo è versionato, la cache di estrazione no
+# graphify: il grafo è versionato (lo aggiorna .github/workflows/graphify.yml);
+# cache e stato di build dipendono dalla singola macchina
 graphify-out/cache/
+graphify-out/manifest.json
+graphify-out/.graphify_build_state.json
 
 # Dipendenze npm non usate dalla dashboard (le librerie arrivano da CDN)
 node_modules/
