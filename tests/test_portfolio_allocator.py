@@ -59,7 +59,7 @@ def test_more_volatile_titles_get_less_capital():
 def test_size_never_exceeds_cap_or_cash_floor():
     limits = pa.risk_limits(True, 15)
     assert pa.size_trade(EQUITY, 0, EQUITY, 0, 0, limits, 1.5, rank=1.0)["allocation_pct"] == pa.MAX_POSITION_PCT
-    sized = pa.size_trade(EQUITY, 90000, 10000, 0, 5, limits, 5.0, rank=1.0)
+    sized = pa.size_trade(EQUITY, 90000, 10000, 0, 3, limits, 5.0, rank=1.0)
     assert sized["amount"] == pytest.approx(5000)
 
 
@@ -124,10 +124,16 @@ def test_pipeline_buys_a_trending_stock_without_news():
         engine.shutdown()
 
 
-def test_six_positions_no_longer_block_new_buys():
-    held = [holding(f"H{i}") for i in range(6)]
-    final = core.validate_desk_decision(buy("NEW"), [pitch("NEW")], held, account(48000), core.get_config(), CHANNELS)
+def test_four_positions_leave_room_for_a_fifth():
+    held = [holding(f"H{i}") for i in range(4)]
+    final = core.validate_desk_decision(buy("NEW"), [pitch("NEW")], held, account(32000), core.get_config(), CHANNELS)
     assert final["action"] == "BUY" and final["buy_amount"] > 0
+
+
+def test_five_positions_block_new_buys():
+    held = [holding(f"H{i}") for i in range(5)]
+    final = core.validate_desk_decision(buy("NEW"), [pitch("NEW")], held, account(40000), core.get_config(), CHANNELS)
+    assert final["action"] == "HOLD" and "5/5 posizioni" in final["reason"]
 
 
 def test_ai_cannot_choose_the_size():
@@ -137,8 +143,8 @@ def test_ai_cannot_choose_the_size():
 
 
 def test_exhausted_risk_budget_holds():
-    held = [holding(f"H{i}", risk=1500) for i in range(5)]
-    final = core.validate_desk_decision(buy("NEW"), [pitch("NEW")], held, account(40000), core.get_config(), CHANNELS)
+    held = [holding(f"H{i}", risk=2000) for i in range(4)]     # 4 x 2% = 8% di rischio aperto: budget pieno
+    final = core.validate_desk_decision(buy("NEW"), [pitch("NEW")], held, account(32000), core.get_config(), CHANNELS)
     assert final["action"] == "HOLD" and "budget" in final["reason"]
 
 
@@ -180,9 +186,9 @@ def test_trend_features_ignore_illiquid_and_todays_bar():
 
 @pytest.fixture
 def desk(monkeypatch):
-    """Ciclo del CIO con conto al 33% investito, 4 posizioni e l'IA in HOLD: lo stato reale del conto."""
+    """Ciclo del CIO con conto quasi tutto in cassa, 1 posizione (4 posti liberi su 5) e l'IA in HOLD."""
     positions = [{"symbol": s, "yf_symbol": s, "is_crypto": False, "qty": 10.0, "market_value": 8000.0, "current_price": 800.0,
-                  "unrealized_pl": 100.0, "unrealized_plpc": 1.0, "avg_entry_price": 790.0, "side": "LONG"} for s in ("HSIC", "MET", "OWL", "REGN")]
+                  "unrealized_pl": 100.0, "unrealized_plpc": 1.0, "avg_entry_price": 790.0, "side": "LONG"} for s in ("HSIC",)]
     inbox = [{**pitch(s, ensemble=e), "rvol": 1.5, "expires_epoch": core.time.time() + 600, "sector": "x", "mtf": {}, "anomalies": [],
               "vwap_dist_pct": 0.1, "beta": 1, "corr": 0.5} for s, e in (("AAA", 90), ("BBB", 85), ("CCC", 80), ("DDD", 75), ("EEE", 72))]
     bought = []
@@ -267,7 +273,8 @@ def test_cycle_with_core_buys_spy_and_keeps_the_bot_in_its_sleeve(with_core):
     bought, orders = with_core
     assert app.run_trading_cycle(trigger="test")
     assert orders == [("BUY", 68000.0)]    # obiettivo 76k, limitato alla liquidità vera (68k)
-    assert bought == []                     # 32k di posizioni del bot superano già la quota satellite (20k)
+    # il bot resta nella sua quota: satellite 20k meno gli 8k già investiti
+    assert bought and sum(amount for _, amount in bought) <= 20000.0 - 8000.0
 
 
 def test_core_position_is_invisible_to_guardian_and_radar(monkeypatch):
@@ -288,3 +295,13 @@ def test_guardian_moves_stop_to_breakeven_after_one_r():
     # picco sotto 1R: lo stop resta quello iniziale e la posizione resta aperta
     out = g.evaluate_position(entry=100.0, price=99.5, peak=105.0, stop_pct=-6.0, atr_pct=2.0, is_crypto=False)
     assert not out["hit"] and out["effective_stop_pct"] == -6.0
+
+
+def test_position_limit_is_five():
+    """Massimo 5 posizioni: la sesta non riceve capitale anche con budget di rischio libero."""
+    from agents.portfolio_allocator import MAX_POSITIONS, risk_limits, size_trade
+    assert MAX_POSITIONS == 5
+    lim = risk_limits(True, 15.0)
+    assert size_trade(100_000, 0, 100_000, 0, 4, lim, 5.0)["amount"] > 0
+    blocked = size_trade(100_000, 0, 100_000, 0, 5, lim, 5.0)
+    assert blocked["amount"] == 0 and "5/5 posizioni" in blocked["reason"]
