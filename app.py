@@ -445,7 +445,9 @@ def run_trading_cycle(manual=False, boot=False, trigger="programmato"):
         analysis = core.market_analyst(held_yf, log=log_message) if positions else {}
         drawdown = core.drawdown_controller(acc_total, state, log=log_message)   # perdita del giorno sull'intero conto
         if positions:
-            core.refresh_held_evaluations(held_yf, log=log_message)   # letture fresche degli agenti per le uscite anticipate
+            core.refresh_held_evaluations(held_yf, log=log_message,   # letture fresche degli agenti per le uscite anticipate
+                                          exposure_usd=sum(abs(p["market_value"]) for p in positions),
+                                          positions_count=len(positions))
         vol, stops, trailing = (core.volatility_agent(held_yf, positions, cfg, log=log_message, ledger=ledger,
                                                       market_open=market_open) if positions else ({}, {}, {}))
         # Stop effettivo dell'Agente #6 (breakeven / trailing): poi lo aggiorna il loop del Guardian ogni 20 secondi
@@ -720,7 +722,9 @@ def guardian_tick():
     held_yf = [p["yf_symbol"] for p in positions]
     if time.time() - _guardian_state["refresh"] >= core.GUARDIAN_REFRESH_SEC:
         _guardian_state["refresh"] = time.time()
-        core.refresh_held_evaluations(held_yf, log=log_message)     # Agenti #1 #2 #4 #5 freschi per le uscite anticipate
+        core.refresh_held_evaluations(held_yf, log=log_message,     # Agenti #1 #2 #4 #5 freschi per le uscite anticipate
+                                      exposure_usd=sum(abs(p["market_value"]) for p in positions),
+                                      positions_count=len(positions))
     with state_lock:
         open_info = {k: dict(v) for k, v in bot_state["ledger_open"].items()}
     evals = core.guardian_watch(positions, open_info, cfg, market_open)
