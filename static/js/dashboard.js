@@ -4,13 +4,40 @@ const CHAT_TIMEOUT_MS = 60000;  // il COO può ragionare e cercare sul web: il s
 function dashboard() {
     return {
         connected: true,
-        tab: 'command',
+        tab: 'oggi',
         tabs: [
-            { id: 'command', label: 'Agenti & Comandi' },
-            { id: 'markets', label: 'Mercati' },
-            { id: 'portfolio', label: 'Portafoglio' },
-            { id: 'audit', label: 'Audit' },
+            { id: 'oggi', label: 'Oggi', icon: 'house' },
+            { id: 'titoli', label: 'I miei titoli', icon: 'wallet' },
+            { id: 'mercato', label: 'Il mercato', icon: 'cloud-sun' },
+            { id: 'chiedi', label: 'Chiedi', icon: 'message-circle' },
+            { id: 'macchine', label: 'Sala macchine', icon: 'cog' },
         ],
+        // Sala macchine: la vista tecnica di prima, divisa in sotto-schede
+        engineTab: 'agenti',
+        engineTabs: [
+            { id: 'agenti', label: 'Agenti' },
+            { id: 'radar', label: 'Radar e canali' },
+            { id: 'audit', label: 'Registro e pagella' },
+            { id: 'log', label: 'Log tecnici' },
+        ],
+        // Glossario: ogni parola tecnica ha un "?" che apre questa spiegazione
+        helpKey: '',
+        glossary: {
+            conto: { t: 'Valore totale del conto', d: 'La somma dei soldi in cassa e del valore di oggi dei titoli che hai. Cambia durante il giorno perché cambiano i prezzi.' },
+            investito: { t: 'Soldi investiti', d: 'Soldi usati per comprare titoli. Possono crescere o scendere insieme al prezzo dei titoli.' },
+            cassa: { t: 'Soldi in cassa', d: 'Soldi non investiti. Non guadagnano e non perdono, e sono pronti per le prossime occasioni.' },
+            titolo: { t: 'Titolo (o azione)', d: "Un pezzetto di un'azienda quotata in borsa, per esempio Apple. Se l'azienda vale di più, anche il tuo pezzetto vale di più." },
+            stop: { t: 'Uscita di sicurezza', d: 'Il prezzo sotto il quale il bot vende da solo, per non perdere troppo. Lo decide prima di comprare. In gergo si chiama "stop loss".' },
+            target: { t: 'Obiettivo', d: 'Il prezzo a cui il bot vende metà del titolo per incassare il guadagno. Il resto lo tiene finché il prezzo continua a salire.' },
+            meteo: { t: 'Il meteo del mercato', d: 'Un modo semplice per dire come va la borsa americana: sereno quando sale tranquilla, pioggia quando scende, temporale quando c\'è paura. Il bot compra di più con il bel tempo e meno con il brutto.' },
+            spy: { t: 'SPY', d: 'Un unico titolo che contiene le 500 aziende più grandi degli Stati Uniti. Si usa come termometro del mercato americano.' },
+            qqq: { t: 'QQQ', d: 'Un unico titolo che contiene le 100 aziende più grandi del Nasdaq, quasi tutte tecnologiche.' },
+            btc: { t: 'Bitcoin', d: 'La criptovaluta più conosciuta. Si muove spesso in modo diverso dalle azioni e con salti più grandi.' },
+            vix: { t: 'Indice della paura (VIX)', d: 'Misura quanto gli investitori si aspettano movimenti bruschi nei prossimi giorni. Sotto 20 il mercato è calmo, sopra 30 c\'è paura.' },
+            winrate: { t: 'Operazioni vinte', d: 'Su 100 operazioni chiuse, quante hanno guadagnato. Non serve vincerle tutte: conta che le vincite siano più grandi delle perdite.' },
+            rischiozero: { t: 'Metti al sicuro il guadagno', d: 'Vende subito metà del titolo e sposta l\'uscita di sicurezza del resto al prezzo che hai pagato. Da lì in poi su quel titolo non puoi più perdere.' },
+            pausa: { t: 'Bot in pausa', d: 'Il bot non compra e non vende. I titoli che hai restano dove sono.' },
+        },
         // Agent Matrix
         agents: [], blocks: { asset_classes: [], sectors: [], symbols: [] }, blockLabels: [], tuning: null, agentBusy: '',
         brainOpen: false, brainId: '', brain: null, brainTimer: null,
@@ -20,7 +47,7 @@ function dashboard() {
             coo: { name: 'COO', short: 'COO', tagline: 'COO: agente IA con accesso in lettura a tutto il sistema e ricerca sul web. Chiedimi qualsiasi cosa su bot, mercati e portafoglio: se serve verifico online e cito le fonti. Le modifiche (agenti, blocchi, aggressività, modalità) le propongo e le applico solo dopo la tua conferma.' },
             risk: { name: 'Risk Manager', short: 'Risk Manager', tagline: 'Risk Manager: stesse capacità, con un occhio più severo su rischi, drawdown e protezioni. Nessuna modifica senza la tua conferma.' },
         },
-        chatSuggestions: ['Come sta andando il portafoglio?', 'Perché al CIO non arriva niente?', 'Cosa stanno scansionando gli Scout?', 'Ci sono notizie importanti sui mercati oggi?', 'Conviene ridurre il rischio?'],
+        chatSuggestions: ['Come stanno andando i miei soldi?', 'Perché oggi non hai comprato niente?', 'Spiegami il titolo che sta perdendo di più', 'Ci sono notizie importanti oggi?', 'Sto rischiando troppo?'],
         account: {}, positions: [], closedPositions: [], bot: { logs: [] },
         radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
         settings: { watchlist: [] }, envLocked: {},
@@ -33,14 +60,18 @@ function dashboard() {
         localLogs: [], clearedId: 0, clearedTs: 0,
         logs: [], lastLogId: 0, dialogue: [], lastDialogueId: 0, fetching: false, streamPinned: true,
         numberFields: [
-            { key: 'stop_loss_pct', label: 'Stop di riserva % (se manca ATR)', step: 0.5, min: -50, max: -0.5 },
-            { key: 'scan_interval_min', label: 'Intervallo di scansione (min)', step: 1, min: 1, max: 1440 },
-            { key: 'max_allocation_pct', label: 'Taglia massima di una posizione % (tetto 15%)', step: 0.5, min: 0.5, max: 100 },
-            { key: 'max_exposure_pct', label: 'Esposizione massima % (tetto Safety Net 50)', step: 5, min: 10, max: 50 },
+            { key: 'max_allocation_pct', label: 'Quanto può mettere al massimo su un solo titolo (%)', step: 0.5, min: 0.5, max: 100,
+              hint: 'Percentuale del conto. Più è bassa, più i soldi sono divisi tra titoli diversi.' },
+            { key: 'max_exposure_pct', label: 'Quanto del conto può investire in tutto (%)', step: 5, min: 10, max: 50,
+              hint: 'Il resto resta sempre in cassa.' },
+            { key: 'stop_loss_pct', label: 'Uscita di sicurezza di riserva (%)', step: 0.5, min: -50, max: -0.5,
+              hint: 'Usata solo se il bot non riesce a calcolarne una su misura per il titolo. Numero negativo: per esempio −5 vuol dire vendere se perde il 5%.' },
+            { key: 'scan_interval_min', label: 'Ogni quanti minuti controlla il mercato', step: 1, min: 1, max: 1440,
+              hint: 'Più è basso, più spesso guarda i prezzi.' },
         ],
 
         init() {
-            try { const t = localStorage.getItem('jarvis.tab'); if (t && this.tabs.some(x => x.id === t)) this.tab = t; } catch (e) { /* storage non disponibile */ }
+            try { const t = localStorage.getItem('bot.tab'); if (t && this.tabs.some(x => x.id === t)) this.tab = t; } catch (e) { /* storage non disponibile */ }
             this.fetchStatus();
             this.loadSettings();
             setInterval(() => this.fetchStatus(), 1000);
@@ -49,10 +80,181 @@ function dashboard() {
             this.loadAgents();
             setInterval(() => this.loadAgents(), 2000);
             this.loadChat();
-            this.$watch('tab', t => { try { localStorage.setItem('jarvis.tab', t); } catch (e) { /* ignora */ } this.icons(); });
+            this.$watch('tab', t => { try { localStorage.setItem('bot.tab', t); } catch (e) { /* ignora */ } this.icons(); });
             this.icons();
         },
         icons() { this.$nextTick(() => window.lucide && lucide.createIcons()); },
+        // Icona SVG come testo: resta corretta anche dentro x-for e quando cambia (lucide.createIcons sostituisce l'elemento)
+        icon(name) {
+            const L = window.lucide;
+            if (!L || !name) return '';
+            const key = String(name).split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('');
+            const node = L.icons && L.icons[key];
+            if (!node) return '';
+            try { return L.createElement(node).outerHTML; } catch (e) { return ''; }
+        },
+        help(key) { this.helpKey = this.glossary[key] ? key : ''; },
+
+        // ---------- Frasi semplici per chi non conosce la borsa ----------
+        toneClass(v) {
+            if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return '';
+            return Number(v) > 0 ? 'up-t' : 'down-t';
+        },
+        todayTone() {
+            const v = Number(this.account.daily_pnl_usd);
+            return isNaN(v) || Math.abs(v) < 0.5 ? '' : (v > 0 ? 'up' : 'down');
+        },
+        todayHeadline() {
+            if (!this.connected && this.account.portfolio === undefined) return 'Non riesco a leggere il tuo conto.';
+            if (this.account.portfolio === undefined) return 'Sto leggendo il tuo conto…';
+            const v = Number(this.account.daily_pnl_usd);
+            if (isNaN(v) || Math.abs(v) < 0.5) return 'Oggi i tuoi soldi sono rimasti fermi.';
+            return v > 0 ? `Oggi i tuoi soldi sono cresciuti di ${this.usd(v)}.` : `Oggi i tuoi soldi sono scesi di ${this.usd(Math.abs(v))}.`;
+        },
+        todayWhy() {
+            const n = this.positions.length;
+            if (!n) return 'Non hai titoli: i soldi sono tutti in cassa, quindi il totale non si muove.';
+            const pct = this.pct(this.account.daily_pnl_pct);
+            return `Il totale cambia perché cambiano i prezzi dei ${n === 1 ? 'titolo' : n + ' titoli'} che hai (${pct} oggi). `
+                + 'Guadagni e perdite diventano definitivi solo quando il bot vende.';
+        },
+        botNow() {
+            if (!this.connected) return { lamp: 'off', title: 'Non collegato', text: 'Il server del bot non risponde. Riprovo da solo ogni secondo.' };
+            if (!this.bot.active) return { lamp: 'pause', title: 'In pausa', text: 'Il bot è in pausa: non compra e non vende. I titoli che hai restano dove sono. Premi "Riaccendi" per farlo ripartire.' };
+            const busy = String(this.bot.status || '').startsWith('Scansione');
+            const mode = this.settings.auto_execute_trades
+                ? 'Compra e vende da solo, seguendo le sue regole di sicurezza.'
+                : 'Ti dà solo consigli: non invia ordini.';
+            const pnl = Number(this.account.daily_pnl_pct);
+            const careful = !isNaN(pnl) && pnl <= -3 ? ' Oggi il conto è sceso parecchio, quindi è più prudente del solito.' : '';
+            return { lamp: 'on', title: busy ? 'Sta esaminando il mercato' : 'Al lavoro',
+                     text: (busy ? 'Sta esaminando il mercato proprio ora. ' : 'È acceso e controlla il mercato a intervalli regolari. ') + mode + careful };
+        },
+        decision() {
+            const c = this.cio || {};
+            const why = c.reason ? String(c.reason) : '';
+            if (!c.action) return { title: 'non ha ancora preso decisioni da quando si è acceso.', text: '' };
+            if (c.action === 'BUY') return { title: `ha deciso di comprare ${c.buy_symbol}` + (c.amount ? ` per ${this.usd(c.amount)}.` : '.'), text: why };
+            if (c.action === 'ROTATE') return { title: `ha venduto una parte di ${c.sell_symbol} per comprare ${c.buy_symbol}.`, text: why };
+            if (c.action === 'SELL') return { title: `ha deciso di vendere ${c.sell_symbol}.`, text: why };
+            return { title: 'per ora non compra niente.', text: why };
+        },
+        moneySentence() {
+            const inv = this.investedPct();
+            if (inv === null) return 'Sto calcolando come sono divisi i tuoi soldi…';
+            const n = this.positions.length;
+            if (inv < 0.5) return 'Tutti i tuoi soldi sono in cassa: in questo momento non hai titoli.';
+            return `${inv.toFixed(0)} su 100 dei tuoi soldi sono investiti in ${n === 1 ? 'un titolo' : n + ' titoli'}; `
+                + `gli altri ${(100 - inv).toFixed(0)} sono in cassa, pronti per nuove occasioni.`;
+        },
+        weather() {
+            const st = (this.macro.regime || {}).stock;
+            const vix = this.macro.vix == null ? NaN : Number(this.macro.vix);
+            if (!st) return { icon: 'cloud', tone: 'calm', name: 'Sto leggendo il mercato', text: 'Le informazioni sul mercato arrivano tra poco.' };
+            if (!isNaN(vix) && vix >= 30) return { icon: 'cloud-lightning', tone: 'bad', name: 'Temporale',
+                text: `C'è molta paura sui mercati (indice della paura a ${vix.toFixed(0)}). Il bot investe molto meno del solito e protegge quello che ha.` };
+            if (st === 'RISK-OFF') return { icon: 'cloud-rain', tone: 'bad', name: 'Pioggia',
+                text: 'La borsa americana sta scendendo o è nervosa. Il bot compra meno e con più prudenza.' };
+            if (!isNaN(vix) && vix >= 25) return { icon: 'cloud-sun', tone: 'warn', name: 'Variabile',
+                text: `La borsa sale ma è agitata (indice della paura a ${vix.toFixed(0)}). Il bot investe con cautela.` };
+            return { icon: 'sun', tone: 'good', name: 'Sereno', text: 'La borsa americana sale ed è tranquilla. È il momento in cui il bot lavora di più.' };
+        },
+        indexCards() {
+            const names = { SPY: ['Le 500 aziende più grandi degli USA', 'spy'], QQQ: ['Le grandi aziende tecnologiche USA', 'qqq'], 'BTC-USD': ['Bitcoin', 'btc'] };
+            return Object.entries(this.macro.indices || {}).map(([k, v]) => ({
+                key: k, name: (names[k] || [k])[0], help: (names[k] || [])[1], up: v.trend === 'RIALZISTA' }));
+        },
+        fearText() {
+            const v = Number(this.macro.vix);
+            if (isNaN(v)) return '—';
+            return v.toFixed(0) + (v < 20 ? ', calmo' : v < 30 ? ', un po\' agitato' : ', molta paura');
+        },
+        durationPlain(min) {
+            if (min === null || min === undefined) return '—';
+            if (min < 60) return Math.round(min) + ' minuti';
+            if (min < 1440) return Math.round(min / 60) + ' ore';
+            const d = Math.round(min / 1440);
+            return d === 1 ? '1 giorno' : d + ' giorni';
+        },
+        diary() {
+            const items = [];
+            for (const p of this.positions) {
+                if (!p.opened_at) continue;
+                items.push({ key: 'b' + p.symbol, kind: 'buy', ts: Date.parse(p.opened_at) || 0, when: this.dateTime(p.opened_at),
+                             title: `Ha comprato ${p.symbol}`, text: p.buy_thesis || '' });
+            }
+            for (const c of this.closedPositions) {
+                items.push({ key: 's' + c.symbol + c.closed_at, kind: 'sell', ts: Date.parse(c.closed_at) || 0, when: this.dateTime(c.closed_at),
+                             title: `Ha venduto ${c.symbol}`, text: c.exit_reason || '' });
+            }
+            return items.sort((a, b) => b.ts - a.ts).slice(0, 6);
+        },
+        // Percorso del prezzo tra uscita di sicurezza e obiettivo
+        stopPct(p) { return p.effective_stop_pct ?? p.stop_pct; },
+        stopPrice(p) {
+            const s = this.stopPct(p);
+            return (s === null || s === undefined || !p.avg_entry_price) ? null : p.avg_entry_price * (1 + s / 100);
+        },
+        targetPrice(p) {
+            return (p.target_pct === null || p.target_pct === undefined || !p.avg_entry_price || p.scaled_out)
+                ? null : p.avg_entry_price * (1 + p.target_pct / 100);
+        },
+        _onTrack(p, value) {
+            const lo = this.stopPrice(p), hi = this.targetPrice(p);
+            if (lo === null || hi === null || !value || hi <= lo) return null;
+            return Math.min(100, Math.max(0, (value - lo) / (hi - lo) * 100));
+        },
+        track(p) { return this._onTrack(p, p.current_price); },
+        entryMark(p) { return this._onTrack(p, p.avg_entry_price) ?? 0; },
+        planText(p) {
+            const stop = this.stopPrice(p), target = this.targetPrice(p);
+            const parts = [];
+            if (stop !== null) parts.push(stop >= p.avg_entry_price
+                ? `Se scende a ${this.price(stop)} lo vende, ma ormai in guadagno.`
+                : `Se scende a ${this.price(stop)} lo vende, per non perdere troppo.`);
+            if (target !== null) parts.push(`Se sale a ${this.price(target)} vende metà e incassa il guadagno.`);
+            if (p.scaled_out) parts.push('Metà del guadagno è già stata incassata: il resto lo tiene finché il prezzo sale.');
+            return parts.join(' ') || 'Il bot sta calcolando le uscite per questo titolo.';
+        },
+        positionHeadline(p) {
+            if (!p) return '';
+            const v = Number(p.unrealized_pl);
+            if (isNaN(v) || Math.abs(v) < 0.01) return `Su ${p.symbol} per ora sei in pari.`;
+            return v > 0 ? `Su ${p.symbol} stai guadagnando ${this.usd(v)} (${this.pct(p.unrealized_plpc)}).`
+                         : `Su ${p.symbol} stai perdendo ${this.usd(Math.abs(v))} (${this.pct(p.unrealized_plpc)}).`;
+        },
+        // Titoli sotto esame (radar)
+        candidates() {
+            const seen = new Set(), out = [];
+            for (const r of [...(this.radar.queue || []), ...(this.radar.recent || [])]) {
+                if (seen.has(r.symbol)) continue;
+                seen.add(r.symbol); out.push(r);
+            }
+            return out.slice(0, 10);
+        },
+        plainStatus(st) {
+            return { SUBMITTED_PITCH: 'Appena trovato', UNDER_REVIEW: 'Sotto esame', APPROVED_BY_RISK: 'Promosso', REJECTED_BY_RISK: 'Scartato',
+                     EXPIRED: 'Scaduto', EXECUTED: 'Comprato' }[st] || st;
+        },
+        candidateTone(st) {
+            return { APPROVED_BY_RISK: 'good', EXECUTED: 'info', REJECTED_BY_RISK: 'bad', EXPIRED: '' }[st] ?? 'warn';
+        },
+        candidateIcon(st) {
+            return { APPROVED_BY_RISK: 'circle-check', EXECUTED: 'shopping-cart', REJECTED_BY_RISK: 'circle-x', EXPIRED: 'clock' }[st] || 'search';
+        },
+        candidateWhy(r) {
+            if (r.status === 'REJECTED_BY_RISK') {
+                const v = (r.vetoes || [])[0];
+                return 'Scartato perché non ha superato tutti i controlli' + (v ? ': ' + (v.reason || v.detail || v) : (r.note ? ': ' + r.note : '.'));
+            }
+            if (r.status === 'APPROVED_BY_RISK') return 'Ha superato tutti i controlli: il bot può comprarlo se ha soldi e posto liberi.';
+            if (r.status === 'EXECUTED') return 'Il bot lo ha comprato.';
+            if (r.status === 'EXPIRED') return 'Nessuno lo ha comprato in tempo: l\'occasione è passata.';
+            return 'Il bot lo sta controllando adesso.';
+        },
+        verdictPlain(v) {
+            return { ESEGUITO: 'fatto', SCONSIGLIATO: 'sconsigliato', IMPOSSIBILE: 'non posso', PROPOSTA: 'proposta', INFO: 'risposta', CHIARIMENTO: 'chiarimento' }[v] || String(v).toLowerCase();
+        },
 
         // ---------- HUD: 4 indicatori leggibili da chiunque ----------
         investedPct() {
@@ -71,7 +273,7 @@ function dashboard() {
             if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return 'pill-muted';
             return Number(v) > 0 ? 'pill-up' : 'pill-down';
         },
-        focusCommand() { this.tab = 'command'; this.$nextTick(() => this.$refs.cmd && this.$refs.cmd.focus()); },
+        focusCommand() { this.tab = 'chiedi'; this.$nextTick(() => this.$refs.cmd && this.$refs.cmd.focus()); },
         thoughtColor(t) {
             if (t.level === 'veto' || /❌|Errore|VETO|🚨|🛑|REJECTED/.test(t.text)) return 'text-red-400';
             if (t.level === 'ok' || /✅|APPROVED|ESEGUIT/.test(t.text)) return 'text-emerald-500';
@@ -202,15 +404,15 @@ function dashboard() {
         usd(v, signed = false) {
             if (v === null || v === undefined || isNaN(v)) return '—';
             const n = Number(v);
-            const s = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-            return (signed ? (n > 0 ? '+' : n < 0 ? '−' : '') : (n < 0 ? '−' : '')) + '$' + s;
+            const s = Math.abs(n).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            return (signed ? (n > 0 ? '+' : n < 0 ? '−' : '') : (n < 0 ? '−' : '')) + s + ' $';
         },
         pct(v) {
             if (v === null || v === undefined || isNaN(v)) return '—';
             const n = Number(v);
-            return (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n).toFixed(2) + '%';
+            return (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%';
         },
-        qty(v) { return Number(v).toLocaleString('en-US', { maximumFractionDigits: 6 }); },
+        qty(v) { return Number(v).toLocaleString('it-IT', { maximumFractionDigits: 6 }); },
         tone(v) {
             if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return 'text-zinc-300';
             return Number(v) > 0 ? 'text-emerald-500' : 'text-red-500';
@@ -433,7 +635,7 @@ function dashboard() {
         price(v) {
             if (v === null || v === undefined || isNaN(v)) return '—';
             const n = Number(v);
-            return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: Math.abs(n) < 10 ? 6 : 2 });
+            return n.toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: Math.abs(n) < 10 ? 6 : 2 }) + ' $';
         },
         dateTime(v) {
             if (!v) return '—';

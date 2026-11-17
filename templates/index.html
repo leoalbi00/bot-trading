@@ -1,29 +1,24 @@
 <!DOCTYPE html>
-<html lang="it" class="dark">
+<html lang="it">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quant Desk</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Il mio bot</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;600;700&family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
+    <!-- Tailwind serve solo alla "Sala macchine" (vista tecnica di prima) -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    fontFamily: {
-                        sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
-                        mono: ['JetBrains Mono', 'Roboto Mono', 'ui-monospace', 'monospace'],
-                    }
-                }
-            }
-        }
+        if (window.tailwind) tailwind.config = {
+            corePlugins: { preflight: false },
+            theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'Roboto Mono', 'ui-monospace', 'monospace'] } } }
+        };
     </script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/pro_desk.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/chiaro.css') }}">
     <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
     <script>
         // Token degli endpoint di controllo, inserito dal server dopo il login
@@ -32,78 +27,287 @@
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 </head>
-<body class="min-h-screen font-sans antialiased text-[13px]" x-data="dashboard()" x-init="init()"
+<body class="chiaro" x-data="dashboard()" x-init="init()"
       @keydown.window.prevent.meta.k="focusCommand()" @keydown.window.prevent.ctrl.k="focusCommand()">
 
-    <!-- ============ HEADER ============ -->
-    <header class="sticky top-0 z-40 border-b border-zinc-800 bg-[#09090b]/95 backdrop-blur">
-        <div class="max-w-[1500px] mx-auto px-4 sm:px-6 h-11 flex items-center justify-between gap-3">
-            <div class="flex items-center gap-2.5 min-w-0">
-                <span class="dot" :class="!connected ? 'text-amber-500' : (bot.active ? 'dot-active' : 'dot-paused')"></span>
-                <span class="text-[12px] font-semibold tracking-wide text-zinc-100">QUANT DESK</span>
-                <span class="text-[11px] text-zinc-500 mono" x-text="!connected ? '• OFFLINE' : (bot.active ? '• LIVE' : '• PAUSA')"></span>
-                <span class="hidden md:inline text-[11px] text-zinc-600 truncate"
-                      x-text="(settings.auto_execute_trades ? 'Auto-Trading' : 'Advisor') + ' · ' + (bot.status || '')"></span>
+    <!-- ============ TESTATA ============ -->
+    <header class="topbar">
+        <div class="wrap">
+            <div class="brand">
+                <span class="lamp" :class="botNow().lamp" :title="botNow().title"></span>
+                <span>Il mio bot</span>
+                <small x-text="botNow().title"></small>
             </div>
-            <nav class="flex items-center gap-1 shrink-0">
-                <button @click="forceCio()" title="Forza il CIO a valutare subito le proposte in coda" class="btn btn-ghost">
-                    <i data-lucide="zap" class="w-3.5 h-3.5"></i><span class="hidden md:inline">Forza CIO</span></button>
-                <button @click="toggleBot()" class="btn btn-ghost" :title="bot.active ? 'Metti in pausa il sistema' : 'Riattiva il sistema'">
-                    <span class="mono text-[10px]" x-text="bot.active ? '❚❚' : '▶'"></span>
-                    <span class="hidden sm:inline" x-text="bot.active ? 'Pausa' : 'Riprendi'"></span></button>
-                <button @click="showSettings = true" class="btn btn-ghost" title="Impostazioni"><i data-lucide="settings-2" class="w-3.5 h-3.5"></i><span class="hidden lg:inline">Impostazioni</span></button>
-                <button @click="openHistory()" class="btn btn-ghost" title="Operazioni eseguite mentre la dashboard era chiusa"><i data-lucide="history" class="w-3.5 h-3.5"></i><span class="hidden lg:inline">Storico</span></button>
-                <button @click="liquidate()" title="Annulla gli ordini, chiude tutte le posizioni e mette il bot in pausa" class="btn btn-danger">PANIC</button>
-                <form method="post" action="/logout">
-                    <button type="submit" title="Esci" class="btn btn-ghost w-7 px-0"><i data-lucide="log-out" class="w-3.5 h-3.5"></i></button>
+            <div class="actions">
+                <button class="k-btn small" @click="toggleBot()" :title="bot.active ? 'Ferma il bot: non comprerà né venderà' : 'Riaccendi il bot'">
+                    <span class="ico" x-html="icon(bot.active ? 'pause' : 'play')"></span><span class="lbl" x-text="bot.active ? 'Metti in pausa' : 'Riaccendi'"></span></button>
+                <button class="k-btn small plain" @click="openHistory()" title="Tutto quello che il bot ha comprato e venduto">
+                    <span class="ico" x-html="icon('book-open')"></span><span class="lbl">Storico</span></button>
+                <button class="k-btn small plain" @click="showSettings = true" title="Impostazioni">
+                    <span class="ico" x-html="icon('sliders-horizontal')"></span><span class="lbl">Impostazioni</span></button>
+                <button class="k-btn small danger" @click="liquidate()" title="Emergenza: vende tutto e mette in pausa il bot">
+                    <span class="ico" x-html="icon('octagon-alert')"></span><span class="lbl">Vendi tutto</span></button>
+                <form method="post" action="/logout" style="margin:0">
+                    <button type="submit" class="k-btn small plain" title="Esci"><span class="ico" x-html="icon('log-out')"></span></button>
                 </form>
-            </nav>
+            </div>
         </div>
     </header>
+    <div class="wrap tabwrap">
+            <nav class="tabs" aria-label="Sezioni">
+                <template x-for="t in tabs" :key="t.id">
+                    <button :class="tab === t.id && 'on'" @click="tab = t.id" :aria-current="tab === t.id ? 'page' : null">
+                        <span class="ico" x-html="icon(t.icon)"></span><span x-text="t.label"></span></button>
+                </template>
+            </nav>
+    </div>
 
-    <main class="max-w-[1500px] mx-auto px-4 sm:px-6 py-4 space-y-4">
+    <main class="wrap">
 
-        <!-- ============ KPI ============ -->
-        <section class="glass kpi-bar">
-            <div class="kpi">
-                <div class="label">Saldo totale</div>
-                <div class="kpi-value num text-zinc-100" x-text="usd(account.portfolio)"></div>
-                <div class="mt-0.5 text-[11px] num" :class="tone(account.net_pnl_pct)"
-                     x-text="pct(account.net_pnl_pct) + (account.initial_capital ? ' da ' + usd(account.initial_capital) : '')"></div>
+        <!-- ================================================================ OGGI -->
+        <div x-show="tab === 'oggi'" class="grid2">
+            <div class="stack">
+                <section class="sheet today" :class="todayTone()">
+                    <div class="speaker"><span class="face">B</span><span>Il tuo bot ti racconta la giornata</span></div>
+                    <p class="headline" x-text="todayHeadline()"></p>
+                    <div class="total n">
+                        <div><span>Valore totale del conto <button class="q" @click="help('conto')" aria-label="Cos'è il valore totale">?</button></span>
+                             <strong x-text="usd(account.portfolio)"></strong></div>
+                        <div><span>Dall'inizio</span>
+                             <strong :class="toneClass(account.net_pnl_pct)" x-text="pct(account.net_pnl_pct)"></strong></div>
+                    </div>
+                    <div class="why">
+                        <div><span class="ico" x-html="icon('info')"></span><p x-text="todayWhy()"></p></div>
+                        <div x-show="account.initial_capital"><span class="ico" x-html="icon('flag')"></span>
+                            <p x-text="'Sei partito con ' + usd(account.initial_capital) + '. È un conto di prova: i soldi sono finti.'"></p></div>
+                    </div>
+                </section>
+
+                <section class="sheet">
+                    <h2>Cosa sta facendo il bot</h2>
+                    <p class="lead" x-text="botNow().text"></p>
+                    <div class="why">
+                        <div><span class="ico" x-html="icon('compass')"></span><p><b>L'ultima decisione: </b><span x-text="decision().title"></span></p></div>
+                        <div x-show="decision().text"><span class="ico" x-html="icon('message-circle')"></span><p x-text="decision().text"></p></div>
+                    </div>
+                </section>
+
+                <section class="sheet">
+                    <h2>Dove sono i tuoi soldi</h2>
+                    <p class="lead" x-text="moneySentence()"></p>
+                    <div class="bar" style="margin-top:14px" role="img" :aria-label="moneySentence()">
+                        <span class="inv" :style="'width:' + (investedPct() ?? 0) + '%'"></span>
+                        <span class="cash" :style="'width:' + (investedPct() === null ? 100 : 100 - investedPct()) + '%'"></span>
+                    </div>
+                    <div class="legend n">
+                        <span><i class="sw" style="background:var(--pen)"></i>Investiti <span x-text="usd(account.exposure)"></span>
+                            <button class="q" @click="help('investito')" aria-label="Cosa vuol dire investiti">?</button></span>
+                        <span><i class="sw" style="background:color-mix(in srgb, var(--pen) 22%, var(--mist))"></i>In cassa <span x-text="usd(account.cash)"></span>
+                            <button class="q" @click="help('cassa')" aria-label="Cosa vuol dire in cassa">?</button></span>
+                    </div>
+                </section>
             </div>
-            <div class="kpi">
-                <div class="label">Profitto di oggi</div>
-                <div class="flex items-baseline gap-2 mt-0.5">
-                    <span class="kpi-value num" :class="tone(account.daily_pnl_usd)" x-text="usd(account.daily_pnl_usd, true)"></span>
-                    <span class="pill num" :class="pnlPill(account.daily_pnl_pct)" x-text="pct(account.daily_pnl_pct)"></span>
+
+            <div class="stack">
+                <section class="sheet">
+                    <div class="weather">
+                        <div class="sky" :class="weather().tone"><span class="ico" x-html="icon(weather().icon)"></span></div>
+                        <div>
+                            <div class="faint">Il meteo del mercato <button class="q" @click="help('meteo')" aria-label="Cos'è il meteo del mercato">?</button></div>
+                            <div class="name" x-text="weather().name"></div>
+                        </div>
+                    </div>
+                    <p class="lead" style="margin-top:12px" x-text="weather().text"></p>
+                </section>
+
+                <section class="sheet">
+                    <h2>Cosa ha fatto di recente</h2>
+                    <p class="faint" x-show="!diary().length">Ancora niente da raccontare: quando il bot compra o vende qualcosa lo trovi qui.</p>
+                    <ul class="diary">
+                        <template x-for="d in diary()" :key="d.key">
+                            <li>
+                                <span class="ic" :class="d.kind"><span class="ico" x-html="icon(d.kind === 'buy' ? 'shopping-cart' : 'hand-coins')"></span></span>
+                                <div>
+                                    <h3 x-text="d.title"></h3>
+                                    <div class="when" x-text="d.when"></div>
+                                    <p x-show="d.text" x-text="d.text"></p>
+                                </div>
+                            </li>
+                        </template>
+                    </ul>
+                </section>
+
+                <section class="sheet" x-show="perf.trades">
+                    <h2>Il bilancio delle operazioni chiuse</h2>
+                    <div class="rows n">
+                        <div><span class="k">Operazioni chiuse negli ultimi 90 giorni</span><span class="v" x-text="perf.trades ?? '—'"></span></div>
+                        <div><span class="k">Quante hanno guadagnato <button class="q" @click="help('winrate')" aria-label="Cosa vuol dire">?</button></span>
+                             <span class="v" x-text="perf.win_rate != null ? Math.round(perf.win_rate) + ' su 100' : '—'"></span></div>
+                        <div><span class="k">Guadagno o perdita incassati</span><span class="v" :class="toneClass(perf.pnl)" x-text="usd(perf.pnl, true)"></span></div>
+                        <div><span class="k">Quanto tiene in media un titolo</span><span class="v" x-text="durationPlain(perf.avg_held_min)"></span></div>
+                    </div>
+                </section>
+            </div>
+        </div>
+
+        <!-- ================================================================ I MIEI TITOLI -->
+        <div x-show="tab === 'titoli'" x-cloak class="stack">
+            <section class="sheet">
+                <h2 x-text="positions.length ? 'Hai ' + positions.length + (positions.length === 1 ? ' titolo' : ' titoli') : 'Non hai titoli in questo momento'"></h2>
+                <p class="lead">Un titolo è un pezzetto di un'azienda. <button class="q" @click="help('titolo')" aria-label="Cos'è un titolo">?</button>
+                    Per ognuno vedi quanto stai guadagnando o perdendo e cosa farà il bot. Tocca un titolo per tutti i dettagli.</p>
+            </section>
+
+            <div class="cards">
+                <template x-for="p in positions" :key="p.symbol">
+                    <article class="sheet holding" @click="openPosition(p)" @keydown.enter="openPosition(p)" tabindex="0" role="button"
+                             :aria-label="'Apri i dettagli di ' + p.symbol">
+                        <div class="top">
+                            <div>
+                                <div class="sym" x-text="p.symbol"></div>
+                                <div class="faint n" x-text="qty(p.qty) + ' azioni · valgono ' + usd(p.market_value)"></div>
+                            </div>
+                            <div class="val n">
+                                <strong :class="toneClass(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></strong>
+                                <div :class="toneClass(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></div>
+                            </div>
+                        </div>
+
+                        <template x-if="track(p) !== null">
+                            <div class="track" role="img" :aria-label="planText(p)">
+                                <span class="lab l n" x-text="'vende a ' + price(stopPrice(p))"></span>
+                                <span class="lab r n" x-text="'incassa a ' + price(targetPrice(p))"></span>
+                                <span class="mark entry" :style="'left:' + entryMark(p) + '%'" title="Prezzo d'acquisto"></span>
+                                <span class="mark now" :style="'left:' + track(p) + '%'" :title="'Prezzo di adesso: ' + price(p.current_price)"></span>
+                                <span class="lab top n" :style="'left:' + track(p) + '%'" x-text="'ora ' + price(p.current_price)"></span>
+                            </div>
+                        </template>
+
+                        <div class="why">
+                            <div><span class="ico" x-html="icon('shield')"></span><p x-text="planText(p)"></p></div>
+                            <div x-show="p.buy_thesis"><span class="ico" x-html="icon('lightbulb')"></span><p><b>Perché l'ha comprato: </b><span x-text="p.buy_thesis"></span></p></div>
+                            <div x-show="p.hold_rationale"><span class="ico" x-html="icon('hourglass')"></span><p><b>Perché lo tiene: </b><span x-text="p.hold_rationale"></span></p></div>
+                        </div>
+                    </article>
+                </template>
+            </div>
+
+            <section class="sheet" x-show="closedPositions.length">
+                <h2>Venduti di recente</h2>
+                <ul class="diary">
+                    <template x-for="c in closedPositions" :key="c.symbol + c.closed_at">
+                        <li>
+                            <span class="ic sell"><span class="ico" x-html="icon('hand-coins')"></span></span>
+                            <div>
+                                <h3 x-text="'Ha venduto ' + c.symbol"></h3>
+                                <div class="when" x-text="dateTime(c.closed_at)"></div>
+                                <p x-text="c.exit_reason"></p>
+                            </div>
+                        </li>
+                    </template>
+                </ul>
+            </section>
+        </div>
+
+        <!-- ================================================================ IL MERCATO -->
+        <div x-show="tab === 'mercato'" x-cloak class="grid2">
+            <div class="stack">
+                <section class="sheet">
+                    <div class="weather">
+                        <div class="sky" :class="weather().tone"><span class="ico" x-html="icon(weather().icon)"></span></div>
+                        <div>
+                            <div class="faint">Il meteo del mercato <button class="q" @click="help('meteo')" aria-label="Cos'è il meteo del mercato">?</button></div>
+                            <div class="name" x-text="weather().name"></div>
+                        </div>
+                    </div>
+                    <p class="lead" style="margin-top:12px" x-text="weather().text"></p>
+                    <div class="rows n" style="margin-top:14px">
+                        <template x-for="ix in indexCards()" :key="ix.key">
+                            <div><span class="k"><span x-text="ix.name"></span>
+                                    <button class="q" x-show="ix.help" @click="help(ix.help)" :aria-label="'Cos\'è ' + ix.name">?</button></span>
+                                 <span class="v"><span class="tag" :class="ix.up ? 'good' : 'bad'" x-text="ix.up ? 'In salita' : 'In discesa'"></span></span></div>
+                        </template>
+                        <div x-show="macro.vix != null"><span class="k">Indice della paura <button class="q" @click="help('vix')" aria-label="Cos'è l'indice della paura">?</button></span>
+                             <span class="v" x-text="fearText()"></span></div>
+                    </div>
+                </section>
+            </div>
+
+            <div class="stack">
+                <section class="sheet">
+                    <h2>Titoli che il bot sta valutando</h2>
+                    <p class="lead">Il bot cerca di continuo aziende interessanti. Prima di comprarne una la esamina con molti controlli: la maggior parte viene scartata, ed è normale.</p>
+                    <p class="faint" style="margin-top:10px" x-show="!candidates().length">In questo momento non ci sono titoli sotto esame.</p>
+                    <ul class="diary">
+                        <template x-for="r in candidates()" :key="r.symbol + (r.updated_at || r.discovered_at)">
+                            <li>
+                                <span class="ic" :class="r.status === 'REJECTED_BY_RISK' || r.status === 'EXPIRED' ? 'sell' : 'buy'">
+                                    <span class="ico" x-html="icon(candidateIcon(r.status))"></span></span>
+                                <div>
+                                    <h3><span x-text="r.symbol"></span> <span class="tag" :class="candidateTone(r.status)" x-text="plainStatus(r.status)"></span></h3>
+                                    <p x-text="candidateWhy(r)"></p>
+                                </div>
+                            </li>
+                        </template>
+                    </ul>
+                </section>
+            </div>
+        </div>
+
+        <!-- ================================================================ CHIEDI AL BOT -->
+        <div x-show="tab === 'chiedi'" x-cloak class="stack" style="max-width:760px">
+            <section class="sheet">
+                <h2>Chiedi al bot</h2>
+                <p class="lead">Scrivi una domanda con parole tue. Il bot guarda il conto e il mercato, e se serve cerca su internet. Se gli chiedi di cambiare qualcosa, prima ti chiede conferma.</p>
+                <div class="suggest">
+                    <template x-for="(p, key) in personas" :key="key">
+                        <button :style="persona === key ? 'border-color:var(--pen);color:var(--pen)' : ''" @click="persona = key; scrollChat()"
+                                x-text="key === 'coo' ? 'Parla con il bot' : 'Parla con il controllore del rischio'"></button>
+                    </template>
+                </div>
+            </section>
+
+            <section class="sheet">
+                <div x-ref="chat" class="talk">
+                    <p class="quiet" x-show="!personaMessages().length" x-text="personas[persona].tagline"></p>
+                    <template x-for="m in personaMessages()" :key="m.id">
+                        <div class="bubble" :class="m.role === 'user' ? 'me' : 'bot'">
+                            <div class="who" x-show="m.role !== 'user'" x-text="(m.author || 'Bot') + (m.verdict ? ' · ' + verdictPlain(m.verdict) : '')"></div>
+                            <div class="msg" x-text="m.text"></div>
+                        </div>
+                    </template>
+                    <p class="faint" x-show="chatSending">Il bot sta pensando…</p>
+                </div>
+                <div class="confirm" x-show="chatPending[persona]" style="margin-top:12px">
+                    <span style="flex:1;min-width:200px" x-text="'Vuoi che lo faccia? ' + (chatPending[persona] || '')"></span>
+                    <button class="k-btn small main" @click="sendChat('sì, conferma')" :disabled="chatSending">Sì, fallo</button>
+                    <button class="k-btn small" @click="sendChat('no, annulla')" :disabled="chatSending">No</button>
+                </div>
+                <form class="ask" @submit.prevent="sendChat()">
+                    <input x-ref="cmd" x-model="chatInput" maxlength="800" :disabled="chatSending" placeholder="Per esempio: perché hai comprato Apple?"
+                           aria-label="La tua domanda">
+                    <button type="submit" class="k-btn main" :disabled="chatSending || !chatInput.trim()">Invia</button>
+                </form>
+                <div class="suggest">
+                    <template x-for="s in chatSuggestions" :key="s">
+                        <button @click="sendChat(s)" :disabled="chatSending" x-text="s"></button>
+                    </template>
+                </div>
+            </section>
+        </div>
+
+        <!-- ================================================================ SALA MACCHINE (vista tecnica di prima) -->
+        <div x-show="tab === 'macchine'" x-cloak>
+            <div class="engine-intro">
+                <p class="quiet" style="max-width:62ch;margin:0">Qui ci sono tutti i dettagli tecnici: gli agenti, i controlli, i registri. Non serve guardarli per usare il bot.</p>
+                <div class="subtabs">
+                    <template x-for="t in engineTabs" :key="t.id">
+                        <button :class="engineTab === t.id && 'on'" @click="engineTab = t.id; icons()" x-text="t.label"></button>
+                    </template>
                 </div>
             </div>
-            <div class="kpi">
-                <div class="label">Regime operativo</div>
-                <div class="mt-1.5"><span class="pill" :class="health().pill" :title="health().hint">
-                    <span class="dot"></span><span x-text="health().label"></span></span></div>
-                <div class="mt-1 text-[11px] text-zinc-500 truncate" x-text="health().hint"></div>
-            </div>
-            <div class="kpi">
-                <div class="flex items-center justify-between label">
-                    <span>Allocazione cassa</span>
-                    <span class="num text-zinc-300" x-text="investedPct() === null ? '—' : (100 - investedPct()).toFixed(0) + '% cassa'"></span>
-                </div>
-                <div class="kpi-value num text-zinc-100" x-text="investedPct() === null ? '—' : investedPct().toFixed(1) + '%'"></div>
-                <div class="exp-bar mt-1.5" :title="'Esposizione massima ' + (settings.max_exposure_pct ?? '—') + '%'"><span :style="'width:' + (investedPct() ?? 0) + '%'"></span></div>
-            </div>
-        </section>
-
-        <!-- ============ TAB ============ -->
-        <nav class="tabbar scroll-thin">
-            <template x-for="t in tabs" :key="t.id">
-                <button class="tab" :class="tab === t.id && 'active'" @click="tab = t.id" x-text="t.label"></button>
-            </template>
-        </nav>
-
-        <!-- ================================================================ AGENTI -->
-        <div x-show="tab === 'command'" class="space-y-4">
-
+            <div class="engine">
+                <div x-show="engineTab === 'agenti'" class="space-y-4">
             <!-- AGENT MATRIX -->
             <section class="glass">
                 <div class="panel-head">
@@ -151,67 +355,9 @@
                     </template>
                 </div>
             </section>
-
             <div class="grid grid-cols-1 xl:grid-cols-5 gap-4 items-start">
-                <!-- COMMAND BAR (dipendenti AI) -->
-                <section class="glass xl:col-span-3 flex flex-col">
-                    <div class="panel-head">
-                        <h2 class="panel-title">Comandi</h2>
-                        <div class="seg">
-                            <template x-for="(p, key) in personas" :key="key">
-                                <button :class="persona === key && 'on'" @click="persona = key; scrollChat()" x-text="p.short"></button>
-                            </template>
-                        </div>
-                    </div>
-                    <div class="p-3">
-                        <form @submit.prevent="sendChat()" class="cmd flex items-center gap-2 px-2.5 h-9">
-                            <span class="mono text-zinc-500 text-[12px]">›</span>
-                            <input x-ref="cmd" x-model="chatInput" maxlength="800" :disabled="chatSending"
-                                   :placeholder="'Chiedi al ' + personas[persona].short + ' — es. perché il portafoglio è fermo?'"
-                                   class="flex-1 min-w-0 text-[13px] text-zinc-100 placeholder-zinc-600">
-                            <span x-show="chatSending" class="text-[11px] text-zinc-500 mono">ragiono…</span>
-                            <span x-show="!chatSending" class="kbd hidden sm:inline">⌘K</span>
-                            <button type="submit" class="btn btn-sm btn-primary" :disabled="chatSending || !chatInput.trim()">Invia</button>
-                        </form>
-                        <div class="mt-2 flex flex-wrap gap-1.5">
-                            <template x-for="s in chatSuggestions" :key="s">
-                                <button class="chip" @click="sendChat(s)" :disabled="chatSending" x-text="s"></button>
-                            </template>
-                        </div>
-                    </div>
-                    <div x-ref="chat" class="border-t border-zinc-800 overflow-y-auto scroll-thin max-h-[380px] px-3 py-2 space-y-2.5">
-                        <div x-show="!personaMessages().length" class="py-3 text-[12px] text-zinc-500" x-text="personas[persona].tagline"></div>
-                        <div x-show="chatPending[persona]" class="flex flex-wrap items-center gap-2 text-[11.5px] text-sky-300 border border-sky-500/30 rounded px-2 py-1.5 sticky top-0 bg-[#121215] z-10">
-                            <span class="min-w-0" x-text="'In attesa di conferma: ' + (chatPending[persona] || '')"></span>
-                            <span class="ml-auto flex gap-1.5">
-                                <button class="btn btn-sm btn-primary" @click="sendChat('sì, conferma')" :disabled="chatSending">Conferma</button>
-                                <button class="btn btn-sm" @click="sendChat('no, annulla')" :disabled="chatSending">Annulla</button>
-                            </span>
-                        </div>
-                        <template x-for="m in personaMessages()" :key="m.id">
-                            <div>
-                                <template x-if="m.role === 'user'">
-                                    <div class="flex gap-2 text-[12.5px]"><span class="mono text-zinc-600">›</span>
-                                        <span class="text-zinc-200" x-text="m.text"></span>
-                                        <span class="ml-auto mono text-[10.5px] text-zinc-600 shrink-0" x-text="m.time || ''"></span></div>
-                                </template>
-                                <template x-if="m.role !== 'user'">
-                                    <div class="reply ml-3" :class="'v-' + (m.verdict || 'INFO')">
-                                        <div class="flex items-center gap-2">
-                                            <span class="verdict" :class="verdictTone(m.verdict)" x-text="m.verdict || 'INFO'"></span>
-                                            <span class="text-[11px] text-zinc-500" x-text="m.author"></span>
-                                        </div>
-                                        <div class="text-[12.5px] text-zinc-300 leading-relaxed whitespace-pre-line" x-text="m.text"></div>
-                                        <div x-show="m.parser" class="mt-1 mono text-[10.5px] text-zinc-600" x-text="m.parser"></div>
-                                    </div>
-                                </template>
-                            </div>
-                        </template>
-                    </div>
-                </section>
-
                 <!-- FEED EVENTI -->
-                <section class="glass xl:col-span-2 flex flex-col">
+                <section class="glass xl:col-span-5 flex flex-col">
                     <div class="panel-head">
                         <h2 class="panel-title">Eventi agenti</h2>
                         <span class="flex items-center gap-1.5 text-[11px] text-zinc-500 num">
@@ -230,7 +376,6 @@
                     </div>
                 </section>
             </div>
-
             <!-- Ultima decisione del CIO -->
             <section class="glass">
                 <div class="panel-head">
@@ -248,10 +393,8 @@
                     </template>
                 </div>
             </section>
-        </div>
-
-        <!-- ================================================================ MERCATI -->
-        <div x-show="tab === 'markets'" x-cloak class="space-y-4">
+                </div>
+                <div x-show="engineTab === 'radar'" class="space-y-4">
         <!-- ============ 5 CANALI DI INTELLIGENCE ============ -->
         <section class="glass">
             <div class="px-4 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2">
@@ -419,108 +562,8 @@
                 </div>
             </div>
         </section>
-        </div>
-
-        <!-- ================================================================ PORTAFOGLIO -->
-        <div x-show="tab === 'portfolio'" x-cloak class="space-y-4">
-        <section class="flex flex-wrap gap-x-8 gap-y-2 px-1 text-xs text-zinc-500">
-            <span>Trade chiusi (90gg) <span class="num text-zinc-200" x-text="perf.trades ?? '—'"></span></span>
-            <span>Win rate <span class="num text-zinc-200" x-text="perf.win_rate != null ? perf.win_rate + '%' : '—'"></span></span>
-            <span>PnL realizzato <span class="num" :class="tone(perf.pnl)" x-text="usd(perf.pnl, true)"></span></span>
-            <span>Permanenza media <span class="num text-zinc-200" x-text="duration(perf.avg_held_min)"></span></span>
-            <span>Cash <span class="num text-zinc-200" x-text="usd(account.cash)"></span></span>
-            <span x-show="perf.best">Migliore <span class="num text-emerald-500" x-text="perf.best ? perf.best.symbol + ' ' + usd(perf.best.pnl, true) : ''"></span></span>
-            <span x-show="perf.worst">Peggiore <span class="num text-red-500" x-text="perf.worst ? perf.worst.symbol + ' ' + usd(perf.worst.pnl, true) : ''"></span></span>
-        </section>
-        <!-- ============ POSIZIONI ============ -->
-        <section class="glass">
-            <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
-                <h2 class="panel-title">Posizioni aperte</h2>
-                <span class="text-[11px] text-zinc-500 num" x-text="positions.length + ' posizioni'"></span>
-            </div>
-            <div class="overflow-x-auto scroll-thin">
-                <table class="w-full text-xs">
-                    <thead>
-                        <tr class="border-b border-zinc-800 text-zinc-500 text-left">
-                            <th class="font-medium px-4 py-2.5">Asset</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Quantità</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Allocazione CIO</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Convinzione</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Stop</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Prezzo medio</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Prezzo</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Valore</th>
-                            <th class="font-medium px-4 py-2.5 text-right">P&amp;L</th>
-                            <th class="font-medium px-4 py-2.5 text-right">%</th>
-                            <th class="font-medium px-4 py-2.5 text-right">Azioni</th>
-                        </tr>
-                    </thead>
-                    <tbody class="num" x-show="!positions.length">
-                        <tr><td colspan="11" class="px-4 py-4 text-zinc-500 font-sans">Nessuna posizione aperta.</td></tr>
-                    </tbody>
-                    <template x-for="p in positions" :key="p.symbol">
-                        <tbody class="num border-b border-zinc-800/70">
-                            <tr class="table-row cursor-pointer" @click="openPosition(p)" title="Apri la scheda della posizione">
-                                <td class="px-4 py-2.5 text-zinc-100">
-                                    <span x-text="p.symbol"></span>
-                                    <span x-show="p.trade_class === 'SUPER_CONVICTION'" class="ml-1 text-[10px] font-sans px-1 rounded bg-amber-500/15 text-amber-300">SUPER</span>
-                                    <span x-show="p.horizon" class="ml-1 text-[10px] font-sans text-zinc-500" x-text="p.horizon === 'SWING_CATALYST' ? 'swing' : 'intraday'"></span>
-                                    <span x-show="p.scaled_out" class="ml-1 text-[10px] font-sans text-emerald-500">runner</span>
-                                </td>
-                                <td class="px-4 py-2.5 text-right text-zinc-300" x-text="qty(p.qty)"></td>
-                                <td class="px-4 py-2.5 text-right text-zinc-200" x-text="p.allocation_pct != null ? p.allocation_pct + '%' : weight(p)"></td>
-                                <td class="px-4 py-2.5 text-right text-zinc-400" x-text="p.conviction ?? '—'"></td>
-                                <td class="px-4 py-2.5 text-right text-zinc-400" :title="p.stop_basis ? 'Stop ' + p.stop_pct + '% (' + p.stop_basis + (p.atr_pct ? ', ATR ' + p.atr_pct + '%' : '') + ') · Target 1 +' + p.target_pct + '% (3R)' : ''">
-                                    <div x-text="p.effective_stop_pct != null && p.effective_stop_pct !== p.stop_pct ? (p.effective_stop_pct > 0 ? '+' : '') + p.effective_stop_pct + '%' : (p.stop_pct != null ? p.stop_pct + '%' : '—')"></div>
-                                    <div x-show="p.target_pct != null && !p.scaled_out" class="text-[10px] text-emerald-500/80" x-text="'T1 +' + p.target_pct + '%'"></div>
-                                </td>
-                                <td class="px-4 py-2.5 text-right text-zinc-400" x-text="usd(p.avg_entry_price)"></td>
-                                <td class="px-4 py-2.5 text-right text-zinc-300" x-text="usd(p.current_price)"></td>
-                                <td class="px-4 py-2.5 text-right text-zinc-300" x-text="usd(p.market_value)"></td>
-                                <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></td>
-                                <td class="px-4 py-2.5 text-right" :class="tone(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></td>
-                                <td class="px-4 py-2.5 text-right font-sans whitespace-nowrap">
-                                    <button @click.stop="deRisk(p)" :disabled="!canDeRisk(p) || deRisking === p.symbol" class="btn btn-sm"
-                                            :title="p.scaled_out ? 'Metà già incassata: il runner è già a breakeven' : (p.unrealized_pl > 0 ? 'Vende il 50% e porta lo stop del resto a breakeven + commissioni' : 'Disponibile solo con la posizione in profitto')"
-                                            x-text="deRisking === p.symbol ? 'invio…' : '🛡️ Attiva Rischio Zero'"></button>
-                                </td>
-                            </tr>
-                            <tr class="font-sans">
-                                <td colspan="11" class="px-4 pb-2.5 pt-0">
-                                    <dl class="grid grid-cols-1 lg:grid-cols-3 gap-x-4 gap-y-1 text-[11px] leading-snug">
-                                        <div class="min-w-0"><dt class="inline text-indigo-400">buy_thesis · </dt><dd class="inline text-zinc-300" x-text="p.buy_thesis || '—'"></dd></div>
-                                        <div class="min-w-0"><dt class="inline text-amber-300">hold_rationale · </dt><dd class="inline text-zinc-300" x-text="p.hold_rationale || '—'"></dd></div>
-                                        <div class="min-w-0"><dt class="inline text-red-500">exit_reason · </dt><dd class="inline text-zinc-300" x-text="p.exit_reason || 'nessuna uscita (posizione intera)'"></dd></div>
-                                    </dl>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </template>
-                </table>
-            </div>
-        </section>
-
-        <!-- ============ ULTIME CHIUSURE (exit_reason del Guardian) ============ -->
-        <section class="glass" x-show="closedPositions.length">
-            <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
-                <h2 class="panel-title">Ultime chiusure</h2>
-                <span class="text-[11px] text-zinc-500 num" x-text="closedPositions.length + ' recenti'"></span>
-            </div>
-            <ul class="divide-y divide-zinc-800/70 text-[11px]">
-                <template x-for="c in closedPositions" :key="c.symbol + c.closed_at">
-                    <li class="px-4 py-2 space-y-0.5">
-                        <div class="flex items-center gap-2"><span class="text-zinc-100 num" x-text="c.symbol"></span>
-                            <span class="text-zinc-500 num" x-text="dateTime(c.closed_at)"></span></div>
-                        <div><span class="text-red-500">exit_reason · </span><span class="text-zinc-300" x-text="c.exit_reason"></span></div>
-                        <div x-show="c.buy_thesis"><span class="text-indigo-400">buy_thesis · </span><span class="text-zinc-400" x-text="c.buy_thesis"></span></div>
-                    </li>
-                </template>
-            </ul>
-        </section>
-        </div>
-
-        <!-- ================================================================ AUDIT -->
-        <div x-show="tab === 'audit'" x-cloak class="space-y-4">
+                </div>
+                <div x-show="engineTab === 'audit'" class="space-y-4">
         <!-- ============ AUDIT AGENTI & REVISIONI ============ -->
         <section class="glass">
             <div class="px-4 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2">
@@ -647,13 +690,13 @@
                      x-text="(audit.scorecard?.closed_trades ?? 0) + ' trade chiusi analizzati, ' + (audit.scorecard?.voted_trades ?? 0) + ' con i voti degli agenti all\'ingresso'"></div>
             </div>
         </section>
-        </div>
-
+                </div>
+                <div x-show="engineTab === 'log'" class="space-y-4">
         <!-- ================================================================ LOG TECNICI -->
-        <details x-show="tab === 'audit'" class="glass group">
+        <details class="glass group" open>
             <summary class="panel-head cursor-pointer select-none !border-b-0">
                 <span class="panel-title">
-                    <i data-lucide="chevron-right" class="w-3.5 h-3.5 text-zinc-500 transition-transform group-open:rotate-90"></i>
+                    <span class="ico" class="w-3.5 h-3.5 text-zinc-500 transition-transform group-open:rotate-90" x-html="icon('chevron-right')"></span>
                     Log di sistema
                 </span>
                 <span class="text-[11px] text-zinc-500 num" x-text="visibleLogs().length + ' righe'"></span>
@@ -668,7 +711,7 @@
                     </template>
                 </div>
             </div>
-        </details>
+                </div>
     </main>
 
     <!-- ============ ISPEZIONA (console laterale) ============ -->
@@ -711,233 +754,181 @@
             </div>
         </aside>
     </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- ============ GLOSSARIO ============ -->
+    <div x-cloak x-show="helpKey" class="overlay" @keydown.escape.window="helpKey = ''" role="dialog" aria-modal="true">
+        <div class="backdrop" @click="helpKey = ''"></div>
+        <div class="dialog" style="max-width:480px">
+            <header><h2 x-text="glossary[helpKey]?.t"></h2><button class="x" @click="helpKey = ''" aria-label="Chiudi">✕</button></header>
+            <div class="body"><p style="margin:0;font-size:18px" x-text="glossary[helpKey]?.d"></p></div>
+        </div>
+    </div>
 
     <!-- ============ NOTIFICHE ============ -->
-    <div class="fixed bottom-4 right-4 z-[70] space-y-2 w-[min(340px,calc(100vw-2rem))]">
+    <div class="toasts" aria-live="polite">
         <template x-for="t in toasts" :key="t.id">
-            <div class="toast" :class="t.error ? 'text-red-300' : 'text-zinc-200'"
-                 x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" x-text="t.text"></div>
+            <div class="k-toast" :class="t.error && 'err'" x-text="t.text"></div>
         </template>
     </div>
 
-    <!-- ============ IMPOSTAZIONI (nascoste di default) ============ -->
-    <div x-cloak x-show="showSettings" x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-fade-from" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
-         @keydown.escape.window="showSettings = false">
-        <div class="modal-backdrop" @click="showSettings = false"></div>
-        <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin modal">
-            <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between sticky top-0 bg-[#121215]">
-                <h2 class="text-sm font-semibold text-zinc-100">Impostazioni Bot</h2>
-                <button @click="showSettings = false" class="h-7 w-7 rounded hover:bg-zinc-800 text-zinc-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
-            </div>
+    <!-- ============ IMPOSTAZIONI ============ -->
+    <div x-cloak x-show="showSettings" class="overlay" @keydown.escape.window="showSettings = false" role="dialog" aria-modal="true">
+        <div class="backdrop" @click="showSettings = false"></div>
+        <div class="dialog">
+            <header><h2>Impostazioni</h2><button class="x" @click="showSettings = false" aria-label="Chiudi">✕</button></header>
+            <div class="body form">
+                <label class="toggle" :title="lockTitle('auto_execute_trades')">
+                    <span><b>Il bot può comprare e vendere da solo</b>
+                        <span class="faint" style="display:block" x-text="settings.auto_execute_trades ? 'Sì: invia gli ordini da solo, seguendo le sue regole di sicurezza.' : 'No: ti dà solo consigli, non invia ordini.'"></span></span>
+                    <input type="checkbox" x-model="settings.auto_execute_trades" :disabled="locked('auto_execute_trades')">
+                </label>
 
-            <div class="p-5 space-y-5 text-xs">
-                <div>
-                    <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-2">Watchlist</div>
-                    <div class="flex flex-wrap gap-1.5 mb-2">
+                <template x-for="f in numberFields" :key="f.key">
+                    <label class="f" :title="lockTitle(f.key)">
+                        <span class="t" x-text="f.label"></span>
+                        <span class="h" x-text="f.hint"></span>
+                        <input type="number" :step="f.step" :min="f.min" :max="f.max" x-model.number="settings[f.key]" :disabled="locked(f.key)" class="n">
+                    </label>
+                </template>
+
+                <label class="f" :title="lockTitle('core_spy_pct')" x-show="settings.core_spy_pct !== undefined">
+                    <span class="t">Parte del conto fissa su SPY (%)</span>
+                    <span class="h">0 = spento. Con un valore più alto, quella parte resta sempre investita sulle 500 aziende più grandi USA e il bot lavora con il resto.</span>
+                    <input type="number" step="5" min="0" max="90" x-model.number="settings.core_spy_pct" :disabled="locked('core_spy_pct')" class="n">
+                </label>
+
+                <div class="f" style="display:grid;gap:8px">
+                    <span class="t" style="font-weight:700">Titoli da tenere sempre d'occhio</span>
+                    <span class="h faint">Il bot li controlla in aggiunta a quelli che trova da solo.</span>
+                    <div class="tickers n">
                         <template x-for="t in settings.watchlist || []" :key="t">
-                            <span class="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded border border-zinc-700 num text-zinc-200">
-                                <span x-text="t"></span>
-                                <button type="button" @click="removeTicker(t)" :disabled="locked('watchlist')" class="px-1 text-zinc-500 hover:text-red-500 disabled:opacity-40">×</button>
-                            </span>
+                            <span><span x-text="t"></span><button type="button" @click="removeTicker(t)" :disabled="locked('watchlist')" :aria-label="'Togli ' + t">✕</button></span>
                         </template>
                     </div>
-                    <form @submit.prevent="addTicker()" class="flex gap-2">
-                        <input x-model="tickerInput" :disabled="locked('watchlist')" maxlength="15" placeholder="Es. GOOGL o DOGE-USD"
-                               class="flex-1 min-w-0 h-8 field num uppercase text-zinc-200 focus:outline-none focus:border-zinc-600 disabled:opacity-50">
-                        <button type="submit" :disabled="locked('watchlist')" class="btn">Aggiungi</button>
+                    <form @submit.prevent="addTicker()" style="display:flex;gap:8px">
+                        <input type="text" x-model="tickerInput" :disabled="locked('watchlist')" maxlength="15" placeholder="Es. GOOGL" style="flex:1;min-width:0;text-transform:uppercase">
+                        <button type="submit" class="k-btn" :disabled="locked('watchlist')">Aggiungi</button>
                     </form>
                 </div>
 
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <template x-for="f in numberFields" :key="f.key">
-                        <label class="block" :title="lockTitle(f.key)">
-                            <span class="text-[11px] uppercase tracking-wider text-zinc-500" x-text="f.label"></span>
-                            <input type="number" :step="f.step" :min="f.min" :max="f.max" x-model.number="settings[f.key]" :disabled="locked(f.key)"
-                                   class="mt-1 w-full h-8 field num text-zinc-200 focus:outline-none focus:border-zinc-600 disabled:opacity-50">
+                <details class="more">
+                    <summary>Impostazioni avanzate</summary>
+                    <div class="form">
+                        <label class="toggle" :title="lockTitle('keep_alive_enabled')">
+                            <span><b>Tieni sveglio il server</b><span class="faint" style="display:block">Il server si richiama da solo ogni 10 minuti, così non si addormenta.</span></span>
+                            <input type="checkbox" x-model="settings.keep_alive_enabled" :disabled="locked('keep_alive_enabled')">
                         </label>
-                    </template>
-                </div>
+                        <label class="f" :title="lockTitle('ai_provider')">
+                            <span class="t">Intelligenza artificiale usata dal bot</span>
+                            <select x-model="settings.ai_provider" :disabled="locked('ai_provider')">
+                                <option value="gemini">Gemini Flash</option>
+                                <option value="groq">Groq</option>
+                                <option value="hybrid">Gemini e Groq insieme</option>
+                                <option value="quant">Nessuna: solo calcoli</option>
+                            </select>
+                        </label>
+                    </div>
+                </details>
 
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-zinc-800" :title="lockTitle('auto_execute_trades')">
-                        <span>
-                            <span class="text-zinc-200">Auto-Trading</span>
-                            <span class="block text-[11px] text-zinc-500" x-text="settings.auto_execute_trades ? 'Esegue gli ordini' : 'Advisor: solo suggerimenti'"></span>
-                        </span>
-                        <input type="checkbox" x-model="settings.auto_execute_trades" :disabled="locked('auto_execute_trades')" class="h-4 w-4 accent-indigo-500">
-                    </label>
-                    <label class="flex items-center justify-between gap-3 h-10 px-3 rounded border border-zinc-800" :title="lockTitle('keep_alive_enabled')">
-                        <span>
-                            <span class="text-zinc-200">Anti-Sleep</span>
-                            <span class="block text-[11px] text-zinc-500">Self-ping ogni 10 minuti</span>
-                        </span>
-                        <input type="checkbox" x-model="settings.keep_alive_enabled" :disabled="locked('keep_alive_enabled')" class="h-4 w-4 accent-indigo-500">
-                    </label>
-                </div>
-
-                <label class="block" :title="lockTitle('ai_provider')">
-                    <span class="text-[11px] uppercase tracking-wider text-zinc-500">Motore IA</span>
-                    <select x-model="settings.ai_provider" :disabled="locked('ai_provider')"
-                            class="mt-1 w-full h-8 field text-zinc-200 focus:outline-none focus:border-zinc-600 disabled:opacity-50">
-                        <option value="gemini">Gemini Flash</option>
-                        <option value="groq">Groq</option>
-                        <option value="hybrid">Ibrido Gemini + Groq</option>
-                        <option value="quant">Solo algoritmo quantitativo</option>
-                    </select>
-                </label>
-
-                <p x-show="Object.keys(envLocked).length" class="text-[11px] text-zinc-500">
-                    I campi disattivati sono fissati da variabili d'ambiente su Render.
-                </p>
+                <p class="faint" x-show="Object.keys(envLocked).length" style="margin:0">Le voci disattivate sono fissate su Render e si cambiano da lì.</p>
             </div>
-
-            <div class="px-5 py-3 border-t border-zinc-800 flex items-center justify-between gap-3 sticky bottom-0 bg-[#121215]">
-                <span class="text-[11px] num" :class="noticeError ? 'text-red-500' : 'text-emerald-500'" x-text="notice"></span>
-                <div class="flex gap-2">
-                    <button @click="showSettings = false" class="btn">Chiudi</button>
-                    <button @click="saveSettings()" :disabled="saving" class="btn btn-primary">Salva impostazioni</button>
-                </div>
-            </div>
+            <footer>
+                <span class="note" :class="noticeError ? 'down-t' : 'up-t'" x-text="notice"></span>
+                <button @click="showSettings = false" class="k-btn">Chiudi</button>
+                <button @click="saveSettings()" :disabled="saving" class="k-btn main">Salva</button>
+            </footer>
         </div>
     </div>
 
-    <!-- ============ SCHEDA POSIZIONE (click su una riga) ============ -->
-    <div x-cloak x-show="showPosition" x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-fade-from" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
-         @keydown.escape.window="showPosition = false">
-        <div class="modal-backdrop" @click="showPosition = false"></div>
-        <div class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto scroll-thin modal">
-            <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between sticky top-0 bg-[#121215]">
-                <h2 class="text-sm font-semibold text-zinc-100" x-text="'Posizione ' + (posDetail?.position?.symbol || posSymbol)"></h2>
-                <button @click="showPosition = false" class="h-7 w-7 rounded hover:bg-zinc-800 text-zinc-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
-            </div>
-            <div class="p-5 text-xs space-y-5">
-                <div x-show="posLoading" class="text-zinc-500">Caricamento…</div>
-                <div x-show="posError" class="text-red-500" x-text="posError"></div>
+    <!-- ============ SCHEDA DI UN TITOLO ============ -->
+    <div x-cloak x-show="showPosition" class="overlay" @keydown.escape.window="showPosition = false" role="dialog" aria-modal="true">
+        <div class="backdrop" @click="showPosition = false"></div>
+        <div class="dialog">
+            <header><h2 x-text="posDetail?.position?.symbol || posSymbol"></h2><button class="x" @click="showPosition = false" aria-label="Chiudi">✕</button></header>
+            <div class="body">
+                <p x-show="posLoading" class="quiet" style="margin:0">Sto caricando i dettagli…</p>
+                <p x-show="posError" class="down-t" style="margin:0" x-text="posError"></p>
                 <template x-if="posDetail && !posLoading">
-                    <div class="space-y-5">
-                        <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 num">
-                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Apertura</div>
-                                 <div class="text-zinc-200" x-text="dateTime(posDetail.opened_at)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Prezzo di ingresso</div>
-                                 <div class="text-zinc-200" x-text="price(posDetail.position.avg_entry_price)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Prezzo attuale</div>
-                                 <div class="text-zinc-200" x-text="price(posDetail.position.current_price)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">PnL %</div>
-                                 <div :class="tone(posDetail.position.unrealized_plpc)" x-text="pct(posDetail.position.unrealized_plpc)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">PnL</div>
-                                 <div :class="tone(posDetail.position.unrealized_pl)" x-text="usd(posDetail.position.unrealized_pl, true)"></div></div>
-                            <div><div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Quantità · Valore</div>
-                                 <div class="text-zinc-200" x-text="qty(posDetail.position.qty) + ' · ' + usd(posDetail.position.market_value)"></div></div>
+                    <div class="stack">
+                        <p style="margin:0;font-size:20px" x-text="positionHeadline(posDetail.position)"></p>
+                        <div class="rows n">
+                            <div><span class="k">Comprato il</span><span class="v" x-text="dateTime(posDetail.opened_at)"></span></div>
+                            <div><span class="k">Prezzo pagato per azione</span><span class="v" x-text="price(posDetail.position.avg_entry_price)"></span></div>
+                            <div><span class="k">Prezzo di adesso</span><span class="v" x-text="price(posDetail.position.current_price)"></span></div>
+                            <div><span class="k">Azioni possedute</span><span class="v" x-text="qty(posDetail.position.qty)"></span></div>
+                            <div><span class="k">Valore oggi</span><span class="v" x-text="usd(posDetail.position.market_value)"></span></div>
+                            <div><span class="k">Uscita di sicurezza <button class="q" @click="help('stop')" aria-label="Cos'è l'uscita di sicurezza">?</button></span>
+                                 <span class="v down-t" x-text="posDetail.stop_loss?.price ? price(posDetail.stop_loss.price) : '—'"></span></div>
+                            <div><span class="k">Obiettivo <button class="q" @click="help('target')" aria-label="Cos'è l'obiettivo">?</button></span>
+                                 <span class="v up-t" x-text="posDetail.take_profit?.price ? price(posDetail.take_profit.price) : '—'"></span></div>
                         </div>
-
-                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 num">
-                            <div class="border border-zinc-800 rounded p-3">
-                                <div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Stop Loss</div>
-                                <div class="text-red-500" x-text="price(posDetail.stop_loss.price) + ' (' + posDetail.stop_loss.pct + '%)'"></div>
-                                <div class="text-[11px] text-zinc-500 font-sans" x-text="posDetail.stop_loss.source + (posDetail.stop_loss.effective_pct != null && posDetail.stop_loss.effective_pct !== posDetail.stop_loss.pct ? ' · stop effettivo del Guardian ' + posDetail.stop_loss.effective_pct + '%' : '')"></div>
+                        <div class="why" style="margin-top:0">
+                            <div x-show="posDetail.guardian?.buy_thesis"><span class="ico" x-html="icon('lightbulb')"></span><p><b>Perché l'ha comprato: </b><span x-text="posDetail.guardian?.buy_thesis"></span></p></div>
+                            <div x-show="posDetail.guardian?.hold_rationale"><span class="ico" x-html="icon('hourglass')"></span><p><b>Perché lo tiene: </b><span x-text="posDetail.guardian?.hold_rationale"></span></p></div>
+                            <div x-show="posDetail.guardian?.exit_reason"><span class="ico" x-html="icon('hand-coins')"></span><p><b>Cosa ha già venduto: </b><span x-text="posDetail.guardian?.exit_reason"></span></p></div>
+                        </div>
+                        <details class="more">
+                            <summary>Dettagli tecnici</summary>
+                            <div class="tech">
+                                <p x-text="(posDetail.stop_loss?.source || '') + (posDetail.stop_loss?.pct != null ? ' (' + posDetail.stop_loss.pct + '%)' : '')"></p>
+                                <template x-if="posDetail.rationale?.agents">
+                                    <table class="n"><tbody>
+                                        <template x-for="row in agentRows(posDetail.rationale.agents)" :key="row.name">
+                                            <tr><td x-text="row.name"></td><td x-text="row.score"></td><td x-text="row.detail"></td></tr>
+                                        </template>
+                                    </tbody></table>
+                                </template>
+                                <p x-show="posDetail.rationale?.desk_cio" x-text="posDetail.rationale?.desk_cio ? 'Decisione: ' + posDetail.rationale.desk_cio.reason : ''"></p>
+                                <p x-show="!posDetail.rationale">Nessuna motivazione registrata: il titolo è stato comprato prima che esistesse il registro.</p>
                             </div>
-                            <div class="border border-zinc-800 rounded p-3">
-                                <div class="text-[11px] uppercase tracking-wider text-zinc-500 font-sans">Target 1 (3R)</div>
-                                <div class="text-emerald-500" x-text="posDetail.take_profit.price ? price(posDetail.take_profit.price) + (posDetail.take_profit.pct != null ? ' (+' + posDetail.take_profit.pct + '%)' : '') : '—'"></div>
-                                <div class="text-[11px] text-zinc-500 font-sans" x-text="posDetail.take_profit.label || 'target del Comitato Rischi / Agente #3'"></div>
-                            </div>
-                        </div>
-
-                        <div class="space-y-1.5" x-show="posDetail.guardian">
-                            <div class="text-[11px] uppercase tracking-wider text-zinc-500">Schede del Guardian
-                                <span class="normal-case tracking-normal text-zinc-600" x-text="[posDetail.guardian?.trade_class, posDetail.guardian?.horizon].filter(Boolean).join(' · ')"></span></div>
-                            <div><span class="text-indigo-400">buy_thesis · </span><span class="text-zinc-300" x-text="posDetail.guardian?.buy_thesis || '—'"></span></div>
-                            <div><span class="text-amber-300">hold_rationale · </span><span class="text-zinc-300" x-text="posDetail.guardian?.hold_rationale || '—'"></span>
-                                <span class="text-zinc-600 num" x-show="posDetail.guardian?.hold_updated_at" x-text="'(' + dateTime(posDetail.guardian?.hold_updated_at) + ')'"></span></div>
-                            <div><span class="text-red-500">exit_reason · </span><span class="text-zinc-300" x-text="posDetail.guardian?.exit_reason || 'nessuna uscita (posizione intera)'"></span></div>
-                        </div>
-
-                        <div>
-                            <div class="text-[11px] uppercase tracking-wider text-zinc-500 mb-2">Motivazione d'ingresso
-                                <span class="normal-case tracking-normal text-zinc-600" x-show="posDetail.rationale_source" x-text="'· ' + posDetail.rationale_source"></span></div>
-                            <template x-if="!posDetail.rationale">
-                                <div class="text-zinc-500">Nessun rationale registrato per questa posizione (aperta prima del registro operazioni).</div>
-                            </template>
-                            <template x-if="posDetail.rationale">
-                                <div class="space-y-2">
-                                    <template x-if="posDetail.rationale.agents">
-                                        <table class="w-full num">
-                                            <tbody class="divide-y divide-zinc-800/70">
-                                                <template x-for="row in agentRows(posDetail.rationale.agents)" :key="row.name">
-                                                    <tr><td class="py-1.5 pr-3 text-zinc-400 font-sans" x-text="row.name"></td>
-                                                        <td class="py-1.5 pr-3 text-right text-zinc-100" x-text="row.score"></td>
-                                                        <td class="py-1.5 text-zinc-400" x-text="row.detail"></td></tr>
-                                                </template>
-                                            </tbody>
-                                        </table>
-                                    </template>
-                                    <div x-show="posDetail.rationale.desk_cio" class="text-zinc-400">
-                                        <span class="text-amber-300">CIO del desk</span>
-                                        <span x-text="posDetail.rationale.desk_cio ? ('(' + posDetail.rationale.desk_cio.source + ', convinzione ' + posDetail.rationale.desk_cio.conviction + ', allocazione ' + posDetail.rationale.desk_cio.allocation_pct + '%): ' + posDetail.rationale.desk_cio.reason) : ''"></span>
-                                    </div>
-                                    <div x-show="posDetail.rationale.risk_package?.reason" class="text-zinc-500" x-text="'Comitato Rischi: ' + (posDetail.rationale.risk_package?.reason || '')"></div>
-                                </div>
-                            </template>
-                        </div>
+                        </details>
                     </div>
                 </template>
             </div>
-            <div class="px-5 py-3 border-t border-zinc-800 flex items-center justify-between gap-3 sticky bottom-0 bg-[#121215]">
-                <span class="text-[11px] num" :class="posNoticeError ? 'text-red-500' : 'text-emerald-500'" x-text="posNotice"></span>
-                <div class="flex gap-2">
-                    <button @click="showPosition = false" class="btn">Chiudi</button>
-                    <button @click="deRisk(posDetail?.position)" :disabled="!posDetail || !canDeRisk({...posDetail.position, scaled_out: !!posDetail.guardian?.scale_out}) || deRisking" class="btn">🛡️ Attiva Rischio Zero</button>
-                    <button @click="sellNow()" :disabled="selling || !posDetail" class="btn btn-danger">🔴 VENDI SUBITO</button>
-                </div>
-            </div>
+            <footer>
+                <span class="note" :class="posNoticeError ? 'down-t' : 'up-t'" x-text="posNotice"></span>
+                <button @click="deRisk(posDetail?.position)" class="k-btn"
+                        :disabled="!posDetail || !canDeRisk({...posDetail.position, scaled_out: !!posDetail.guardian?.scale_out}) || deRisking"
+                        title="Disponibile solo se il titolo è in guadagno">
+                    <span class="ico" x-html="icon('shield-check')"></span>Metti al sicuro il guadagno</button>
+                <button class="q" @click="help('rischiozero')" aria-label="Cosa fa">?</button>
+                <button @click="sellNow()" :disabled="selling || !posDetail" class="k-btn danger">Vendi subito</button>
+            </footer>
         </div>
     </div>
 
-    <!-- ============ STORICO OFFLINE ============ -->
-    <div x-cloak x-show="showHistory" x-transition:enter="t-enter" x-transition:enter-start="t-pop-from" x-transition:enter-end="t-to" x-transition:leave="t-leave" x-transition:leave-start="t-to" x-transition:leave-end="t-fade-from" class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:pt-20"
-         @keydown.escape.window="showHistory = false">
-        <div class="modal-backdrop" @click="showHistory = false"></div>
-        <div class="relative w-full max-w-5xl max-h-[85vh] overflow-y-auto scroll-thin modal">
-            <div class="px-5 py-3 border-b border-zinc-800 flex items-center justify-between gap-3 sticky top-0 bg-[#121215]">
-                <h2 class="text-sm font-semibold text-zinc-100">📜 Storico Offline</h2>
-                <div class="flex items-center gap-3 text-xs">
-                    <label class="flex items-center gap-1.5 text-zinc-400">
-                        <input type="checkbox" x-model="historyOffline" @change="loadHistory()" class="h-3.5 w-3.5 accent-indigo-500"> solo operazioni offline
-                    </label>
-                    <button @click="showHistory = false" class="h-7 w-7 rounded hover:bg-zinc-800 text-zinc-400 inline-flex items-center justify-center" title="Chiudi">✕</button>
-                </div>
-            </div>
-            <div class="p-5 text-xs">
-                <div class="mb-3 text-zinc-500 num" x-text="historySummary()"></div>
-                <div class="overflow-x-auto scroll-thin">
-                    <table class="w-full">
-                        <thead>
-                            <tr class="border-b border-zinc-800 text-zinc-500 text-left">
-                                <th class="font-medium py-2 pr-3">Data</th><th class="font-medium py-2 pr-3">Simbolo</th>
-                                <th class="font-medium py-2 pr-3">Operazione</th><th class="font-medium py-2 pr-3 text-right">Prezzo</th>
-                                <th class="font-medium py-2 pr-3 text-right">Quantità</th><th class="font-medium py-2 pr-3 text-right">PnL realizzato</th>
-                                <th class="font-medium py-2">Rationale</th>
+    <!-- ============ STORICO ============ -->
+    <div x-cloak x-show="showHistory" class="overlay" @keydown.escape.window="showHistory = false" role="dialog" aria-modal="true">
+        <div class="backdrop" @click="showHistory = false"></div>
+        <div class="dialog wide">
+            <header><h2>Storico delle operazioni</h2><button class="x" @click="showHistory = false" aria-label="Chiudi">✕</button></header>
+            <div class="body">
+                <label class="toggle" style="padding:10px 14px">
+                    <span>Mostra solo quello che è successo mentre non guardavi</span>
+                    <input type="checkbox" x-model="historyOffline" @change="loadHistory()">
+                </label>
+                <p class="quiet n" style="margin:0" x-text="historySummary()"></p>
+                <table class="hist n">
+                    <thead><tr><th>Quando</th><th>Titolo</th><th>Cosa</th><th>Prezzo</th><th>Guadagno</th><th>Perché</th></tr></thead>
+                    <tbody>
+                        <template x-if="!historyRows.length">
+                            <tr><td colspan="6" class="quiet" x-text="historyLoading ? 'Sto caricando…' : 'Nessuna operazione registrata.'"></td></tr>
+                        </template>
+                        <template x-for="h in historyRows" :key="h.id">
+                            <tr>
+                                <td class="faint" x-text="dateTime(h.timestamp)"></td>
+                                <td><b x-text="h.symbol"></b></td>
+                                <td :class="h.side === 'BUY' ? '' : 'down-t'" x-text="h.side === 'BUY' ? 'Comprato' : 'Venduto'"></td>
+                                <td x-text="price(h.price)"></td>
+                                <td :class="toneClass(h.realized_pnl)" x-text="h.realized_pnl != null ? usd(h.realized_pnl, true) : ''"></td>
+                                <td class="wide" x-text="rationaleText(h)"></td>
                             </tr>
-                        </thead>
-                        <tbody class="divide-y divide-zinc-800/70 num">
-                            <template x-if="!historyRows.length">
-                                <tr><td colspan="7" class="py-4 text-zinc-500 font-sans" x-text="historyLoading ? 'Caricamento…' : 'Nessuna operazione registrata.'"></td></tr>
-                            </template>
-                            <template x-for="h in historyRows" :key="h.id">
-                                <tr class="align-top">
-                                    <td class="py-2 pr-3 text-zinc-400 whitespace-nowrap" x-text="dateTime(h.timestamp)"></td>
-                                    <td class="py-2 pr-3 text-zinc-100" x-text="h.symbol"></td>
-                                    <td class="py-2 pr-3 whitespace-nowrap" :class="h.side === 'BUY' ? 'text-emerald-500' : 'text-red-500'"
-                                        x-text="h.operation + (h.executed_offline ? '' : ' · online')"></td>
-                                    <td class="py-2 pr-3 text-right text-zinc-300" x-text="price(h.price)"></td>
-                                    <td class="py-2 pr-3 text-right text-zinc-300" x-text="h.quantity != null ? qty(h.quantity) : (h.notional != null ? usd(h.notional) : '—')"></td>
-                                    <td class="py-2 pr-3 text-right" :class="tone(h.realized_pnl)" x-text="h.realized_pnl != null ? usd(h.realized_pnl, true) : '—'"></td>
-                                    <td class="py-2 text-zinc-400 font-sans" x-text="rationaleText(h)"></td>
-                                </tr>
-                            </template>
-                        </tbody>
-                    </table>
-                </div>
+                        </template>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
