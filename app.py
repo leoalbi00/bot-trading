@@ -1142,6 +1142,33 @@ def api_history():
     limit = max(1, min(request.args.get("limit", default=200, type=int), 1000))
     return jsonify({"executions": core.list_executions(offline_only=offline, limit=limit)})
 
+@app.route("/api/orders")
+@require_login
+def api_orders():
+    """Storico ordini Alpaca dal giorno ?since=AAAA-MM-GG (default: 30 giorni fa), anche core SPY e ordini manuali.
+
+    ?symbol=SPY filtra un titolo. In "summary" i totali comprati/venduti per origine (core SPY, bot, altro).
+    """
+    import datetime as dt
+    raw = request.args.get("since")
+    try:
+        since = dt.date.fromisoformat(raw) if raw else dt.date.today() - dt.timedelta(days=30)
+    except ValueError:
+        return jsonify({"status": "error", "message": "since deve essere una data nel formato AAAA-MM-GG"}), 400
+    rows = core.order_history(since, symbol=request.args.get("symbol") or None, log=log_message)
+    if rows is None:
+        return jsonify({"status": "error", "message": "Storico ordini non leggibile da Alpaca"}), 503
+    summary = {}
+    for r in rows:
+        s = summary.setdefault(r["source"], {"orders": 0, "bought_usd": 0.0, "sold_usd": 0.0})
+        s["orders"] += 1
+        if r["status"] == "filled" and r["filled_qty"] and r["filled_avg_price"]:
+            value = round(r["filled_qty"] * r["filled_avg_price"], 2)
+            s["bought_usd" if r["side"] == "BUY" else "sold_usd"] += value
+    for s in summary.values():
+        s["bought_usd"], s["sold_usd"] = round(s["bought_usd"], 2), round(s["sold_usd"], 2)
+    return jsonify({"since": since.isoformat(), "count": len(rows), "summary": summary, "orders": rows})
+
 @app.route("/api/audit")
 @require_login
 def api_audit():

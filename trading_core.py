@@ -1713,6 +1713,50 @@ def drawdown_controller(account, state, log=print):
 
 
 # ---------------- Post-Trade Auditor ----------------
+def order_history(since, symbol=None, log=print):
+    """Tutti gli ordini Alpaca inviati dal giorno `since` (date), compresi quelli del core SPY e quelli manuali.
+
+    È il registro permanente di cosa ha fatto il conto: i log del bot stanno in memoria e si perdono a ogni riavvio.
+    Restituisce una lista di dict in ordine cronologico, oppure None se Alpaca non è configurato o non risponde.
+    """
+    if not alpaca_client:
+        return None
+    from datetime import datetime, time as dtime, timezone
+    after = datetime.combine(since, dtime.min, tzinfo=timezone.utc)
+    orders, seen = [], set()
+    try:
+        while True:
+            page = alpaca_client.get_orders(GetOrdersRequest(
+                status=QueryOrderStatus.ALL, limit=500, direction="asc", after=after))
+            fresh = [o for o in page if o.id not in seen]
+            seen.update(o.id for o in fresh)
+            orders.extend(fresh)
+            if len(page) < 500 or not fresh:
+                break
+            after = max(o.submitted_at for o in page)
+    except Exception as e:
+        log(f"Errore lettura storico ordini: {e}")
+        return None
+    want = normalize_symbol(symbol) if symbol else None
+    num = lambda v: float(v) if v not in (None, "") else None
+    iso = lambda t: t.isoformat() if hasattr(t, "isoformat") else None
+    rows = []
+    for o in orders:
+        if want and normalize_symbol(o.symbol) != want:
+            continue
+        cid = o.client_order_id or ""
+        source = ("core SPY" if cid.startswith(core_alloc.CORE_ORDER_PREFIX)
+                  else "bot" if cid.startswith(ORDER_TAG_PREFIX) else "altro")
+        rows.append({
+            "id": str(o.id), "symbol": o.symbol, "side": str(getattr(o.side, "value", o.side)).upper(),
+            "source": source, "status": str(getattr(o.status, "value", o.status)),
+            "submitted_at": iso(o.submitted_at), "filled_at": iso(o.filled_at),
+            "notional": num(o.notional), "qty": num(o.qty), "filled_qty": num(o.filled_qty),
+            "filled_avg_price": num(o.filled_avg_price), "client_order_id": cid,
+        })
+    return rows
+
+
 def sync_ledger(days=90, log=print):
     """Ricostruisce dagli ordini Alpaca eseguiti (FIFO) i trade chiusi e le posizioni aperte.
 
