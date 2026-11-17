@@ -1,9 +1,9 @@
 /* =============================================================================
-   PRO DESK — design system institutional dark (TradingView Dark / Linear / Vercel).
-   Superfici opache, bordi da 1px, nessun bagliore; solo micro-transizioni da 150ms.
+   PRO DESK — stile scuro della vista tecnica, usato solo dentro la "Sala macchine" (.engine).
+   Il resto della dashboard usa chiaro.css.
    ============================================================================= */
 
-:root {
+.engine {
     --bg: #09090b;
     --surface: #121215;
     --surface-2: #18181b;
@@ -19,8 +19,14 @@
     --ease: 150ms ease-out;
 }
 
-[x-cloak] { display: none !important; }
-body { background: var(--bg); color: var(--text); font-feature-settings: "cv11", "ss01"; }
+.engine { background: var(--bg); color: var(--text); font-feature-settings: "cv11", "ss01"; }
+
+/* Reset minimo (come il preflight di Tailwind) limitato alla Sala macchine: specificità zero, le classi vincono */
+:where(.engine) *, :where(.engine) *::before, :where(.engine) *::after { box-sizing: border-box; border-width: 0; border-style: solid; border-color: #27272a; }
+:where(.engine) button, :where(.engine) input, :where(.engine) select { font: inherit; color: inherit; background: transparent; padding: 0; margin: 0; cursor: pointer; }
+:where(.engine) h2, :where(.engine) h3, :where(.engine) p, :where(.engine) ul, :where(.engine) ol, :where(.engine) dl, :where(.engine) dd { margin: 0; padding: 0; font-size: inherit; font-weight: inherit; }
+:where(.engine) ul, :where(.engine) ol { list-style: none; }
+:where(.engine) table { border-collapse: collapse; }
 
 .num, .mono { font-family: 'JetBrains Mono', 'Roboto Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
 details > summary { list-style: none; }

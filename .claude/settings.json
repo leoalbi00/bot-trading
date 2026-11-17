@@ -9,6 +9,15 @@
             "timeout": 20
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v graphify >/dev/null 2>&1 || pip install -q graphifyy==0.9.108 >/dev/null 2>&1 || true",
+            "timeout": 180
+          }
+        ]
       }
     ],
     "PreToolUse": [
