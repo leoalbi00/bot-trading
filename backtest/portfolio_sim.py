@@ -79,14 +79,28 @@ class Market:
         self.spy_50 = (spy > spy.ewm(span=50).mean()).shift(1)
         self.btc_up = (btc > btc.ewm(span=100).mean()).shift(1)
         self.vix = close["^VIX"].shift(1)
+        # VIX barra per barra (le ore senza borsa USA, es. crypto di notte, tengono l'ultimo valore): serve all'uscita VIX
+        self.vix_h = pd.Series(hourly["^VIX"]["Close"].values, dtype=float).ffill().values
         self.close = close
 
 
-def enter(pos, sym, price, amount, stop, target_r, trail, ts):
+def enter(pos, sym, price, amount, stop, target_r, trail, ts, vix0=None):
     crypto = sym in CRYPTO
     fill = price * (1 + COST[crypto])
     pos[sym] = {"q": amount / fill, "entry": fill, "stop": fill * (1 - stop), "target": fill * (1 + target_r * stop),
-                "scaled": False, "peak": fill, "trail": trail, "last": price, "t0": ts}
+                "scaled": False, "peak": fill, "trail": trail, "last": price, "t0": ts, "vix0": vix0}
+
+
+VIX_EXIT_GUARDIAN = {"panic": 28.0, "spike_level": 25.0, "spike_pct": 20.0}   # agents/agent_06_sentinel.py (NEWS_SHOCK)
+
+
+def vix_shock(vix, vix0, rule):
+    """Uscita NEWS_SHOCK del Guardian: VIX >= panic, oppure VIX >= spike_level e salito di spike_pct% dall'ingresso."""
+    if rule is None or vix is None or np.isnan(vix):
+        return False
+    if vix >= rule["panic"]:
+        return True
+    return bool(vix0) and vix >= rule["spike_level"] and vix > vix0 * (1 + rule["spike_pct"] / 100)
 
 
 def effective_stop(sym, p):
@@ -98,7 +112,7 @@ def effective_stop(sym, p):
     return max(p["stop"], p["entry"] * (1 + FEE_BUFFER[sym in CRYPTO]), p["peak"] * (1 - p["trail"]))
 
 
-def simulate(market, mode, start, end, signals=None):
+def simulate(market, mode, start, end, signals=None, vix_exit=None):
     """mode "attuale": 4 posizioni, 50%, allocazione fissa, stop 1.2-3.5% su signals; "allocatore": Portfolio Allocator."""
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     days = pd.DatetimeIndex(market.idx.tz_convert(TZ)).normalize().tz_localize(None)
@@ -116,6 +130,11 @@ def simulate(market, mode, start, end, signals=None):
                 continue
             p["last"], p["peak"] = c, max(p["peak"], h)
             cost = COST[sym in CRYPTO]
+            if vix_shock(market.vix_h[i], p.get("vix0"), vix_exit):   # liquidazione alla chiusura della barra
+                cash += p["q"] * c * (1 - cost)
+                closed.append((c * (1 - cost) / p["entry"] - 1) * 100)
+                del pos[sym]
+                continue
             stop = effective_stop(sym, p)
             if l <= stop:
                 fill = min(o, stop) * (1 - cost)
@@ -171,7 +190,8 @@ def entries_allocator(market, pos, cash, equity, peak, i, day, ts):
                               rank=rank[sym], crypto=crypto,
                               crypto_exposure=sum(p["q"] * p["last"] for k, p in pos.items() if k in CRYPTO))
         if sized["amount"]:
-            enter(pos, sym, price, sized["amount"], stop / 100, pa.TARGET_R, pa.TRAIL_ATR_MULT * atr / 100, ts)
+            enter(pos, sym, price, sized["amount"], stop / 100, pa.TARGET_R, pa.TRAIL_ATR_MULT * atr / 100, ts,
+                  vix0=market.vix_h[i])
             cash -= sized["amount"]
         elif "budget" in sized["reason"]:
             break
@@ -205,6 +225,7 @@ if __name__ == "__main__":
     args = argparse.ArgumentParser()
     args.add_argument("--cache", default=None)
     args.add_argument("--signals", default=None, help="pickle {giorno: [ticker]} con i segnali Q>=70 per la logica attuale")
+    args.add_argument("--vix-exit", action="store_true", help="confronta anche l'uscita NEWS_SHOCK del Guardian (VIX)")
     opts = args.parse_args()
     market = Market(load_data(opts.cache))
     signals = pd.read_pickle(opts.signals) if opts.signals else None
@@ -214,3 +235,5 @@ if __name__ == "__main__":
         if signals is not None:
             print("  attuale   ", stats(*simulate(market, "attuale", start, end, signals)))
         print("  allocatore", stats(*simulate(market, "allocatore", start, end)))
+        if opts.vix_exit:
+            print("  + uscita VIX", stats(*simulate(market, "allocatore", start, end, vix_exit=VIX_EXIT_GUARDIAN)))
