@@ -2650,6 +2650,11 @@ def _review_context(macro):
     return ctx
 
 
+def _fmt_pct(value):
+    """Percentuale con segno, o "n/d" se il dato manca (es. VWAP all'apertura, con la prima candela a volume zero)."""
+    return "n/d" if value is None else f"{value:+.2f}%"
+
+
 def risk_committee(pitch, ctx, fng):
     """Tier 3: i 3 gatekeeper valutano la scheda in parallelo; un solo veto basta per respingerla."""
     started = time.perf_counter()
@@ -2692,7 +2697,7 @@ def risk_committee(pitch, ctx, fng):
                    "trade_class": quant_gate.get("trade_class"), "horizon": quant_gate.get("horizon"),
                    "buy_thesis": quant_gate.get("buy_thesis"),
                    "reason": f"{pitch['sector']}: {', '.join(pitch['anomalies'])}; MTF {pitch['mtf_aligned']}/3, "
-                             f"RVOL {pitch['rvol']}x, VWAP {pitch['vwap_dist_pct']:+.2f}%, stop {stop:.1f}% (ATR)"}
+                             f"RVOL {pitch['rvol']}x, VWAP {_fmt_pct(pitch.get('vwap_dist_pct'))}, stop {stop:.1f}% (ATR)"}
     return {"approved": not vetoes, "gates": gates, "vetoes": vetoes, "score": score, "audit": audit_note,
             "ensemble": quant_gate.get("ensemble_score"), "trade_class": quant_gate.get("trade_class"),
             "package": package, "elapsed_ms": round((time.perf_counter() - started) * 1000, 1)}
@@ -3076,7 +3081,7 @@ def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
             f"  - {p['symbol']} [{p['sector']}] ENSEMBLE {p.get('ensemble')} ({p.get('trade_class') or 'STANDARD'}), "
             f"score tecnico {p['score']}, anomalie: {', '.join(p['anomalies'])}\n"
             f"      Tesi: {(p.get('package') or {}).get('buy_thesis') or 'N/D'}\n"
-            f"      MTF: {mtf} | RVOL {p['rvol']}x | VWAP {p['vwap_dist_pct']:+.2f}% | beta {p['beta']} corr {p['corr']}\n"
+            f"      MTF: {mtf} | RVOL {p['rvol']}x | VWAP {_fmt_pct(p.get('vwap_dist_pct'))} | beta {p['beta']} corr {p['corr']}\n"
             f"      Comitato: {gates}\n"
             f"      Target ${p['package']['target_price']:,.4f}, stop {p['package']['stop_pct']:.1f}% "
             f"(scade tra {max(0, int((p['expires_epoch'] - _now_epoch()) / 60))} min)")
@@ -3818,11 +3823,13 @@ def _audit_stages(engine, sym, frame, cycle_start, meta):
                         stop_pct=stop_pct, agents=r)
 
 
-def refresh_held_evaluations(held_yf, log=print):
+def refresh_held_evaluations(held_yf, log=print, exposure_usd=None, positions_count=None):
     """Valuta subito con i 7 agenti le posizioni aperte (uscite anticipate dell'Agente #6 e tesi degradate), senza filtri di Stage.
 
     Non attende mai lo sciame: se un ciclo della pipeline è in corso lo salta, perché quel ciclo valuta già le
     posizioni aperte (forzate fino allo Stage 3). Così Guardian e CIO non restano bloccati.
+    exposure_usd e positions_count: capitale investito e numero di posizioni, perché l'Agente #3 valuti i limiti
+    reali (senza, vedeva esposizione 0%).
     """
     held_yf = list(dict.fromkeys(held_yf))
     if not held_yf or _quant_lock.locked():
@@ -3830,7 +3837,8 @@ def refresh_held_evaluations(held_yf, log=print):
     frames = _download(held_yf, "3mo", "1h")
     try:
         stream_scouts_to_agents([(0, s, frames.get(s)) for s in held_yf], latest_channels().get("macro") or {},
-                                crypto_fear_greed(), held_keys=held_yf, log=log, force=held_yf, blocking=False)
+                                crypto_fear_greed(), held_keys=held_yf, log=log, force=held_yf, blocking=False,
+                                exposure_usd=exposure_usd, positions_count=positions_count)
     except Exception as e:
         log(f"⚠️ [Agente #6] Valutazione delle posizioni aperte non riuscita: {type(e).__name__}: {e}")
 

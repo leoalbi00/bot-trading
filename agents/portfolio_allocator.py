@@ -18,7 +18,7 @@ MAX_GROSS_PCT = 95.0           # esposizione massima con regime favorevole (mai 
 CASH_FLOOR_PCT = 3.0           # liquidità minima sempre disponibile
 MAX_POSITION_PCT = 15.0        # taglia massima di una posizione
 MAX_CRYPTO_PCT = 20.0          # esposizione crypto massima
-MAX_POSITIONS = 15             # limite operativo: la capacità reale la decide la heat
+MAX_POSITIONS = 5              # poche posizioni ma piene (11/2026: da 15 a 5); la capacità reale la decide la heat
 MIN_POSITION_PCT = 1.0         # sotto questa taglia il trade non vale i costi
 
 STOP_ATR_MULT = 3.0            # stop = 3 x ATR% giornaliero nella fascia sotto
