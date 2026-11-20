@@ -4052,7 +4052,7 @@ if __name__ == "__main__":
 
     def _sim_groq(system, prompt):
         if "Ticker: MSFT" in prompt:
-            time.sleep(2.5)                      # oltre il limite dell'Agente #7: News Score neutro
+            time.sleep(GROQ_TIMEOUT_S + 0.5)     # oltre il limite dell'Agente #7: News Score neutro
         bullish = "beats estimates" in prompt
         return json.dumps({"impact_score": 0.85 if bullish else 0.05, "novelty_index_minutes": 4,
                            "catalyst_type": "EARNINGS" if bullish else "MACRO",

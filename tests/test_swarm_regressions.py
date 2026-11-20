@@ -119,3 +119,19 @@ def test_idle_scouts_are_not_stalled():
     busy.runs, busy.busy_since = 5, time.time() - 900
     assert swarm.stalled_scouts(600) == [busy]
     swarm.shutdown()
+
+
+def test_groq_guard_not_blocked_by_abandoned_slow_calls():
+    """Le chiamate oltre il limite restano in esecuzione: non devono far scadere in coda quelle successive."""
+    import threading
+    import time
+    from agents.agent_07_chop import ChopWatchdog
+    guard = ChopWatchdog(llm_timeout_s=0.5)
+    slow = [threading.Thread(target=guard.guarded_llm_call, args=(lambda: time.sleep(1.5),)) for _ in range(8)]
+    for t in slow:
+        t.start()
+    time.sleep(0.1)
+    assert guard.guarded_llm_call(lambda: "ok") == "ok"
+    for t in slow:
+        t.join()
+    assert guard.llm_stats["timeouts"] == 8 and guard.llm_stats["ok"] == 1

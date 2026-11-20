@@ -66,17 +66,28 @@ class ChopWatchdog:
         self.llm_timeout_s = llm_timeout_s
         self.llm_stats = {"calls": 0, "ok": 0, "timeouts": 0, "errors": 0}
         self.llm_ms: Deque[float] = deque(maxlen=200)
-        self._llm_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="groq-guard")
+        # 16 thread: una chiamata oltre il limite viene abbandonata ma resta in esecuzione fino al timeout HTTP;
+        # con 8 thread le chiamate abbandonate occupavano il pool e quelle nuove scadevano in coda
+        self._llm_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="groq-guard")
 
     # ------------------------------------------------------------------ Groq: timeout massimo GROQ_TIMEOUT_S
     def guarded_llm_call(self, fn: Callable[..., Any], *args, **kwargs) -> Optional[Any]:
         """Esegue fn con un limite di llm_timeout_s secondi: None su timeout o eccezione (registrati)."""
         with self._lock:
             self.llm_stats["calls"] += 1
-        started = time.perf_counter()
-        future = self._llm_pool.submit(fn, *args, **kwargs)
+        began = threading.Event()
+        started = [time.perf_counter()]
+
+        def run():
+            started[0] = time.perf_counter()   # il limite vale dall'inizio della chiamata, non dall'attesa in coda
+            began.set()
+            return fn(*args, **kwargs)
+
+        future = self._llm_pool.submit(run)
         try:
-            result = future.result(timeout=self.llm_timeout_s)
+            if not began.wait(self.llm_timeout_s):   # nessun thread libero entro il limite
+                raise FutureTimeout()
+            result = future.result(timeout=max(0.0, self.llm_timeout_s - (time.perf_counter() - started[0])))
         except FutureTimeout:
             future.cancel()
             with self._lock:
@@ -89,7 +100,7 @@ class ChopWatchdog:
             return None
         with self._lock:
             self.llm_stats["ok"] += 1
-            self.llm_ms.append((time.perf_counter() - started) * 1000)
+            self.llm_ms.append((time.perf_counter() - started[0]) * 1000)
         return result
 
     # ------------------------------------------------------------------ telemetria
