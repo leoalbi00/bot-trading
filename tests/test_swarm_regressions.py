@@ -43,3 +43,24 @@ def test_cio_prompt_accepts_unknown_vwap():
     account = {"equity": 100000.0, "exposure": 0.0, "funds": 95000.0}
     prompt = core.build_desk_cio_prompt([pitch], [], account, {}, core.get_config())
     assert "VWAP n/d" in prompt
+
+
+def _long_pitch(i):
+    gate = {"agent": "Technical & Liquidity", "detail": "RVOL 2.3x, MTF 3/3, RSI 1h 61, 4h 58, 1d 63, prezzo sopra il VWAP, "
+                                                         "liquidità ok, spread ok, nessuna trappola RSI, ROC sotto la soglia " * 2}
+    return {"symbol": f"T{i:02d}", "sector": "Healthcare", "ensemble": 70 + i, "trade_class": "STANDARD", "score": 80,
+            "anomalies": ["breakout"], "mtf": {"1h": {"bullish": True, "rsi": 61}}, "rvol": 2.3, "vwap_dist_pct": 0.4,
+            "beta": 1.1, "corr": 0.5, "review": {"gates": [gate] * 4}, "expires_epoch": 0,
+            "package": {"buy_thesis": "Tesi lunga " * 20, "target_price": 250.0, "stop_pct": -6.5}}
+
+
+def test_cio_prompt_fits_groq_free_tier_with_many_pitches():
+    """Con molte schede il prompt superava gli 8.000 token al minuto di Groq (errore 413): ora resta nel budget."""
+    account = {"equity": 95000.0, "exposure": 20000.0, "funds": 70000.0}
+    holdings = [{"symbol": f"H{i}", "market_value": 2000, "weight_pct": 2.0, "pnl_pct": 1.0, "thesis_note": "x"} for i in range(13)]
+    prompt = core.build_desk_cio_prompt([_long_pitch(i) for i in range(30)], holdings, account, {}, core.get_config())
+    total = core.estimate_tokens(prompt + core.DESK_CIO_SYSTEM_PROMPT) + core.CIO_LLM_MAX_TOKENS
+    assert total <= core.CIO_PROMPT_TOKEN_BUDGET < 8000
+    assert "T29" in prompt and "T28" in prompt          # le schede con l'Ensemble più alto restano
+    assert "T00 " not in prompt and "T10 " not in prompt  # le più deboli no
+    assert sum(line.startswith("  - T") for line in prompt.splitlines()) <= core.CIO_PROMPT_MAX_PITCHES
