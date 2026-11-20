@@ -138,7 +138,7 @@ class ChopWatchdog:
         actions = []
         if swarm is not None:
             for scout in swarm.stalled_scouts(self.scout_silence_s):
-                swarm.restart_scout(scout, f"nessun heartbeat da {self.scout_silence_s:.0f}s")
+                swarm.restart_scout(scout, f"scansione in corso da oltre {self.scout_silence_s:.0f}s")
                 actions.append(f"riavviato Scout {scout.label}")
         if engine is not None:
             add = self.needs_more_workers(self.queue_now, engine.num_workers)

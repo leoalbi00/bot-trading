@@ -76,3 +76,46 @@ def test_news_llm_limit_matches_measured_groq_latency():
     assert guard.guarded_llm_call(lambda: "ok") == "ok"
     assert guard.guarded_llm_call(lambda: time.sleep(0.5) or "tardi") is None
     assert guard.llm_stats["timeouts"] == 1
+
+
+def test_scout_timeout_ignores_waiting_in_queue(monkeypatch):
+    """Il timeout degli Scout misurava anche l'attesa in coda sui thread: con la CPU di Render 2/3 dei segnali
+    andavano persi e gli Scout venivano "riavviati" migliaia di volte senza essere bloccati."""
+    import asyncio
+    import time
+    import scouts.swarm as swm
+    real_scan = swm.Scout.scan
+
+    def slow_scan(self, df, book):          # 50 ms per scansione: ben sotto il timeout, ma 60 lavori su 2 thread
+        time.sleep(0.05)
+        return real_scan(self, df, book)
+
+    monkeypatch.setattr(swm.Scout, "scan", slow_scan)
+    import numpy as np
+    import pandas as pd
+    close = 100 + np.cumsum(np.random.default_rng(1).normal(0, 1, 120))
+    df = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": np.full(120, 1e6)})
+    swarm = swm.ScoutSwarm(size=60, timeout_s=0.3, threads=2)
+    queue = asyncio.Queue()
+    asyncio.run(swarm.stream([{"symbol": f"T{i}", "df_ohlcv": df, "order_book": {}} for i in range(10)], queue))
+    swarm.shutdown()
+    signals = []
+    while not queue.empty():
+        item = queue.get_nowait()
+        if item:
+            signals += item["scout_signals"]
+    assert len(signals) == 60
+    assert swarm.restarts == 0 and not any(s.get("detail") == "timeout" for s in signals)
+
+
+def test_idle_scouts_are_not_stalled():
+    """Uno Scout senza lavoro da 10 minuti è solo inattivo (blocchi piccoli, mercato chiuso): non va riavviato.
+    È bloccato solo se ha una scansione in corso da troppo tempo."""
+    import time
+    from scouts.swarm import ScoutSwarm
+    swarm = ScoutSwarm(size=6, threads=1)
+    idle, busy = swarm.scouts[0], swarm.scouts[1]
+    idle.runs, idle.last_heartbeat = 5, time.time() - 3600
+    busy.runs, busy.busy_since = 5, time.time() - 900
+    assert swarm.stalled_scouts(600) == [busy]
+    swarm.shutdown()
