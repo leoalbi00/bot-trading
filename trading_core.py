@@ -536,7 +536,7 @@ from agents import core_allocation as core_alloc
 def groq_news_llm(system, prompt):
     """Agente #4 -> Groq con output JSON rigoroso. Testo della risposta o None (nessuna chiave / errore).
 
-    Il limite di 2.0 s è doppio: timeout del client HTTP e guard dell'Agente #7 (guarded_llm_call).
+    Il limite GROQ_TIMEOUT_S (4 s) è doppio: timeout del client HTTP e guard dell'Agente #7 (guarded_llm_call).
     """
     global _groq_client
     if not GROQ_KEY:
@@ -568,7 +568,7 @@ def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024,
     """Prova i modelli Groq in sequenza; restituisce il testo o None. Gli errori vengono loggati.
 
     `validate` scarta le risposte nel formato sbagliato (es. rifiuti) e passa al modello successivo.
-    timeout: secondi per chiamata (default GROQ_TIMEOUT_S = 2 s del client, pensato per i giudizi brevi sulle
+    timeout: secondi per chiamata (default GROQ_TIMEOUT_S = 4 s del client, pensato per i giudizi brevi sulle
     notizie); deadline (time.monotonic()): budget totale, oltre il quale non si provano altri modelli.
     """
     global _groq_client
@@ -578,7 +578,7 @@ def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024,
     try:
         import groq
         if _groq_client is None:
-            # Agente #7: nessuna chiamata a Groq può superare GROQ_TIMEOUT_S (2.0 s)
+            # Agente #7: nessuna chiamata a Groq può superare GROQ_TIMEOUT_S (4 s di default)
             _groq_client = groq.Groq(api_key=GROQ_KEY, timeout=GROQ_TIMEOUT_S, max_retries=0)
     except Exception as e:
         log(f"❌ Impossibile inizializzare il client Groq: {e}")

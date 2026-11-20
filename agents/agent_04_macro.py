@@ -10,7 +10,7 @@ Due compiti:
    - notizie più vecchie di 30 minuti (novelty > 30) valgono Impact 0;
    - Groq fa da VALIDATORE e FILTRO DI VETO: notizia negativa -> VETO; notizia assente, vecchia o speculativa ->
      News Score neutro o quasi, nessun veto;
-   - Groq in timeout (limite di 2.0 s imposto dall'Agente #7) -> News Score 0 (neutro), il ciclo non si blocca.
+   - Groq in timeout (limite GROQ_TIMEOUT_S imposto dall'Agente #7) -> News Score 0 (neutro), il ciclo non si blocca.
 I fetcher HTTP e il client LLM sono iniettabili: i test offline girano senza rete.
 """
 import email.utils

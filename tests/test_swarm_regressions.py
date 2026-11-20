@@ -64,3 +64,15 @@ def test_cio_prompt_fits_groq_free_tier_with_many_pitches():
     assert "T29" in prompt and "T28" in prompt          # le schede con l'Ensemble più alto restano
     assert "T00 " not in prompt and "T10 " not in prompt  # le più deboli no
     assert sum(line.startswith("  - T") for line in prompt.splitlines()) <= core.CIO_PROMPT_MAX_PITCHES
+
+
+def test_news_llm_limit_matches_measured_groq_latency():
+    """Groq risponde in media in 1,0-1,3 s ma metà delle chiamate superava i 2 s: il limite delle notizie è 4 s."""
+    import time
+    from agents.agent_07_chop import GROQ_TIMEOUT_S, ChopWatchdog
+    assert GROQ_TIMEOUT_S == 4.0
+    assert ChopWatchdog().llm_timeout_s == GROQ_TIMEOUT_S
+    guard = ChopWatchdog(llm_timeout_s=0.2)
+    assert guard.guarded_llm_call(lambda: "ok") == "ok"
+    assert guard.guarded_llm_call(lambda: time.sleep(0.5) or "tardi") is None
+    assert guard.llm_stats["timeouts"] == 1

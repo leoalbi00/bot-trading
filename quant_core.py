@@ -258,7 +258,7 @@ class QuantitativeTradingCore:
     def news_assessment(self, symbol: str, is_crypto: bool) -> Dict[str, Any]:
         """Agente #4 · News Radar: titoli multi-canale (cache 2 min) + giudizio di Groq (riusato se i titoli non cambiano).
 
-        Groq passa dal guard dell'Agente #7 (timeout 2.0 s): in timeout il giudizio è neutro e non viene messo in cache.
+        Groq passa dal guard dell'Agente #7 (timeout GROQ_TIMEOUT_S): in timeout il giudizio è neutro e non viene messo in cache.
         """
         if self.news_provider:
             return self.news_provider(symbol) or {}
