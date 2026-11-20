@@ -1,6 +1,34 @@
 {
   "version": 2,
   "skills": {
+    "alpaca-broker-market-data": {
+      "source": "alpacahq/alpaca-skills",
+      "commit": "0e7c35163ae462730de1f4a0bfafceac82b7d59b",
+      "sourceType": "github",
+      "skillPath": "skills/broker-api/market-data/SKILL.md",
+      "computedHash": "32f796fb3a2d378ae1f5b4a4d4c3b7c2c6cae67eac9df162c99b6693a39b2489"
+    },
+    "alpaca-broker-rate-limits-resilience": {
+      "source": "alpacahq/alpaca-skills",
+      "commit": "0e7c35163ae462730de1f4a0bfafceac82b7d59b",
+      "sourceType": "github",
+      "skillPath": "skills/broker-api/rate-limits-resilience/SKILL.md",
+      "computedHash": "36129243cd276ef73f452e83a7b07b9c8a99661eb649c75e286462ddbc6eefec"
+    },
+    "alpaca-trading-paper-trading": {
+      "source": "alpacahq/alpaca-skills",
+      "commit": "0e7c35163ae462730de1f4a0bfafceac82b7d59b",
+      "sourceType": "github",
+      "skillPath": "skills/trading-api/paper-trading/SKILL.md",
+      "computedHash": "6c4c072bc1dc8256914ea9a2cb23812af67156259782985cef6b2cd8f23779ca"
+    },
+    "backtesting-frameworks": {
+      "source": "wshobson/agents",
+      "commit": "42203085cfc5736204bf0f6d436dff7e1da0bf3f",
+      "sourceType": "github",
+      "skillPath": "plugins/quantitative-trading/skills/backtesting-frameworks/SKILL.md",
+      "computedHash": "06911073e6cb32003d4057134ab32548e7efd59d87e878c9f7f8915ca06ac260"
+    },
     "dashboard-design": {
       "source": "abdiraimov-otabek/dashboard-design-skill",
       "commit": "463b8fdf62c640180ec1ba731f3616c2319bf68c",
@@ -25,6 +53,13 @@
       "sourceType": "github",
       "skillPath": "skills/mcp-builder/SKILL.md",
       "computedHash": "5a699fa929d99d7e6b1ebe10f13bf960d9ad452b70bd0733efd5d1de9524e285"
+    },
+    "python-performance-optimization": {
+      "source": "wshobson/agents",
+      "commit": "42203085cfc5736204bf0f6d436dff7e1da0bf3f",
+      "sourceType": "github",
+      "skillPath": "plugins/python-development/skills/python-performance-optimization/SKILL.md",
+      "computedHash": "81a1369058d4089e208104bbfc384cd73eb6b62d654bda87cf33cb97ea296ccd"
     },
     "systematic-debugging": {
       "source": "obra/superpowers",
