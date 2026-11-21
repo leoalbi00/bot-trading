@@ -32,6 +32,7 @@ class Scout:
         self.timeouts = 0
         self.last_heartbeat = time.time()
         self.last_ms = 0.0
+        self.busy_since = None   # inizio della scansione in corso (None = Scout libero)
 
     @property
     def label(self) -> str:
@@ -53,7 +54,9 @@ class ScoutSwarm:
         self.size = size
         self.timeout_s = timeout_s
         self.watchdog = watchdog
+        self.threads = threads
         self.executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="scout")
+        self._slots = None   # semaforo creato nel loop di ogni stream: tanti lavori in volo quanti i thread
         self._lock = threading.Lock()
         self.scouts: List[Scout] = []
         for i in range(size):
@@ -81,15 +84,26 @@ class ScoutSwarm:
         return fresh
 
     def stalled_scouts(self, max_silence_s: float) -> List[Scout]:
-        """Scout che non danno segni di vita da troppo tempo pur essendo stati assegnati."""
+        """Scout con una scansione in corso da più di max_silence_s secondi.
+
+        Uno Scout senza lavoro (blocchi piccoli, mercato chiuso) è solo inattivo: contarlo come bloccato produceva
+        riavvii a ripetizione senza nessun guasto reale.
+        """
         now = time.time()
         with self._lock:
-            return [s for s in self.scouts if s.runs and now - s.last_heartbeat > max_silence_s]
+            return [s for s in self.scouts if s.busy_since is not None and now - s.busy_since > max_silence_s]
 
     async def _run_scout(self, scout: Scout, symbol: str, df, book) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
         try:
-            res = await asyncio.wait_for(loop.run_in_executor(self.executor, scout.scan, df, book), self.timeout_s)
+            # Il timeout deve misurare la scansione, non l'attesa di un thread libero: senza il semaforo, con 6 lavori
+            # per ticker su 4 thread e la CPU di Render, 2/3 dei segnali scadevano in coda (Scout "riavviati" a migliaia)
+            async with self._slots:
+                scout.busy_since = time.time()
+                try:
+                    res = await asyncio.wait_for(loop.run_in_executor(self.executor, scout.scan, df, book), self.timeout_s)
+                finally:
+                    scout.busy_since = None
         except asyncio.TimeoutError:
             scout.timeouts += 1
             self.restart_scout(scout, f"timeout {self.timeout_s:.1f}s su {symbol}")
@@ -120,6 +134,7 @@ class ScoutSwarm:
         """Esegue gli Scout su tutti i ticker e inserisce ogni payload in coda appena pronto; chiude con STREAM_END."""
         groups = self.by_category()
         used: set = set()
+        self._slots = asyncio.Semaphore(self.threads)
         try:
             await asyncio.gather(*(self._scan_symbol(i, p, groups, queue, used) for i, p in enumerate(payloads)))
         finally:

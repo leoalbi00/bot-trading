@@ -5,7 +5,7 @@ Traccia:
 - latenza in millisecondi di ciascuno Stage della pipeline;
 - occupazione della asyncio.Queue degli Scout;
 - memoria (RSS) e CPU del processo;
-- chiamate a Groq: timeout massimo di 2.0 secondi (guarded_llm_call). Oltre il limite la chiamata viene
+- chiamate a Groq: timeout massimo di GROQ_TIMEOUT_S secondi, 4 di default (guarded_llm_call). Oltre il limite la chiamata viene
   abbandonata e l'Agente #4 usa un News Score neutro: il ciclo di trading non resta mai bloccato.
 Auto-healing:
 - Scout in timeout o silenziosi -> riavvio (ScoutSwarm.restart_scout);
@@ -13,6 +13,7 @@ Auto-healing:
 Ogni `audit_interval` secondi produce la riga
 `🐝 [CHOP SWARM AUDIT] N Scout Attivi | Backlog Code: X | Stage 1 Latency: Yms | RAM: ZMB`.
 """
+import os
 import resource
 import threading
 import time
@@ -21,7 +22,9 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 STAGES = ("stage1", "stage2", "stage3")
-GROQ_TIMEOUT_S = 2.0
+# Groq (Agente #4): risposte in media 1,0-1,3 s, ma con 2 s metà delle chiamate andava in timeout (log 17-20/11/2026).
+# Regolabile da Render con GROQ_NEWS_TIMEOUT_S senza toccare il codice.
+GROQ_TIMEOUT_S = float(os.getenv("GROQ_NEWS_TIMEOUT_S", "4.0"))
 
 
 def _rss_mb() -> float:
@@ -63,17 +66,28 @@ class ChopWatchdog:
         self.llm_timeout_s = llm_timeout_s
         self.llm_stats = {"calls": 0, "ok": 0, "timeouts": 0, "errors": 0}
         self.llm_ms: Deque[float] = deque(maxlen=200)
-        self._llm_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="groq-guard")
+        # 16 thread: una chiamata oltre il limite viene abbandonata ma resta in esecuzione fino al timeout HTTP;
+        # con 8 thread le chiamate abbandonate occupavano il pool e quelle nuove scadevano in coda
+        self._llm_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="groq-guard")
 
-    # ------------------------------------------------------------------ Groq: timeout massimo 2.0 s
+    # ------------------------------------------------------------------ Groq: timeout massimo GROQ_TIMEOUT_S
     def guarded_llm_call(self, fn: Callable[..., Any], *args, **kwargs) -> Optional[Any]:
         """Esegue fn con un limite di llm_timeout_s secondi: None su timeout o eccezione (registrati)."""
         with self._lock:
             self.llm_stats["calls"] += 1
-        started = time.perf_counter()
-        future = self._llm_pool.submit(fn, *args, **kwargs)
+        began = threading.Event()
+        started = [time.perf_counter()]
+
+        def run():
+            started[0] = time.perf_counter()   # il limite vale dall'inizio della chiamata, non dall'attesa in coda
+            began.set()
+            return fn(*args, **kwargs)
+
+        future = self._llm_pool.submit(run)
         try:
-            result = future.result(timeout=self.llm_timeout_s)
+            if not began.wait(self.llm_timeout_s):   # nessun thread libero entro il limite
+                raise FutureTimeout()
+            result = future.result(timeout=max(0.0, self.llm_timeout_s - (time.perf_counter() - started[0])))
         except FutureTimeout:
             future.cancel()
             with self._lock:
@@ -86,7 +100,7 @@ class ChopWatchdog:
             return None
         with self._lock:
             self.llm_stats["ok"] += 1
-            self.llm_ms.append((time.perf_counter() - started) * 1000)
+            self.llm_ms.append((time.perf_counter() - started[0]) * 1000)
         return result
 
     # ------------------------------------------------------------------ telemetria
@@ -135,7 +149,7 @@ class ChopWatchdog:
         actions = []
         if swarm is not None:
             for scout in swarm.stalled_scouts(self.scout_silence_s):
-                swarm.restart_scout(scout, f"nessun heartbeat da {self.scout_silence_s:.0f}s")
+                swarm.restart_scout(scout, f"scansione in corso da oltre {self.scout_silence_s:.0f}s")
                 actions.append(f"riavviato Scout {scout.label}")
         if engine is not None:
             add = self.needs_more_workers(self.queue_now, engine.num_workers)

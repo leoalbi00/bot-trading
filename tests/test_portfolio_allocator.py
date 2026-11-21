@@ -305,3 +305,14 @@ def test_position_limit_is_five():
     assert size_trade(100_000, 0, 100_000, 0, 4, lim, 5.0)["amount"] > 0
     blocked = size_trade(100_000, 0, 100_000, 0, 5, lim, 5.0)
     assert blocked["amount"] == 0 and "5/5 posizioni" in blocked["reason"]
+
+
+def test_backtest_vix_exit_matches_guardian_rule():
+    """Il backtest replica l'uscita NEWS_SHOCK dell'Agente #6 con le stesse soglie."""
+    from backtest.portfolio_sim import VIX_EXIT_GUARDIAN as rule, vix_shock
+    from agents.agent_06_sentinel import VIX_SPIKE_MIN_LEVEL, PortfolioGuardianAgent
+    g = PortfolioGuardianAgent()
+    assert (rule["panic"], rule["spike_level"], rule["spike_pct"]) == (g.vix_panic, VIX_SPIKE_MIN_LEVEL, g.vix_spike_pct)
+    assert vix_shock(28.0, 27.0, rule) and not vix_shock(27.9, 27.0, rule)          # soglia di panico
+    assert vix_shock(25.5, 20.0, rule) and not vix_shock(24.9, 15.0, rule)          # rialzo >20% conta solo da 25
+    assert not vix_shock(26.0, 22.0, rule) and not vix_shock(40.0, 20.0, None)      # +18% non basta; regola spenta

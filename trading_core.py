@@ -536,7 +536,7 @@ from agents import core_allocation as core_alloc
 def groq_news_llm(system, prompt):
     """Agente #4 -> Groq con output JSON rigoroso. Testo della risposta o None (nessuna chiave / errore).
 
-    Il limite di 2.0 s è doppio: timeout del client HTTP e guard dell'Agente #7 (guarded_llm_call).
+    Il limite GROQ_TIMEOUT_S (4 s) è doppio: timeout del client HTTP e guard dell'Agente #7 (guarded_llm_call).
     """
     global _groq_client
     if not GROQ_KEY:
@@ -568,7 +568,7 @@ def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024,
     """Prova i modelli Groq in sequenza; restituisce il testo o None. Gli errori vengono loggati.
 
     `validate` scarta le risposte nel formato sbagliato (es. rifiuti) e passa al modello successivo.
-    timeout: secondi per chiamata (default GROQ_TIMEOUT_S = 2 s del client, pensato per i giudizi brevi sulle
+    timeout: secondi per chiamata (default GROQ_TIMEOUT_S = 4 s del client, pensato per i giudizi brevi sulle
     notizie); deadline (time.monotonic()): budget totale, oltre il quale non si provano altri modelli.
     """
     global _groq_client
@@ -578,7 +578,7 @@ def _ask_groq(prompt, log, system=None, validate=_has_decision, max_tokens=1024,
     try:
         import groq
         if _groq_client is None:
-            # Agente #7: nessuna chiamata a Groq può superare GROQ_TIMEOUT_S (2.0 s)
+            # Agente #7: nessuna chiamata a Groq può superare GROQ_TIMEOUT_S (4 s di default)
             _groq_client = groq.Groq(api_key=GROQ_KEY, timeout=GROQ_TIMEOUT_S, max_retries=0)
     except Exception as e:
         log(f"❌ Impossibile inizializzare il client Groq: {e}")
@@ -3068,7 +3068,31 @@ DESK_CIO_SYSTEM_PROMPT = (
 )
 
 
+# Groq gratuito: 8.000 token al minuto per modello, contando anche la risposta massima richiesta (errore 413 oltre).
+# Il CIO con IA vede solo le schede migliori, con dettagli accorciati; il CIO quantitativo continua a vederle tutte.
+CIO_PROMPT_MAX_PITCHES = 5          # come il massimo di posizioni: oltre non potrebbe comunque comprarle
+CIO_PROMPT_TOKEN_BUDGET = 6000      # margine sotto gli 8.000: le notizie usano lo stesso budget al minuto
+CIO_LLM_MAX_TOKENS = 1024           # la risposta è un JSON breve; i modelli che ragionano usano parte di questo budget
+CIO_GATE_DETAIL_MAX = 160           # caratteri per controllo del Comitato Rischi nel prompt
+
+
+def estimate_tokens(text):
+    """Stima prudente dei token (circa 3 caratteri per token in italiano con numeri e simboli)."""
+    return len(text) // 3 + 1
+
+
 def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
+    """Prompt del CIO con le CIO_PROMPT_MAX_PITCHES schede più forti, ridotte finché il totale sta nel budget di Groq."""
+    ranked = sorted(pitches, key=lambda p: p.get("ensemble") or 0, reverse=True)[:CIO_PROMPT_MAX_PITCHES]
+    while True:
+        prompt = _desk_cio_prompt_text(ranked, holdings, account, channels, cfg)
+        used = estimate_tokens(prompt + DESK_CIO_SYSTEM_PROMPT) + CIO_LLM_MAX_TOKENS
+        if used <= CIO_PROMPT_TOKEN_BUDGET or len(ranked) <= 1:
+            return prompt
+        ranked = ranked[:-1]
+
+
+def _desk_cio_prompt_text(pitches, holdings, account, channels, cfg):
     macro = channels.get("macro") or {}
     idx = ", ".join(f"{s} {v['trend']} (${v['price']:,.2f} vs EMA50 ${v['ema50']:,.2f})"
                     for s, v in (macro.get("indices") or {}).items()) or "N/D"
@@ -3076,11 +3100,11 @@ def build_desk_cio_prompt(pitches, holdings, account, channels, cfg):
     pitch_lines = []
     for p in pitches:
         mtf = ", ".join(f"{tf} {'↑' if v and v['bullish'] else '↓'}{' RSI ' + str(v['rsi']) if v else ''}" for tf, v in p["mtf"].items())
-        gates = "; ".join(f"{g['agent']}: {g['detail']}" for g in (p.get("review") or {}).get("gates", []))
+        gates = "; ".join(f"{g['agent']}: {str(g['detail'])[:CIO_GATE_DETAIL_MAX]}" for g in (p.get("review") or {}).get("gates", []))
         pitch_lines.append(
             f"  - {p['symbol']} [{p['sector']}] ENSEMBLE {p.get('ensemble')} ({p.get('trade_class') or 'STANDARD'}), "
             f"score tecnico {p['score']}, anomalie: {', '.join(p['anomalies'])}\n"
-            f"      Tesi: {(p.get('package') or {}).get('buy_thesis') or 'N/D'}\n"
+            f"      Tesi: {str((p.get('package') or {}).get('buy_thesis') or 'N/D')[:300]}\n"
             f"      MTF: {mtf} | RVOL {p['rvol']}x | VWAP {_fmt_pct(p.get('vwap_dist_pct'))} | beta {p['beta']} corr {p['corr']}\n"
             f"      Comitato: {gates}\n"
             f"      Target ${p['package']['target_price']:,.4f}, stop {p['package']['stop_pct']:.1f}% "
@@ -3154,7 +3178,7 @@ def ask_desk_cio(prompt, log=print):
             break
         kwargs = {"system": DESK_CIO_SYSTEM_PROMPT, "validate": validate}
         if fn is _ask_groq:
-            kwargs.update(max_tokens=2048, timeout=CIO_LLM_TIMEOUT_S, deadline=deadline)
+            kwargs.update(max_tokens=CIO_LLM_MAX_TOKENS, timeout=CIO_LLM_TIMEOUT_S, deadline=deadline)
         text = fn(prompt, log, **kwargs)
         if text:
             return parse_desk_decision(text), _last_model["groq" if fn is _ask_groq else "gemini"]
@@ -4028,7 +4052,7 @@ if __name__ == "__main__":
 
     def _sim_groq(system, prompt):
         if "Ticker: MSFT" in prompt:
-            time.sleep(2.5)                      # oltre il limite dell'Agente #7: News Score neutro
+            time.sleep(GROQ_TIMEOUT_S + 0.5)     # oltre il limite dell'Agente #7: News Score neutro
         bullish = "beats estimates" in prompt
         return json.dumps({"impact_score": 0.85 if bullish else 0.05, "novelty_index_minutes": 4,
                            "catalyst_type": "EARNINGS" if bullish else "MACRO",
