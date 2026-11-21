@@ -235,10 +235,11 @@ class DynamicUniverseScreener:
                         for n, v in self._sources.items()},
         }
 
-    def tickers(self, snap: Dict[str, Any], market_open: bool) -> List[Tuple[str, str, bool]]:
-        """[(ticker, fonte, negoziabile)] in ordine di scansione: a mercato chiuso solo crypto (24/7)."""
+    def tickers(self, snap: Dict[str, Any], market_open: bool, include_stocks: bool = False) -> List[Tuple[str, str, bool]]:
+        """[(ticker, fonte, negoziabile)] in ordine di scansione: a mercato chiuso solo crypto (24/7),
+        oppure crypto + azioni con include_stocks (modalità "preparazione": le azioni vengono solo analizzate)."""
         crypto = [(c["symbol"], "Crypto (Alpaca)", True) for c in snap["crypto"] if c["tradable"]]
-        if not market_open:
+        if not market_open and not include_stocks:
             return crypto
         stocks = [(s["symbol"], s["source"], True) for s in snap["stocks"]]
         # Alterna azioni e crypto: ogni blocco contiene entrambe le classi

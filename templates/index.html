@@ -800,6 +800,15 @@
                     <input type="number" step="5" min="0" max="90" x-model.number="settings.core_spy_pct" :disabled="locked('core_spy_pct')" class="n">
                 </label>
 
+                <label class="f" :title="lockTitle('closed_market_mode')">
+                    <span class="t">Quando la borsa americana è chiusa</span>
+                    <span class="h">Il bot compra solo crypto, aperte 24 ore su 24. Con "preparazione" intanto studia anche le azioni: quelle che passano tutti i controlli vengono rivalutate per prime all'apertura.</span>
+                    <select x-model="settings.closed_market_mode" :disabled="locked('closed_market_mode')">
+                        <option value="preparazione">Crypto + preparazione delle azioni per l'apertura</option>
+                        <option value="crypto">Solo crypto</option>
+                    </select>
+                </label>
+
                 <div class="f" style="display:grid;gap:8px">
                     <span class="t" style="font-weight:700">Titoli da tenere sempre d'occhio</span>
                     <span class="h faint">Il bot li controlla in aggiunta a quelli che trova da solo.</span>
