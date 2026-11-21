@@ -132,6 +132,9 @@ DEFAULT_CONFIG = {
     "ai_provider": "groq",
     "keep_alive_enabled": True,
     "core_spy_pct": 0.0,          # quota del capitale su SPY (core + satellite, agents/core_allocation.py); 0 = disattivato
+    # Mercato USA chiuso: "preparazione" = acquisti solo crypto (24/7) e analisi delle azioni per l'apertura;
+    # "crypto" = solo crypto. Alpaca non negozia azioni non USA; fuori orario le azioni USA accettano solo ordini limite.
+    "closed_market_mode": "preparazione",
     "bot_api_token": PLACEHOLDER_TOKEN,
 }
 
@@ -149,7 +152,9 @@ ENV_OVERRIDES = {
     "scan_interval_min": "BOT_SCAN_INTERVAL_MIN",
     "keep_alive_enabled": "BOT_KEEP_ALIVE",
     "core_spy_pct": "BOT_CORE_SPY_PCT",
+    "closed_market_mode": "BOT_CLOSED_MARKET_MODE",
 }
+CLOSED_MARKET_MODES = ("preparazione", "crypto")
 _TRUE = ("1", "true", "yes", "on", "si", "sì")
 _FALSE = ("0", "false", "no", "off")
 
@@ -251,6 +256,12 @@ def _validate_config(data, base):
         if provider not in AI_PROVIDERS:
             raise ValueError(f"ai_provider deve essere uno tra {', '.join(AI_PROVIDERS)}")
         cfg["ai_provider"] = provider
+
+    if "closed_market_mode" in data:
+        mode = str(data["closed_market_mode"]).strip().lower()
+        if mode not in CLOSED_MARKET_MODES:
+            raise ValueError(f"closed_market_mode deve essere uno tra {', '.join(CLOSED_MARKET_MODES)}")
+        cfg["closed_market_mode"] = mode
 
     for key in SECRET_FIELDS:
         if data.get(key):
@@ -2156,6 +2167,33 @@ def _now_epoch():
     return time.time()
 
 
+# ---------------------------------------------------------------- preparazione per l'apertura
+OPENING_CANDIDATE_TTL_SEC = 20 * 3600   # dal pomeriggio/notte fino all'apertura successiva (weekend: si rinnovano)
+
+
+def remember_opening_candidate(symbol, ensemble):
+    """Azione che a mercato chiuso ha superato tutti gli agenti: verrà rivalutata per prima all'apertura."""
+    with _registry_lock:
+        reg = load_scout_registry()
+        reg["radar"].setdefault("opening_watch", {})[normalize_symbol(symbol)] = {
+            "symbol": symbol, "ensemble": ensemble, "at": _now_epoch()}
+        _save_registry(reg)
+
+
+def forget_opening_candidate(symbol):
+    with _registry_lock:
+        reg = load_scout_registry()
+        if reg["radar"].get("opening_watch", {}).pop(normalize_symbol(symbol), None) is not None:
+            _save_registry(reg)
+
+
+def opening_candidates():
+    """Simboli pronti per l'apertura, dal più forte, senza quelli più vecchi di OPENING_CANDIDATE_TTL_SEC."""
+    watch = (_registry_view()["radar"].get("opening_watch") or {}).values()
+    fresh = [w for w in watch if _now_epoch() - float(w.get("at", 0)) <= OPENING_CANDIDATE_TTL_SEC]
+    return [w["symbol"] for w in sorted(fresh, key=lambda w: -(w.get("ensemble") or 0))]
+
+
 def _close(reg, pitch, status, note=""):
     """Sposta una scheda dalla coda attiva allo storico recente (sotto _registry_lock)."""
     pitch["status"] = status
@@ -2740,7 +2778,8 @@ def universe_chunk(market_open, log=print):
     release_memory()        # libera i dati del blocco precedente prima di scaricare il successivo
     screener = universe_screener()
     snap = screener.refresh()
-    listed = screener.tickers(snap, market_open)
+    preparing = not market_open and get_config()["closed_market_mode"] == "preparazione"
+    listed = screener.tickers(snap, market_open, include_stocks=preparing)
     universe = [u for u in listed if not yf_missing(u[0])]
     if not universe:
         return None
@@ -2749,9 +2788,15 @@ def universe_chunk(market_open, log=print):
     # La watchlist dell'utente viene scansionata a ogni giro, non solo quando arriva il suo blocco
     # (solo se negoziabile su Alpaca: gli Scout lavorano esclusivamente su asset con ordini abilitati)
     for t in get_config()["watchlist"]:
-        if t not in in_chunk and (market_open or is_crypto(t)) and is_tradable(t):
+        if t not in in_chunk and (market_open or preparing or is_crypto(t)) and is_tradable(t):
             chunk.append((t, "Watchlist", True))
             in_chunk.add(t)
+    # All'apertura le azioni preparate a mercato chiuso entrano subito, prima di aspettare il loro blocco
+    if market_open:
+        for t in opening_candidates():
+            if t not in in_chunk and is_tradable(t):
+                chunk.insert(0, (t, "Pronti per l'apertura", True))
+                in_chunk.add(t)
     groups = {}
     for t, src, _ in chunk:
         groups.setdefault(src, []).append(t)
@@ -2760,8 +2805,8 @@ def universe_chunk(market_open, log=print):
             "crypto_tradable": sum(1 for c in snap["crypto"] if c["tradable"]), "no_data": len(listed) - len(universe),
             "index": {t: i + 1 for i, (t, _, _) in enumerate(universe)}}
     line = (f"🌐 [ALPACAN ACTIVE] Scansione limitata ai soli asset con esecuzione ordini abilitata · "
-            f"{info['stocks'] if market_open else 0} Titoli USA + {info['crypto_tradable']} Crypto · "
-            f"{QUANT_SWARM_SIZE} Scout su {info['total']} Ticker{'' if market_open else ' (mercato USA chiuso: solo crypto 24/7)'}")
+            f"{info['stocks'] if market_open or preparing else 0} Titoli USA + {info['crypto_tradable']} Crypto · "
+            f"{QUANT_SWARM_SIZE} Scout su {info['total']} Ticker{'' if market_open else (' (mercato USA chiuso: crypto 24/7 + preparazione azioni)' if preparing else ' (mercato USA chiuso: solo crypto 24/7)')}")
     if k == 1 or _screener_ref["last_line"] != line:
         log(line)
         errors = [f"{name}: {v['error']}" for name, v in snap["sources"].items() if v.get("error")]
@@ -2799,6 +2844,19 @@ def prune_runtime_caches():
         _prune_cache(_guardian_cache["trend"], 6 * 3600)
 
 
+def _prepare_for_opening(r):
+    """Azione esaminata a mercato chiuso: se il Fusion Engine darebbe BUY con il Guardian d'accordo e lo score
+    tecnico basta, va nella lista "pronti per l'apertura" (nessun ordine fuori orario)."""
+    if get_config()["closed_market_mode"] != "preparazione" or not r.get("tradable", True):
+        return
+    q = quant_rationale(r["symbol"], max_age_sec=120)
+    if (q and q["agent_05_cio"]["decision"] == "BUY" and (q["agent_06_guardian"] or {}).get("approved")
+            and r["score"] >= PIPELINE_MIN_TA_SCORE):
+        remember_opening_candidate(r["symbol"], q["agent_05_cio"]["score"])
+        agent_say("Pipeline", f"{r['symbol']} → BUY dallo Stage 3 a mercato chiuso (ensemble {q['agent_05_cio']['score']}): "
+                              "in lista per l'apertura, nessun ordine fuori orario", "info")
+
+
 def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotate=False, exposure_usd=None,
                     positions_count=None):
     """Tier 1 -> 2 -> 3: scansione parallela, schede all'Orchestrator, revisione immediata.
@@ -2824,7 +2882,9 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             quant_engine().watchdog.universe = {k: v for k, v in uinfo.items() if k != "index"}
             agent_say("Chief of Staff", f"🌐 Blocco {uinfo['chunk']}/{uinfo['chunks']} dell'universo dinamico "
                                         f"({uinfo['total']} ticker): {len(tickers)} ticker ai {QUANT_SWARM_SIZE} Scout"
-                                        + ("" if market_open else " · mercato USA chiuso, solo crypto"))
+                                        + ("" if market_open else " · mercato USA chiuso: acquisti solo crypto"
+                                           + (", azioni in preparazione per l'apertura"
+                                              if get_config()["closed_market_mode"] == "preparazione" else "")))
     if not uinfo:
         # Panieri statici: universo dinamico disattivato (BOT_DYNAMIC_UNIVERSE=0) o non disponibile
         if market_open:
@@ -2916,7 +2976,12 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
             scout_meta={r["symbol"]: {"rvol": r["rvol"], "score": r["score"], "atr_pct": r.get("atr_pct"),
                                       "trend_score": r.get("trend_score")} for r in results})
         for r in results:
-            if not (market_open or is_crypto(r["symbol"])) or not r.get("tradable", True):
+            if not market_open and not is_crypto(r["symbol"]):
+                _prepare_for_opening(r)        # mercato chiuso: nessuna scheda, solo la lista per l'apertura
+                continue
+            if market_open and not is_crypto(r["symbol"]):
+                forget_opening_candidate(r["symbol"])   # rivalutato con i prezzi live: esce dalla lista
+            if not r.get("tradable", True):
                 continue
             q = quant_rationale(r["symbol"], max_age_sec=120)
             # Un'anomalia senza BUY del Fusion Engine non diventa scheda: finirebbe solo in cooldown per 60 minuti
@@ -2953,7 +3018,8 @@ def run_scout_swarm(held_keys=(), pending=(), log=print, on_approved=None, rotat
         "scouts": len(merged), "workers": min(SCOUT_MAX_WORKERS, len(tickers)), "download_s": download_s,
         "scouts_ms": scouts_ms, "max_scout_ms": max_scout_ms, "last_basket": ", ".join(n for n, _ in baskets),
         "mode": (f"Universo dinamico · {uinfo['total']} ticker ({uinfo['stocks']} USA · {uinfo['crypto']} crypto) · "
-                 f"blocco {uinfo['chunk']}/{uinfo['chunks']}" + ("" if market_open else " · mercato USA chiuso: solo crypto")
+                 f"blocco {uinfo['chunk']}/{uinfo['chunks']}" + ("" if market_open else " · mercato USA chiuso: acquisti solo crypto"
+                 + (" + preparazione azioni" if get_config()["closed_market_mode"] == "preparazione" else ""))
                  if uinfo else "Mercato USA aperto · rotazione 6 panieri" if market_open else "Mercato USA chiuso · focus crypto 24/7"),
         "universe": {k: v for k, v in uinfo.items() if k != "index"} if uinfo else None,
         "baskets": [{"name": n, "tickers": sum(1 for r in merged if r["sector"] == n),
@@ -3565,6 +3631,22 @@ def performance_stats(trades):
 
 
 
+FOREIGN_INDICES = {"^STOXX50E": "Europa (Euro Stoxx 50)", "^GDAXI": "Germania (DAX)", "^FTSE": "Regno Unito (FTSE 100)",
+                   "^N225": "Giappone (Nikkei 225)", "^HSI": "Hong Kong (Hang Seng)"}
+
+
+def foreign_markets_snapshot():
+    """Variazione del giorno delle principali borse estere (solo informazione: Alpaca non le negozia)."""
+    out = []
+    for sym, df in _daily_frames(list(FOREIGN_INDICES)).items():
+        close = df["Close"].dropna() if df is not None and "Close" in df else None
+        if close is None or len(close) < 2 or not close.iloc[-2]:
+            continue
+        out.append({"symbol": sym, "name": FOREIGN_INDICES[sym], "price": round(float(close.iloc[-1]), 2),
+                    "change_pct": round((float(close.iloc[-1]) / float(close.iloc[-2]) - 1) * 100, 2)})
+    return out
+
+
 def run_closed_market_pulse(log=print, force=False):
     """Mercato USA chiuso: scansione silenziosa (ogni 15 min) dei 5 panieri azionari/commodities.
 
@@ -3595,6 +3677,10 @@ def run_closed_market_pulse(log=print, force=False):
         if close:
             moves.append((t, round((last / close - 1) * 100, 2), last))
     moves.sort(key=lambda m: abs(m[1]), reverse=True)
+    try:
+        foreign = foreign_markets_snapshot()
+    except Exception:
+        foreign = []
 
     with _registry_lock:
         reg = load_scout_registry()
@@ -3610,7 +3696,8 @@ def run_closed_market_pulse(log=print, force=False):
         if alerts or summary_due:
             radar["last_pulse_log_epoch"] = _now_epoch()
         radar["pulse"] = {"timestamp": now_local().isoformat(timespec="seconds"), "tickers": len(moves),
-                          "top_moves": [{"symbol": t, "move_pct": mv, "price": round(px, 4)} for t, mv, px in moves[:8]]}
+                          "top_moves": [{"symbol": t, "move_pct": mv, "price": round(px, 4)} for t, mv, px in moves[:8]],
+                          "foreign": foreign}
         _save_registry(reg)
 
     if alerts:
@@ -3620,6 +3707,9 @@ def run_closed_market_pulse(log=print, force=False):
     elif summary_due and moves:
         top = ", ".join(f"{t} {mv:+.2f}%" for t, mv, _ in moves[:5])
         log(f"🌙 [Pulse mercati chiusi] {len(moves)} ticker azionari/commodities monitorati, maggiori variazioni: {top}")
+        if foreign:
+            log("🌍 [Borse estere] " + ", ".join(f"{m['name']} {m['change_pct']:+.2f}%" for m in foreign)
+                + " (solo informazione: Alpaca negozia azioni USA e crypto)")
         agent_say("Pulse", f"Riepilogo orario: {len(moves)} ticker monitorati · {top}", "muted")
     return moves
 
