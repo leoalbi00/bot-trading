@@ -3,13 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <title>Il mio bot</title>
+    <title>Trading Desk</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;600;700&family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
-    <!-- Tailwind serve solo alla "Sala macchine" (vista tecnica di prima) -->
+    <!-- Tailwind serve solo alla Diagnostica (vista tecnica di prima) -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         if (window.tailwind) tailwind.config = {
@@ -18,7 +18,7 @@
         };
     </script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/pro_desk.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/chiaro.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/desk.css') }}">
     <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
     <script>
         // Token degli endpoint di controllo, inserito dal server dopo il login
@@ -27,280 +27,280 @@
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 </head>
-<body class="chiaro" x-data="dashboard()" x-init="init()"
+<body class="desk" x-data="dashboard()" x-init="init()"
       @keydown.window.prevent.meta.k="focusCommand()" @keydown.window.prevent.ctrl.k="focusCommand()">
+<div class="app">
 
-    <!-- ============ TESTATA ============ -->
-    <header class="topbar">
-        <div class="wrap">
-            <div class="brand">
-                <span class="lamp" :class="botNow().lamp" :title="botNow().title"></span>
-                <span>Il mio bot</span>
-                <small x-text="botNow().title"></small>
-            </div>
-            <div class="actions">
-                <button class="k-btn small" @click="toggleBot()" :title="bot.active ? 'Ferma il bot: non comprerà né venderà' : 'Riaccendi il bot'">
-                    <span class="ico" x-html="icon(bot.active ? 'pause' : 'play')"></span><span class="lbl" x-text="bot.active ? 'Metti in pausa' : 'Riaccendi'"></span></button>
-                <button class="k-btn small plain" @click="openHistory()" title="Tutto quello che il bot ha comprato e venduto">
-                    <span class="ico" x-html="icon('book-open')"></span><span class="lbl">Storico</span></button>
-                <button class="k-btn small plain" @click="showSettings = true" title="Impostazioni">
-                    <span class="ico" x-html="icon('sliders-horizontal')"></span><span class="lbl">Impostazioni</span></button>
-                <button class="k-btn small danger" @click="liquidate()" title="Emergenza: vende tutto e mette in pausa il bot">
-                    <span class="ico" x-html="icon('octagon-alert')"></span><span class="lbl">Vendi tutto</span></button>
-                <form method="post" action="/logout" style="margin:0">
-                    <button type="submit" class="k-btn small plain" title="Esci"><span class="ico" x-html="icon('log-out')"></span></button>
-                </form>
-            </div>
+    <!-- ============ BARRA LATERALE ============ -->
+    <aside class="side">
+        <div class="brand">
+            <span class="mark">TD</span>
+            <div><b>Trading Desk</b><small>Alpaca · conto paper</small></div>
         </div>
-    </header>
-    <div class="wrap tabwrap">
-            <nav class="tabs" aria-label="Sezioni">
-                <template x-for="t in tabs" :key="t.id">
-                    <button :class="tab === t.id && 'on'" @click="tab = t.id" :aria-current="tab === t.id ? 'page' : null">
-                        <span class="ico" x-html="icon(t.icon)"></span><span x-text="t.label"></span></button>
-                </template>
-            </nav>
-    </div>
+        <nav class="nav" aria-label="Sezioni">
+            <template x-for="t in tabs" :key="t.id">
+                <button :class="tab === t.id && 'on'" @click="tab = t.id" :aria-current="tab === t.id ? 'page' : null">
+                    <span class="ico" x-html="icon(t.icon)"></span><span x-text="t.label"></span></button>
+            </template>
+        </nav>
+        <div class="foot">
+            <span x-text="'Ultimo ciclo: ' + (bot.last_scan ? bot.last_scan.slice(11, 16) : '—')"></span>
+            <span x-text="marketState().label"></span>
+        </div>
+    </aside>
 
-    <main class="wrap">
-
-        <!-- ================================================================ OGGI -->
-        <div x-show="tab === 'oggi'" class="grid2">
-            <div class="stack">
-                <section class="sheet today" :class="todayTone()">
-                    <div class="speaker"><span class="face">B</span><span>Il tuo bot ti racconta la giornata</span></div>
-                    <p class="headline" x-text="todayHeadline()"></p>
-                    <div class="total n">
-                        <div><span>Valore totale del conto <button class="q" @click="help('conto')" aria-label="Cos'è il valore totale">?</button></span>
-                             <strong x-text="usd(account.portfolio)"></strong></div>
-                        <div><span>Dall'inizio</span>
-                             <strong :class="toneClass(account.net_pnl_pct)" x-text="pct(account.net_pnl_pct)"></strong></div>
-                    </div>
-                    <div class="why">
-                        <div><span class="ico" x-html="icon('info')"></span><p x-text="todayWhy()"></p></div>
-                        <div x-show="account.initial_capital"><span class="ico" x-html="icon('flag')"></span>
-                            <p x-text="'Sei partito con ' + usd(account.initial_capital) + '. È un conto di prova: i soldi sono finti.'"></p></div>
-                    </div>
-                </section>
-
-                <section class="sheet">
-                    <h2>Cosa sta facendo il bot</h2>
-                    <p class="lead" x-text="botNow().text"></p>
-                    <div class="why">
-                        <div><span class="ico" x-html="icon('compass')"></span><p><b>L'ultima decisione: </b><span x-text="decision().title"></span></p></div>
-                        <div x-show="decision().text"><span class="ico" x-html="icon('message-circle')"></span><p x-text="decision().text"></p></div>
-                    </div>
-                </section>
-
-                <section class="sheet">
-                    <h2>Dove sono i tuoi soldi</h2>
-                    <p class="lead" x-text="moneySentence()"></p>
-                    <div class="bar" style="margin-top:14px" role="img" :aria-label="moneySentence()">
-                        <span class="inv" :style="'width:' + (investedPct() ?? 0) + '%'"></span>
-                        <span class="cash" :style="'width:' + (investedPct() === null ? 100 : 100 - investedPct()) + '%'"></span>
-                    </div>
-                    <div class="legend n">
-                        <span><i class="sw" style="background:var(--pen)"></i>Investiti <span x-text="usd(account.exposure)"></span>
-                            <button class="q" @click="help('investito')" aria-label="Cosa vuol dire investiti">?</button></span>
-                        <span><i class="sw" style="background:color-mix(in srgb, var(--pen) 22%, var(--mist))"></i>In cassa <span x-text="usd(account.cash)"></span>
-                            <button class="q" @click="help('cassa')" aria-label="Cosa vuol dire in cassa">?</button></span>
-                    </div>
-                </section>
+    <div class="work">
+        <!-- ============ BARRA IN ALTO ============ -->
+        <header class="bar">
+            <div class="in">
+                <h1 x-text="tabs.find(t => t.id === tab)?.label"></h1>
+                <span class="status" :title="botNow().text"><span class="led" :class="botNow().lamp"></span><span x-text="botNow().title"></span></span>
+                <div class="actions">
+                    <button class="ui-btn" @click="toggleBot()" :title="bot.active ? 'Ferma il bot: non comprerà né venderà' : 'Riattiva il bot'">
+                        <span class="ico" x-html="icon(bot.active ? 'pause' : 'play')"></span><span class="lbl" x-text="bot.active ? 'Metti in pausa' : 'Riattiva'"></span></button>
+                    <button class="ui-btn ghost" @click="openHistory()" title="Tutte le operazioni eseguite">
+                        <span class="ico" x-html="icon('history')"></span><span class="lbl">Storico</span></button>
+                    <button class="ui-btn ghost" @click="showSettings = true" title="Impostazioni">
+                        <span class="ico" x-html="icon('settings-2')"></span><span class="lbl">Impostazioni</span></button>
+                    <button class="ui-btn danger" @click="liquidate()" title="Emergenza: annulla gli ordini, vende tutte le posizioni e mette in pausa il bot">
+                        <span class="ico" x-html="icon('octagon-alert')"></span><span class="lbl">Vendi tutto</span></button>
+                    <form method="post" action="/logout" style="margin:0">
+                        <button type="submit" class="ui-btn ghost" title="Esci"><span class="ico" x-html="icon('log-out')"></span></button>
+                    </form>
+                </div>
             </div>
+        </header>
 
-            <div class="stack">
-                <section class="sheet">
-                    <div class="weather">
-                        <div class="sky" :class="weather().tone"><span class="ico" x-html="icon(weather().icon)"></span></div>
-                        <div>
-                            <div class="faint">Il meteo del mercato <button class="q" @click="help('meteo')" aria-label="Cos'è il meteo del mercato">?</button></div>
-                            <div class="name" x-text="weather().name"></div>
-                        </div>
+        <main class="content">
+
+        <!-- ================================================================ PANORAMICA -->
+        <template x-if="tab === 'oggi'">
+        <div style="display:grid;gap:16px">
+            <section class="kpis">
+                <article class="panel stat">
+                    <div class="stat-label">Valore del conto <button class="info" @click="help('conto')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></div>
+                    <div class="value n" x-text="usd(account.portfolio)"></div>
+                    <div class="delta n"><b :class="toneClass(account.net_pnl_pct)" x-text="pct(account.net_pnl_pct)"></b> dall'inizio</div>
+                    <p class="desc" x-text="account.initial_capital ? 'Capitale iniziale ' + usd(account.initial_capital) + '. Conto paper: denaro simulato.' : 'Liquidità più valore di mercato delle posizioni.'"></p>
+                </article>
+                <article class="panel stat">
+                    <div class="stat-label">Risultato di oggi</div>
+                    <div class="value n" :class="toneClass(account.daily_pnl_usd)" x-text="usd(account.daily_pnl_usd, true)"></div>
+                    <div class="delta n"><b :class="toneClass(account.daily_pnl_pct)" x-text="pct(account.daily_pnl_pct)"></b> rispetto alla chiusura di ieri</div>
+                    <p class="desc" x-text="todayWhy()"></p>
+                </article>
+                <article class="panel stat">
+                    <div class="stat-label">Liquidità <button class="info" @click="help('cassa')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></div>
+                    <div class="value n" x-text="usd(account.cash)"></div>
+                    <div class="delta n"><b x-text="investedPct() === null ? '—' : (100 - investedPct()).toFixed(0) + '%'"></b> del conto</div>
+                    <div class="alloc" role="img" :aria-label="moneySentence()"><span :style="'width:' + (investedPct() ?? 0) + '%'"></span></div>
+                    <p class="desc" x-text="moneySentence()"></p>
+                </article>
+                <article class="panel stat">
+                    <div class="stat-label">Posizioni aperte</div>
+                    <div class="value n"><span x-text="positions.length"></span><span class="muted" style="font-weight:400" x-text="' / ' + MAX_POSITIONS"></span></div>
+                    <div class="delta n" x-text="usd(account.exposure) + ' investiti'"></div>
+                    <p class="desc" x-text="slotsText()"></p>
+                </article>
+            </section>
+
+            <div class="grid-2">
+                <section class="panel">
+                    <header><h2>Attività recente</h2><span class="aside">acquisti e vendite del bot</span></header>
+                    <div class="tbl-wrap">
+                        <table class="tbl stack">
+                            <thead><tr><th>Data</th><th>Operazione</th><th>Titolo</th><th>Motivazione</th></tr></thead>
+                            <tbody>
+                                <template x-if="!diary().length"><tr><td colspan="4" class="empty">Nessuna operazione recente.</td></tr></template>
+                                <template x-for="d in diary()" :key="d.key">
+                                    <tr>
+                                        <td class="muted n" style="white-space:nowrap" x-text="d.when"></td>
+                                        <td class="r-s"><span class="tag" :class="d.kind === 'buy' ? 'blue' : ''" x-text="d.kind === 'buy' ? 'Acquisto' : 'Vendita'"></span></td>
+                                        <td class="sym" x-text="d.symbol"></td>
+                                        <td class="full"><div class="note" style="color:var(--ink-2);font-size:13px" x-text="d.text || '—'"></div></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
                     </div>
-                    <p class="lead" style="margin-top:12px" x-text="weather().text"></p>
                 </section>
 
-                <section class="sheet">
-                    <h2>Cosa ha fatto di recente</h2>
-                    <p class="faint" x-show="!diary().length">Ancora niente da raccontare: quando il bot compra o vende qualcosa lo trovi qui.</p>
-                    <ul class="diary">
-                        <template x-for="d in diary()" :key="d.key">
-                            <li>
-                                <span class="ic" :class="d.kind"><span class="ico" x-html="icon(d.kind === 'buy' ? 'shopping-cart' : 'hand-coins')"></span></span>
+                <div style="display:grid;gap:16px">
+                    <section class="panel">
+                        <header><h2>Stato del sistema</h2><span class="aside" x-text="cio.timestamp ? 'decisione delle ' + cio.timestamp.slice(0, 5) : ''"></span></header>
+                        <div class="body">
+                            <div class="kv">
+                                <div><span class="k"><span class="led" :class="botNow().lamp"></span>Bot</span><span class="v" x-text="botNow().title"></span>
+                                     <span class="sub" x-text="botNow().text"></span></div>
+                                <div><span class="k">Esecuzione ordini</span><span class="v" x-text="settings.auto_execute_trades ? 'Automatica' : 'Solo consigli'"></span></div>
+                                <div><span class="k">Borsa USA</span><span class="v" x-text="marketState().open ? 'Aperta' : 'Chiusa'"></span>
+                                     <span class="sub" x-text="marketState().text"></span></div>
+                                <div><span class="k">Ultima decisione</span><span class="v" x-text="decision().short"></span>
+                                     <span class="sub" x-show="decision().text" x-text="decision().text"></span></div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <header><h2>Regime di mercato</h2><button class="info" @click="help('regime')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></header>
+                        <div class="body">
+                            <div class="regime"><span class="name" x-text="regime().name"></span><span class="tag" :class="regime().tone" x-text="regime().tag"></span></div>
+                            <p class="desc" style="margin-top:6px" x-text="regime().text"></p>
+                            <template x-if="macro.vix != null">
                                 <div>
-                                    <h3 x-text="d.title"></h3>
-                                    <div class="when" x-text="d.when"></div>
-                                    <p x-show="d.text" x-text="d.text"></p>
+                                    <div class="scale" role="img" :aria-label="'Indice della paura ' + Number(macro.vix).toFixed(1)">
+                                        <template x-for="t in [20, 25, 28]" :key="t"><span class="tick" :style="'left:' + vixPos(t) + '%'"><span x-text="t"></span></span></template>
+                                        <span class="pin" :style="'left:' + vixPos(macro.vix) + '%'"><span class="n" x-text="'VIX ' + Number(macro.vix).toFixed(1)"></span></span>
+                                    </div>
+                                    <p class="desc">Indice della paura (VIX) <button class="info" @click="help('vix')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button>
+                                        sotto 20 calmo, 25 il bot riduce gli acquisti, 28 vende tutte le posizioni.</p>
                                 </div>
-                            </li>
-                        </template>
-                    </ul>
-                </section>
-
-                <section class="sheet" x-show="perf.trades">
-                    <h2>Il bilancio delle operazioni chiuse</h2>
-                    <div class="rows n">
-                        <div><span class="k">Operazioni chiuse negli ultimi 90 giorni</span><span class="v" x-text="perf.trades ?? '—'"></span></div>
-                        <div><span class="k">Quante hanno guadagnato <button class="q" @click="help('winrate')" aria-label="Cosa vuol dire">?</button></span>
-                             <span class="v" x-text="perf.win_rate != null ? Math.round(perf.win_rate) + ' su 100' : '—'"></span></div>
-                        <div><span class="k">Guadagno o perdita incassati</span><span class="v" :class="toneClass(perf.pnl)" x-text="usd(perf.pnl, true)"></span></div>
-                        <div><span class="k">Quanto tiene in media un titolo</span><span class="v" x-text="durationPlain(perf.avg_held_min)"></span></div>
-                    </div>
-                </section>
-            </div>
-        </div>
-
-        <!-- ================================================================ I MIEI TITOLI -->
-        <div x-show="tab === 'titoli'" x-cloak class="stack">
-            <section class="sheet">
-                <h2 x-text="positions.length ? 'Hai ' + positions.length + (positions.length === 1 ? ' titolo' : ' titoli') : 'Non hai titoli in questo momento'"></h2>
-                <p class="lead">Un titolo è un pezzetto di un'azienda. <button class="q" @click="help('titolo')" aria-label="Cos'è un titolo">?</button>
-                    Per ognuno vedi quanto stai guadagnando o perdendo e cosa farà il bot. Tocca un titolo per tutti i dettagli.</p>
-            </section>
-
-            <div class="cards">
-                <template x-for="p in positions" :key="p.symbol">
-                    <article class="sheet holding" @click="openPosition(p)" @keydown.enter="openPosition(p)" tabindex="0" role="button"
-                             :aria-label="'Apri i dettagli di ' + p.symbol">
-                        <div class="top">
-                            <div>
-                                <div class="sym" x-text="p.symbol"></div>
-                                <div class="faint n" x-text="qty(p.qty) + ' azioni · valgono ' + usd(p.market_value)"></div>
-                            </div>
-                            <div class="val n">
-                                <strong :class="toneClass(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></strong>
-                                <div :class="toneClass(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></div>
-                            </div>
+                            </template>
                         </div>
-
-                        <template x-if="track(p) !== null">
-                            <div class="track" role="img" :aria-label="planText(p)">
-                                <span class="lab l n" x-text="'vende a ' + price(stopPrice(p))"></span>
-                                <span class="lab r n" x-text="'incassa a ' + price(targetPrice(p))"></span>
-                                <span class="mark entry" :style="'left:' + entryMark(p) + '%'" title="Prezzo d'acquisto"></span>
-                                <span class="mark now" :style="'left:' + track(p) + '%'" :title="'Prezzo di adesso: ' + price(p.current_price)"></span>
-                                <span class="lab top n" :style="'left:' + track(p) + '%'" x-text="'ora ' + price(p.current_price)"></span>
-                            </div>
-                        </template>
-
-                        <div class="why">
-                            <div><span class="ico" x-html="icon('shield')"></span><p x-text="planText(p)"></p></div>
-                            <div x-show="p.buy_thesis"><span class="ico" x-html="icon('lightbulb')"></span><p><b>Perché l'ha comprato: </b><span x-text="p.buy_thesis"></span></p></div>
-                            <div x-show="p.hold_rationale"><span class="ico" x-html="icon('hourglass')"></span><p><b>Perché lo tiene: </b><span x-text="p.hold_rationale"></span></p></div>
-                        </div>
-                    </article>
-                </template>
+                    </section>
+                </div>
             </div>
 
-            <section class="sheet" x-show="closedPositions.length">
-                <h2>Venduti di recente</h2>
-                <ul class="diary">
-                    <template x-for="c in closedPositions" :key="c.symbol + c.closed_at">
-                        <li>
-                            <span class="ic sell"><span class="ico" x-html="icon('hand-coins')"></span></span>
-                            <div>
-                                <h3 x-text="'Ha venduto ' + c.symbol"></h3>
-                                <div class="when" x-text="dateTime(c.closed_at)"></div>
-                                <p x-text="c.exit_reason"></p>
-                            </div>
-                        </li>
-                    </template>
-                </ul>
+            <section class="panel" x-show="perf.trades">
+                <header><h2>Operazioni chiuse</h2><span class="aside">ultimi 90 giorni</span></header>
+                <div class="body">
+                    <div class="kpis" style="gap:0">
+                        <div class="stat" style="padding:4px 0"><div class="stat-label">Operazioni</div><div class="value n" style="font-size:18px" x-text="perf.trades ?? '—'"></div></div>
+                        <div class="stat" style="padding:4px 0"><div class="stat-label">Vinte <button class="info" @click="help('winrate')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></div><div class="value n" style="font-size:18px" x-text="perf.win_rate != null ? Math.round(perf.win_rate) + '%' : '—'"></div></div>
+                        <div class="stat" style="padding:4px 0"><div class="stat-label">Risultato realizzato</div><div class="value n" style="font-size:18px" :class="toneClass(perf.pnl)" x-text="usd(perf.pnl, true)"></div></div>
+                        <div class="stat" style="padding:4px 0"><div class="stat-label">Durata media</div><div class="value n" style="font-size:18px" x-text="durationPlain(perf.avg_held_min)"></div></div>
+                    </div>
+                </div>
             </section>
         </div>
+        </template>
 
-        <!-- ================================================================ IL MERCATO -->
-        <div x-show="tab === 'mercato'" x-cloak class="grid2">
-            <div class="stack">
-                <section class="sheet">
-                    <div class="weather">
-                        <div class="sky" :class="weather().tone"><span class="ico" x-html="icon(weather().icon)"></span></div>
-                        <div>
-                            <div class="faint">Il meteo del mercato <button class="q" @click="help('meteo')" aria-label="Cos'è il meteo del mercato">?</button></div>
-                            <div class="name" x-text="weather().name"></div>
-                        </div>
+        <!-- ================================================================ POSIZIONI -->
+        <template x-if="tab === 'titoli'">
+        <section class="panel">
+            <header><h2 x-text="positions.length ? positions.length + (positions.length === 1 ? ' posizione aperta' : ' posizioni aperte') : 'Nessuna posizione aperta'"></h2>
+                <span class="aside">seleziona una riga per motivazione e comandi</span></header>
+            <div class="body" style="padding-top:4px">
+                <p class="desc">Per ogni titolo: risultato non realizzato, uscita di sicurezza <button class="info" @click="help('stop')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button>
+                    e obiettivo <button class="info" @click="help('target')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button>. Il margine indica quanto può ancora scendere prima che il bot venda.</p>
+            </div>
+            <div class="tbl-wrap">
+                <table class="tbl stack pos">
+                    <thead><tr><th>Titolo</th><th class="r">Valore</th><th class="r">Peso</th><th class="r">Risultato</th><th class="r">Uscita</th><th class="r">Obiettivo</th><th>Margine dallo stop</th></tr></thead>
+                    <tbody>
+                        <template x-if="!positions.length"><tr><td colspan="7" class="empty">Il conto è interamente in liquidità.</td></tr></template>
+                        <template x-for="p in positions" :key="p.symbol">
+                            <tr class="click" @click="openPosition(p)" tabindex="0" @keydown.enter="openPosition(p)">
+                                <td><div class="sym" x-text="p.symbol"></div><div class="note" x-text="p.buy_thesis || (qty(p.qty) + ' azioni')"></div></td>
+                                <td class="r n" x-text="usd(p.market_value)"></td>
+                                <td class="r n hide-s" x-text="weightPct(p)"></td>
+                                <td class="r n"><div :class="toneClass(p.unrealized_pl)" x-text="usd(p.unrealized_pl, true)"></div><div class="note" :class="toneClass(p.unrealized_plpc)" x-text="pct(p.unrealized_plpc)"></div></td>
+                                <td class="r n hide-s" x-text="stopPrice(p) ? price(stopPrice(p)) : '—'"></td>
+                                <td class="r n hide-s" x-text="targetPrice(p) ? price(targetPrice(p)) : (p.scaled_out ? 'metà incassata' : '—')"></td>
+                                <td class="full"><div class="room"><div class="track"><span :class="roomTone(p)" :style="'width:' + roomPct(p) + '%'"></span></div><small x-text="roomText(p)"></small></div></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <template x-if="closedPositions.length">
+                <div>
+                    <header style="padding:16px 16px 0;display:flex;justify-content:space-between"><h2 style="font-size:14px;font-weight:600">Chiusure recenti</h2></header>
+                    <div class="tbl-wrap">
+                        <table class="tbl stack">
+                            <thead><tr><th>Data</th><th>Titolo</th><th>Motivo dell'uscita</th></tr></thead>
+                            <tbody>
+                                <template x-for="c in closedPositions" :key="c.symbol + c.closed_at">
+                                    <tr><td class="muted n" style="white-space:nowrap" x-text="dateShort(c.closed_at)"></td><td class="sym" x-text="c.symbol"></td>
+                                        <td class="full" style="color:var(--ink-2)" x-text="c.exit_reason"></td></tr>
+                                </template>
+                            </tbody>
+                        </table>
                     </div>
-                    <p class="lead" style="margin-top:12px" x-text="weather().text"></p>
-                    <div class="rows n" style="margin-top:14px">
+                </div>
+            </template>
+        </section>
+        </template>
+
+        <!-- ================================================================ MERCATO -->
+        <template x-if="tab === 'mercato'">
+        <div class="grid-2">
+            <section class="panel">
+                <header><h2>Titoli in valutazione</h2><span class="aside" x-text="candidates().length + ' recenti'"></span></header>
+                <div class="body" style="padding-top:4px"><p class="desc">Ogni titolo passa da più controlli prima di poter essere comprato: la maggior parte viene scartata, ed è il comportamento atteso.</p></div>
+                <div class="tbl-wrap">
+                    <table class="tbl stack">
+                        <thead><tr><th>Titolo</th><th>Stato</th><th>Dettaglio</th></tr></thead>
+                        <tbody>
+                            <template x-if="!candidates().length"><tr><td colspan="3" class="empty">Nessun titolo in valutazione in questo momento.</td></tr></template>
+                            <template x-for="r in candidates()" :key="r.symbol + (r.updated_at || r.discovered_at)">
+                                <tr><td class="sym" x-text="r.symbol"></td><td><span class="tag" :class="candidateTone(r.status)" x-text="plainStatus(r.status)"></span></td>
+                                    <td class="full" style="color:var(--ink-2)" x-text="candidateWhy(r)"></td></tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+            <section class="panel">
+                <header><h2>Regime di mercato</h2><button class="info" @click="help('regime')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></header>
+                <div class="body">
+                    <div class="regime"><span class="name" x-text="regime().name"></span><span class="tag" :class="regime().tone" x-text="regime().tag"></span></div>
+                    <p class="desc" style="margin-top:6px" x-text="regime().text"></p>
+                    <div class="kv" style="margin-top:12px">
                         <template x-for="ix in indexCards()" :key="ix.key">
-                            <div><span class="k"><span x-text="ix.name"></span>
-                                    <button class="q" x-show="ix.help" @click="help(ix.help)" :aria-label="'Cos\'è ' + ix.name">?</button></span>
-                                 <span class="v"><span class="tag" :class="ix.up ? 'good' : 'bad'" x-text="ix.up ? 'In salita' : 'In discesa'"></span></span></div>
+                            <div><span class="k"><span x-text="ix.name"></span><button class="info" x-show="ix.help" @click="help(ix.help)" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></span>
+                                 <span class="v"><span class="tag" :class="ix.up ? 'good' : 'bad'" x-text="ix.up ? 'Sopra la media a 50 giorni' : 'Sotto la media a 50 giorni'"></span></span></div>
                         </template>
-                        <div x-show="macro.vix != null"><span class="k">Indice della paura <button class="q" @click="help('vix')" aria-label="Cos'è l'indice della paura">?</button></span>
-                             <span class="v" x-text="fearText()"></span></div>
+                        <div x-show="macro.vix != null"><span class="k">Indice della paura (VIX)<button class="info" @click="help('vix')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></span>
+                             <span class="v n" x-text="fearText()"></span></div>
                     </div>
-                </section>
-            </div>
-
-            <div class="stack">
-                <section class="sheet">
-                    <h2>Titoli che il bot sta valutando</h2>
-                    <p class="lead">Il bot cerca di continuo aziende interessanti. Prima di comprarne una la esamina con molti controlli: la maggior parte viene scartata, ed è normale.</p>
-                    <p class="faint" style="margin-top:10px" x-show="!candidates().length">In questo momento non ci sono titoli sotto esame.</p>
-                    <ul class="diary">
-                        <template x-for="r in candidates()" :key="r.symbol + (r.updated_at || r.discovered_at)">
-                            <li>
-                                <span class="ic" :class="r.status === 'REJECTED_BY_RISK' || r.status === 'EXPIRED' ? 'sell' : 'buy'">
-                                    <span class="ico" x-html="icon(candidateIcon(r.status))"></span></span>
-                                <div>
-                                    <h3><span x-text="r.symbol"></span> <span class="tag" :class="candidateTone(r.status)" x-text="plainStatus(r.status)"></span></h3>
-                                    <p x-text="candidateWhy(r)"></p>
-                                </div>
-                            </li>
-                        </template>
-                    </ul>
-                </section>
-            </div>
-        </div>
-
-        <!-- ================================================================ CHIEDI AL BOT -->
-        <div x-show="tab === 'chiedi'" x-cloak class="stack" style="max-width:760px">
-            <section class="sheet">
-                <h2>Chiedi al bot</h2>
-                <p class="lead">Scrivi una domanda con parole tue. Il bot guarda il conto e il mercato, e se serve cerca su internet. Se gli chiedi di cambiare qualcosa, prima ti chiede conferma.</p>
-                <div class="suggest">
-                    <template x-for="(p, key) in personas" :key="key">
-                        <button :style="persona === key ? 'border-color:var(--pen);color:var(--pen)' : ''" @click="persona = key; scrollChat()"
-                                x-text="key === 'coo' ? 'Parla con il bot' : 'Parla con il controllore del rischio'"></button>
-                    </template>
                 </div>
             </section>
+        </div>
+        </template>
 
-            <section class="sheet">
+        <!-- ================================================================ ASSISTENTE -->
+        <template x-if="tab === 'chiedi'">
+        <section class="panel" style="max-width:860px">
+            <header><h2>Assistente</h2>
+                <div class="segm">
+                    <template x-for="(p, key) in personas" :key="key">
+                        <button :class="persona === key && 'on'" @click="persona = key; scrollChat()" x-text="key === 'coo' ? 'Operazioni' : 'Rischio'"></button>
+                    </template>
+                </div></header>
+            <div class="body">
+                <p class="desc" style="margin-bottom:10px">Domande in linguaggio naturale su conto, posizioni e mercato. Le modifiche al bot vengono proposte e applicate solo dopo la tua conferma.</p>
                 <div x-ref="chat" class="talk">
-                    <p class="quiet" x-show="!personaMessages().length" x-text="personas[persona].tagline"></p>
+                    <p class="muted" x-show="!personaMessages().length" x-text="personas[persona].tagline"></p>
                     <template x-for="m in personaMessages()" :key="m.id">
-                        <div class="bubble" :class="m.role === 'user' ? 'me' : 'bot'">
-                            <div class="who" x-show="m.role !== 'user'" x-text="(m.author || 'Bot') + (m.verdict ? ' · ' + verdictPlain(m.verdict) : '')"></div>
-                            <div class="msg" x-text="m.text"></div>
+                        <div class="msg-row" :class="m.role === 'user' && 'me'">
+                            <span class="who" x-text="m.role === 'user' ? 'Tu' : ((m.author || 'Bot') + (m.verdict ? ' · ' + verdictPlain(m.verdict) : ''))"></span>
+                            <div class="txt" x-text="m.text"></div>
                         </div>
                     </template>
-                    <p class="faint" x-show="chatSending">Il bot sta pensando…</p>
+                    <p class="muted" x-show="chatSending">Elaborazione in corso…</p>
                 </div>
-                <div class="confirm" x-show="chatPending[persona]" style="margin-top:12px">
-                    <span style="flex:1;min-width:200px" x-text="'Vuoi che lo faccia? ' + (chatPending[persona] || '')"></span>
-                    <button class="k-btn small main" @click="sendChat('sì, conferma')" :disabled="chatSending">Sì, fallo</button>
-                    <button class="k-btn small" @click="sendChat('no, annulla')" :disabled="chatSending">No</button>
+                <div class="confirm" x-show="chatPending[persona]">
+                    <span style="flex:1;min-width:200px" x-text="'Conferma richiesta: ' + (chatPending[persona] || '')"></span>
+                    <button class="ui-btn primary" @click="sendChat('sì, conferma')" :disabled="chatSending">Conferma</button>
+                    <button class="ui-btn" @click="sendChat('no, annulla')" :disabled="chatSending">Annulla</button>
                 </div>
                 <form class="ask" @submit.prevent="sendChat()">
-                    <input x-ref="cmd" x-model="chatInput" maxlength="800" :disabled="chatSending" placeholder="Per esempio: perché hai comprato Apple?"
-                           aria-label="La tua domanda">
-                    <button type="submit" class="k-btn main" :disabled="chatSending || !chatInput.trim()">Invia</button>
+                    <input x-ref="cmd" x-model="chatInput" maxlength="800" :disabled="chatSending" placeholder="Es. perché è stato comprato questo titolo?" aria-label="Domanda">
+                    <button type="submit" class="ui-btn primary" style="height:38px" :disabled="chatSending || !chatInput.trim()">Invia</button>
                 </form>
-                <div class="suggest">
-                    <template x-for="s in chatSuggestions" :key="s">
-                        <button @click="sendChat(s)" :disabled="chatSending" x-text="s"></button>
-                    </template>
+                <div class="chips">
+                    <template x-for="s in chatSuggestions" :key="s"><button @click="sendChat(s)" :disabled="chatSending" x-text="s"></button></template>
                 </div>
-            </section>
-        </div>
+            </div>
+        </section>
+        </template>
 
-        <!-- ================================================================ SALA MACCHINE (vista tecnica di prima) -->
-        <div x-show="tab === 'macchine'" x-cloak>
+        <!-- ================================================================ DIAGNOSTICA (vista tecnica di prima) -->
+        <div x-show="tab === 'macchine'" x-cloak style="display:grid;gap:12px">
             <div class="engine-intro">
-                <p class="quiet" style="max-width:62ch;margin:0">Qui ci sono tutti i dettagli tecnici: gli agenti, i controlli, i registri. Non serve guardarli per usare il bot.</p>
-                <div class="subtabs">
+                <p class="desc muted" style="max-width:70ch;margin:0">Dettagli tecnici del motore: agenti, controlli, registri e log. Non servono per l'uso quotidiano.</p>
+                <div class="segm">
                     <template x-for="t in engineTabs" :key="t.id">
                         <button :class="engineTab === t.id && 'on'" @click="engineTab = t.id; icons()" x-text="t.label"></button>
                     </template>
@@ -756,14 +756,23 @@
     </div>
             </div>
         </div>
-    </main>
+        </main>
+    </div>
+</div>
+
+    <!-- ============ MENU IN BASSO (telefono) ============ -->
+    <nav class="mnav" aria-label="Sezioni">
+        <template x-for="t in tabs" :key="t.id">
+            <button :class="tab === t.id && 'on'" @click="tab = t.id"><span class="ico" x-html="icon(t.icon)"></span><span x-text="t.short || t.label"></span></button>
+        </template>
+    </nav>
 
     <!-- ============ GLOSSARIO ============ -->
     <div x-cloak x-show="helpKey" class="overlay" @keydown.escape.window="helpKey = ''" role="dialog" aria-modal="true">
         <div class="backdrop" @click="helpKey = ''"></div>
         <div class="dialog" style="max-width:480px">
             <header><h2 x-text="glossary[helpKey]?.t"></h2><button class="x" @click="helpKey = ''" aria-label="Chiudi">✕</button></header>
-            <div class="body"><p style="margin:0;font-size:18px" x-text="glossary[helpKey]?.d"></p></div>
+            <div class="body"><p style="margin:0" x-text="glossary[helpKey]?.d"></p></div>
         </div>
     </div>
 
@@ -819,7 +828,7 @@
                     </div>
                     <form @submit.prevent="addTicker()" style="display:flex;gap:8px">
                         <input type="text" x-model="tickerInput" :disabled="locked('watchlist')" maxlength="15" placeholder="Es. GOOGL" style="flex:1;min-width:0;text-transform:uppercase">
-                        <button type="submit" class="k-btn" :disabled="locked('watchlist')">Aggiungi</button>
+                        <button type="submit" class="ui-btn" :disabled="locked('watchlist')">Aggiungi</button>
                     </form>
                 </div>
 
@@ -846,8 +855,8 @@
             </div>
             <footer>
                 <span class="note" :class="noticeError ? 'down-t' : 'up-t'" x-text="notice"></span>
-                <button @click="showSettings = false" class="k-btn">Chiudi</button>
-                <button @click="saveSettings()" :disabled="saving" class="k-btn main">Salva</button>
+                <button @click="showSettings = false" class="ui-btn">Chiudi</button>
+                <button @click="saveSettings()" :disabled="saving" class="ui-btn primary">Salva</button>
             </footer>
         </div>
     </div>
@@ -862,16 +871,16 @@
                 <p x-show="posError" class="down-t" style="margin:0" x-text="posError"></p>
                 <template x-if="posDetail && !posLoading">
                     <div class="stack">
-                        <p style="margin:0;font-size:20px" x-text="positionHeadline(posDetail.position)"></p>
+                        <p class="lead-line" x-text="positionHeadline(posDetail.position)"></p>
                         <div class="rows n">
                             <div><span class="k">Comprato il</span><span class="v" x-text="dateTime(posDetail.opened_at)"></span></div>
                             <div><span class="k">Prezzo pagato per azione</span><span class="v" x-text="price(posDetail.position.avg_entry_price)"></span></div>
                             <div><span class="k">Prezzo di adesso</span><span class="v" x-text="price(posDetail.position.current_price)"></span></div>
                             <div><span class="k">Azioni possedute</span><span class="v" x-text="qty(posDetail.position.qty)"></span></div>
                             <div><span class="k">Valore oggi</span><span class="v" x-text="usd(posDetail.position.market_value)"></span></div>
-                            <div><span class="k">Uscita di sicurezza <button class="q" @click="help('stop')" aria-label="Cos'è l'uscita di sicurezza">?</button></span>
+                            <div><span class="k">Uscita di sicurezza <button class="info" @click="help('stop')" aria-label="Cos'è l'uscita di sicurezza"><span class="ico" x-html="icon('info')"></span></button></span>
                                  <span class="v down-t" x-text="posDetail.stop_loss?.price ? price(posDetail.stop_loss.price) : '—'"></span></div>
-                            <div><span class="k">Obiettivo <button class="q" @click="help('target')" aria-label="Cos'è l'obiettivo">?</button></span>
+                            <div><span class="k">Obiettivo <button class="info" @click="help('target')" aria-label="Cos'è l'obiettivo"><span class="ico" x-html="icon('info')"></span></button></span>
                                  <span class="v up-t" x-text="posDetail.take_profit?.price ? price(posDetail.take_profit.price) : '—'"></span></div>
                         </div>
                         <div class="why" style="margin-top:0">
@@ -899,12 +908,12 @@
             </div>
             <footer>
                 <span class="note" :class="posNoticeError ? 'down-t' : 'up-t'" x-text="posNotice"></span>
-                <button @click="deRisk(posDetail?.position)" class="k-btn"
+                <button @click="deRisk(posDetail?.position)" class="ui-btn"
                         :disabled="!posDetail || !canDeRisk({...posDetail.position, scaled_out: !!posDetail.guardian?.scale_out}) || deRisking"
                         title="Disponibile solo se il titolo è in guadagno">
                     <span class="ico" x-html="icon('shield-check')"></span>Metti al sicuro il guadagno</button>
-                <button class="q" @click="help('rischiozero')" aria-label="Cosa fa">?</button>
-                <button @click="sellNow()" :disabled="selling || !posDetail" class="k-btn danger">Vendi subito</button>
+                <button class="info" @click="help('rischiozero')" aria-label="Cosa fa"><span class="ico" x-html="icon('info')"></span></button>
+                <button @click="sellNow()" :disabled="selling || !posDetail" class="ui-btn danger">Vendi subito</button>
             </footer>
         </div>
     </div>
