@@ -6,13 +6,14 @@ function dashboard() {
         connected: true,
         tab: 'oggi',
         tabs: [
-            { id: 'oggi', label: 'Oggi', icon: 'house' },
-            { id: 'titoli', label: 'I miei titoli', icon: 'wallet' },
-            { id: 'mercato', label: 'Il mercato', icon: 'cloud-sun' },
-            { id: 'chiedi', label: 'Chiedi', icon: 'message-circle' },
-            { id: 'macchine', label: 'Sala macchine', icon: 'cog' },
+            { id: 'oggi', label: 'Panoramica', icon: 'layout-dashboard' },
+            { id: 'titoli', label: 'Posizioni', icon: 'briefcase' },
+            { id: 'mercato', label: 'Mercato', icon: 'activity' },
+            { id: 'chiedi', label: 'Assistente', icon: 'message-square' },
+            { id: 'macchine', label: 'Diagnostica', icon: 'wrench' },
         ],
-        // Sala macchine: la vista tecnica di prima, divisa in sotto-schede
+        MAX_POSITIONS: 5,   // agents/portfolio_allocator.py (MAX_POSITIONS)
+        // Diagnostica: la vista tecnica di prima, divisa in sotto-schede
         engineTab: 'agenti',
         engineTabs: [
             { id: 'agenti', label: 'Agenti' },
@@ -20,23 +21,23 @@ function dashboard() {
             { id: 'audit', label: 'Registro e pagella' },
             { id: 'log', label: 'Log tecnici' },
         ],
-        // Glossario: ogni parola tecnica ha un "?" che apre questa spiegazione
+        // Glossario: ogni parola tecnica ha un'icona ⓘ che apre questa spiegazione
         helpKey: '',
         glossary: {
-            conto: { t: 'Valore totale del conto', d: 'La somma dei soldi in cassa e del valore di oggi dei titoli che hai. Cambia durante il giorno perché cambiano i prezzi.' },
-            investito: { t: 'Soldi investiti', d: 'Soldi usati per comprare titoli. Possono crescere o scendere insieme al prezzo dei titoli.' },
-            cassa: { t: 'Soldi in cassa', d: 'Soldi non investiti. Non guadagnano e non perdono, e sono pronti per le prossime occasioni.' },
-            titolo: { t: 'Titolo (o azione)', d: "Un pezzetto di un'azienda quotata in borsa, per esempio Apple. Se l'azienda vale di più, anche il tuo pezzetto vale di più." },
-            stop: { t: 'Uscita di sicurezza', d: 'Il prezzo sotto il quale il bot vende da solo, per non perdere troppo. Lo decide prima di comprare. In gergo si chiama "stop loss".' },
-            target: { t: 'Obiettivo', d: 'Il prezzo a cui il bot vende metà del titolo per incassare il guadagno. Il resto lo tiene finché il prezzo continua a salire.' },
-            meteo: { t: 'Il meteo del mercato', d: 'Un modo semplice per dire come va la borsa americana: sereno quando sale tranquilla, pioggia quando scende, temporale quando c\'è paura. Il bot compra di più con il bel tempo e meno con il brutto.' },
-            spy: { t: 'SPY', d: 'Un unico titolo che contiene le 500 aziende più grandi degli Stati Uniti. Si usa come termometro del mercato americano.' },
-            qqq: { t: 'QQQ', d: 'Un unico titolo che contiene le 100 aziende più grandi del Nasdaq, quasi tutte tecnologiche.' },
-            btc: { t: 'Bitcoin', d: 'La criptovaluta più conosciuta. Si muove spesso in modo diverso dalle azioni e con salti più grandi.' },
-            vix: { t: 'Indice della paura (VIX)', d: 'Misura quanto gli investitori si aspettano movimenti bruschi nei prossimi giorni. Sotto 20 il mercato è calmo, sopra 30 c\'è paura.' },
-            winrate: { t: 'Operazioni vinte', d: 'Su 100 operazioni chiuse, quante hanno guadagnato. Non serve vincerle tutte: conta che le vincite siano più grandi delle perdite.' },
-            rischiozero: { t: 'Metti al sicuro il guadagno', d: 'Vende subito metà del titolo e sposta l\'uscita di sicurezza del resto al prezzo che hai pagato. Da lì in poi su quel titolo non puoi più perdere.' },
-            pausa: { t: 'Bot in pausa', d: 'Il bot non compra e non vende. I titoli che hai restano dove sono.' },
+            conto: { t: 'Valore del conto', d: 'Liquidità più valore di mercato delle posizioni aperte. Varia durante la giornata con i prezzi.' },
+            investito: { t: 'Capitale investito', d: 'Valore di mercato delle posizioni aperte: sale e scende con i prezzi dei titoli.' },
+            cassa: { t: 'Liquidità', d: 'Capitale non investito: non è esposto ai movimenti di mercato ed è disponibile per nuovi acquisti.' },
+            titolo: { t: 'Titolo', d: "Azione di una società quotata (per esempio Apple): rappresenta una quota dell'azienda." },
+            stop: { t: 'Uscita di sicurezza (stop loss)', d: 'Prezzo sotto il quale il bot vende automaticamente per limitare la perdita. Viene fissato prima dell\'acquisto in base alla volatilità del titolo (3 volte l\'escursione media giornaliera, tra 1,5% e 9%).' },
+            target: { t: 'Obiettivo', d: 'Prezzo a cui il bot vende metà della posizione per incassare il guadagno (3 volte il rischio iniziale). La parte restante segue il prezzo con uno stop mobile.' },
+            regime: { t: 'Regime di mercato', d: 'Lo stato della borsa americana secondo le regole del bot: tendenza dei principali indici rispetto alle loro medie e livello dell\'indice della paura (VIX). Con un regime favorevole il bot usa il budget di rischio pieno; con un regime prudente o ribassista compra meno; oltre VIX 28 vende tutte le posizioni.' },
+            spy: { t: 'SPY', d: 'ETF che replica l\'indice S&P 500, le 500 maggiori società statunitensi: il riferimento per il mercato americano.' },
+            qqq: { t: 'QQQ', d: 'ETF che replica il Nasdaq-100, le 100 maggiori società non finanziarie del Nasdaq, in prevalenza tecnologiche.' },
+            btc: { t: 'Bitcoin', d: 'La principale criptovaluta. Più volatile delle azioni e negoziata 24 ore su 24.' },
+            vix: { t: 'Indice della paura (VIX)', d: 'Volatilità attesa dello S&P 500 nei prossimi 30 giorni. Sotto 20 mercato calmo; da 25 il bot riduce il rischio; da 28 il Guardian liquida le posizioni.' },
+            winrate: { t: 'Operazioni vinte', d: 'Percentuale di operazioni chiuse in guadagno. Va letta insieme al risultato: conta che le vincite siano più grandi delle perdite.' },
+            rischiozero: { t: 'Metti al sicuro il guadagno', d: 'Vende subito il 50% della posizione e porta l\'uscita di sicurezza del resto al prezzo di carico più le commissioni: da quel momento la posizione non può chiudersi in perdita.' },
+            pausa: { t: 'Bot in pausa', d: 'Nessun acquisto né vendita automatica. Le posizioni aperte restano invariate.' },
         },
         // Agent Matrix
         agents: [], blocks: { asset_classes: [], sectors: [], symbols: [] }, blockLabels: [], tuning: null, agentBusy: '',
@@ -113,51 +114,87 @@ function dashboard() {
         },
         todayWhy() {
             const n = this.positions.length;
-            if (!n) return 'Non hai titoli: i soldi sono tutti in cassa, quindi il totale non si muove.';
-            const pct = this.pct(this.account.daily_pnl_pct);
-            return `Il totale cambia perché cambiano i prezzi dei ${n === 1 ? 'titolo' : n + ' titoli'} che hai (${pct} oggi). `
-                + 'Guadagni e perdite diventano definitivi solo quando il bot vende.';
+            if (!n) return 'Conto interamente in liquidità: il valore non varia con i prezzi di mercato.';
+            return `Variazione dei prezzi delle ${n === 1 ? 'posizione aperta' : n + ' posizioni aperte'}. `
+                + 'Il risultato diventa realizzato solo alla vendita.';
         },
         botNow() {
-            if (!this.connected) return { lamp: 'off', title: 'Non collegato', text: 'Il server del bot non risponde. Riprovo da solo ogni secondo.' };
-            if (!this.bot.active) return { lamp: 'pause', title: 'In pausa', text: 'Il bot è in pausa: non compra e non vende. I titoli che hai restano dove sono. Premi "Riaccendi" per farlo ripartire.' };
+            if (!this.connected) return { lamp: 'off', title: 'Non collegato', text: 'Il server non risponde; nuovo tentativo automatico ogni secondo.' };
+            if (!this.bot.active) return { lamp: 'pause', title: 'In pausa', text: 'Nessun acquisto né vendita automatica. Le posizioni aperte restano invariate.' };
             const busy = String(this.bot.status || '').startsWith('Scansione');
             const mode = this.settings.auto_execute_trades
-                ? 'Compra e vende da solo, seguendo le sue regole di sicurezza.'
-                : 'Ti dà solo consigli: non invia ordini.';
+                ? 'Ordini inviati automaticamente entro i limiti di rischio.'
+                : 'Modalità consulenza: le decisioni vengono registrate, nessun ordine inviato.';
             const pnl = Number(this.account.daily_pnl_pct);
-            const careful = !isNaN(pnl) && pnl <= -3 ? ' Oggi il conto è sceso parecchio, quindi è più prudente del solito.' : '';
-            return { lamp: 'on', title: busy ? 'Sta esaminando il mercato' : 'Al lavoro',
-                     text: (busy ? 'Sta esaminando il mercato proprio ora. ' : 'È acceso e controlla il mercato a intervalli regolari. ') + mode + careful };
+            const careful = !isNaN(pnl) && pnl <= -3 ? ' Perdita giornaliera elevata: rischio ridotto.' : '';
+            return { lamp: 'on', title: busy ? 'Analisi in corso' : 'Operativo',
+                     text: (busy ? 'Ciclo di analisi in corso. ' : 'Analisi del mercato a intervalli regolari. ') + mode + careful };
         },
         decision() {
             const c = this.cio || {};
             const why = c.reason ? String(c.reason) : '';
-            if (!c.action) return { title: 'non ha ancora preso decisioni da quando si è acceso.', text: '' };
-            if (c.action === 'BUY') return { title: `ha deciso di comprare ${c.buy_symbol}` + (c.amount ? ` per ${this.usd(c.amount)}.` : '.'), text: why };
-            if (c.action === 'ROTATE') return { title: `ha venduto una parte di ${c.sell_symbol} per comprare ${c.buy_symbol}.`, text: why };
-            if (c.action === 'SELL') return { title: `ha deciso di vendere ${c.sell_symbol}.`, text: why };
-            return { title: 'per ora non compra niente.', text: why };
+            if (!c.action) return { title: 'nessuna decisione dall\'avvio.', short: '—', text: '' };
+            if (c.action === 'BUY') return { title: `acquisto di ${c.buy_symbol}` + (c.amount ? ` per ${this.usd(c.amount)}.` : '.'),
+                                             short: `Acquisto ${c.buy_symbol}` + (c.amount ? ` · ${this.usd(c.amount)}` : ''), text: why };
+            if (c.action === 'ROTATE') return { title: `rotazione da ${c.sell_symbol} a ${c.buy_symbol}.`, short: `Rotazione ${c.sell_symbol} → ${c.buy_symbol}`, text: why };
+            if (c.action === 'SELL') return { title: `vendita di ${c.sell_symbol}.`, short: `Vendita ${c.sell_symbol}`, text: why };
+            return { title: 'nessun acquisto.', short: 'Attesa', text: why };
         },
         moneySentence() {
             const inv = this.investedPct();
-            if (inv === null) return 'Sto calcolando come sono divisi i tuoi soldi…';
-            const n = this.positions.length;
-            if (inv < 0.5) return 'Tutti i tuoi soldi sono in cassa: in questo momento non hai titoli.';
-            return `${inv.toFixed(0)} su 100 dei tuoi soldi sono investiti in ${n === 1 ? 'un titolo' : n + ' titoli'}; `
-                + `gli altri ${(100 - inv).toFixed(0)} sono in cassa, pronti per nuove occasioni.`;
+            if (inv === null) return 'Calcolo della ripartizione in corso.';
+            if (inv < 0.5) return 'Nessuna posizione aperta: capitale interamente disponibile.';
+            return `${inv.toFixed(0)}% investito, ${(100 - inv).toFixed(0)}% disponibile per nuovi ingressi.`;
         },
-        weather() {
+        // Regime di mercato (stesse soglie del bot): trend degli indici + indice della paura
+        regime() {
             const st = (this.macro.regime || {}).stock;
             const vix = this.macro.vix == null ? NaN : Number(this.macro.vix);
-            if (!st) return { icon: 'cloud', tone: 'calm', name: 'Sto leggendo il mercato', text: 'Le informazioni sul mercato arrivano tra poco.' };
-            if (!isNaN(vix) && vix >= 30) return { icon: 'cloud-lightning', tone: 'bad', name: 'Temporale',
-                text: `C'è molta paura sui mercati (indice della paura a ${vix.toFixed(0)}). Il bot investe molto meno del solito e protegge quello che ha.` };
-            if (st === 'RISK-OFF') return { icon: 'cloud-rain', tone: 'bad', name: 'Pioggia',
-                text: 'La borsa americana sta scendendo o è nervosa. Il bot compra meno e con più prudenza.' };
-            if (!isNaN(vix) && vix >= 25) return { icon: 'cloud-sun', tone: 'warn', name: 'Variabile',
-                text: `La borsa sale ma è agitata (indice della paura a ${vix.toFixed(0)}). Il bot investe con cautela.` };
-            return { icon: 'sun', tone: 'good', name: 'Sereno', text: 'La borsa americana sale ed è tranquilla. È il momento in cui il bot lavora di più.' };
+            if (!st) return { name: 'In aggiornamento', tag: '—', tone: '', text: 'I dati di mercato arrivano con il prossimo ciclo dello sciame.' };
+            if (!isNaN(vix) && vix >= 28) return { name: 'Stress', tag: 'VIX ' + vix.toFixed(1), tone: 'bad',
+                text: 'Volatilità estrema: il Guardian liquida le posizioni e non si aprono nuovi rischi.' };
+            if (st === 'RISK-OFF') return { name: 'Ribassista', tag: 'rischio ridotto', tone: 'bad',
+                text: 'Indici sotto la media a 50 giorni o volatilità in aumento: acquisti ridotti e più selettivi.' };
+            if (!isNaN(vix) && vix >= 25) return { name: 'Prudente', tag: 'VIX ' + vix.toFixed(1), tone: 'warn',
+                text: 'Tendenza positiva ma volatilità alta: budget di rischio ridotto al 60%.' };
+            return { name: 'Favorevole', tag: 'rischio pieno', tone: 'good', text: 'Indici in tendenza positiva e volatilità contenuta: budget di rischio pieno.' };
+        },
+        vixPos(v) { return Math.min(100, Math.max(0, (Number(v) - 10) / 30 * 100)); },   // scala VIX 10-40
+        marketState() {
+            const closed = this.radar.pulse != null || /chiuso/i.test(String(this.channels.mode || ''));
+            if (!closed) return { open: true, label: 'Borsa USA aperta', text: 'Negoziazione regolare, 15:30-22:00 ora italiana.' };
+            return { open: false, label: 'Borsa USA chiusa',
+                     text: this.settings.closed_market_mode === 'crypto'
+                        ? 'Acquisti solo su crypto (mercato 24/7).'
+                        : 'Acquisti solo su crypto; le azioni vengono analizzate per l\'apertura.' };
+        },
+        slotsText() {
+            const free = Math.max(0, this.MAX_POSITIONS - this.positions.length);
+            return free ? `${free} ${free === 1 ? 'posto libero' : 'posti liberi'} per nuovi acquisti.`
+                        : 'Limite raggiunto: nuovi acquisti solo dopo una vendita.';
+        },
+        weightPct(p) {
+            const eq = Number(this.account.portfolio);
+            return eq ? (p.market_value / eq * 100).toLocaleString('it-IT', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + '%' : '—';
+        },
+        dateShort(v) {
+            if (!v) return '—';
+            const d = new Date(v);
+            return isNaN(d) ? String(v) : d.toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+        },
+        // Margine dallo stop: frazione della distanza ingresso-stop ancora disponibile prima dell'uscita
+        roomPct(p) {
+            const stop = this.stopPrice(p);
+            if (stop === null || !p.current_price || !p.avg_entry_price) return 0;
+            if (stop >= p.avg_entry_price) return 100;                          // stop già in guadagno
+            return Math.min(100, Math.max(0, (p.current_price - stop) / (p.avg_entry_price - stop) * 100));
+        },
+        roomTone(p) { const r = this.roomPct(p); return r < 25 ? 'bad' : r < 50 ? 'warn' : ''; },
+        roomText(p) {
+            const stop = this.stopPrice(p);
+            if (stop === null || !p.current_price) return 'uscita in calcolo';
+            if (stop >= p.avg_entry_price) return 'stop in guadagno';
+            return `${((p.current_price / stop - 1) * 100).toFixed(1).replace('.', ',')}% sopra l'uscita`;
         },
         indexCards() {
             const names = { SPY: ['Le 500 aziende più grandi degli USA', 'spy'], QQQ: ['Le grandi aziende tecnologiche USA', 'qqq'], 'BTC-USD': ['Bitcoin', 'btc'] };
@@ -167,7 +204,7 @@ function dashboard() {
         fearText() {
             const v = Number(this.macro.vix);
             if (isNaN(v)) return '—';
-            return v.toFixed(0) + (v < 20 ? ', calmo' : v < 30 ? ', un po\' agitato' : ', molta paura');
+            return v.toFixed(1).replace('.', ',') + (v < 20 ? ' · calmo' : v < 25 ? ' · moderato' : v < 28 ? ' · alto' : ' · estremo');
         },
         durationPlain(min) {
             if (min === null || min === undefined) return '—';
@@ -180,11 +217,11 @@ function dashboard() {
             const items = [];
             for (const p of this.positions) {
                 if (!p.opened_at) continue;
-                items.push({ key: 'b' + p.symbol, kind: 'buy', ts: Date.parse(p.opened_at) || 0, when: this.dateTime(p.opened_at),
+                items.push({ key: 'b' + p.symbol, kind: 'buy', symbol: p.symbol, ts: Date.parse(p.opened_at) || 0, when: this.dateShort(p.opened_at),
                              title: `Ha comprato ${p.symbol}`, text: p.buy_thesis || '' });
             }
             for (const c of this.closedPositions) {
-                items.push({ key: 's' + c.symbol + c.closed_at, kind: 'sell', ts: Date.parse(c.closed_at) || 0, when: this.dateTime(c.closed_at),
+                items.push({ key: 's' + c.symbol + c.closed_at, kind: 'sell', symbol: c.symbol, ts: Date.parse(c.closed_at) || 0, when: this.dateShort(c.closed_at),
                              title: `Ha venduto ${c.symbol}`, text: c.exit_reason || '' });
             }
             return items.sort((a, b) => b.ts - a.ts).slice(0, 6);
@@ -219,9 +256,8 @@ function dashboard() {
         positionHeadline(p) {
             if (!p) return '';
             const v = Number(p.unrealized_pl);
-            if (isNaN(v) || Math.abs(v) < 0.01) return `Su ${p.symbol} per ora sei in pari.`;
-            return v > 0 ? `Su ${p.symbol} stai guadagnando ${this.usd(v)} (${this.pct(p.unrealized_plpc)}).`
-                         : `Su ${p.symbol} stai perdendo ${this.usd(Math.abs(v))} (${this.pct(p.unrealized_plpc)}).`;
+            if (isNaN(v) || Math.abs(v) < 0.01) return `${p.symbol}: posizione in pari.`;
+            return `${p.symbol}: risultato non realizzato ${this.usd(v, true)} (${this.pct(p.unrealized_plpc)}).`;
         },
         // Titoli sotto esame (radar)
         candidates() {
@@ -237,7 +273,7 @@ function dashboard() {
                      EXPIRED: 'Scaduto', EXECUTED: 'Comprato' }[st] || st;
         },
         candidateTone(st) {
-            return { APPROVED_BY_RISK: 'good', EXECUTED: 'info', REJECTED_BY_RISK: 'bad', EXPIRED: '' }[st] ?? 'warn';
+            return { APPROVED_BY_RISK: 'good', EXECUTED: 'blue', REJECTED_BY_RISK: 'bad', EXPIRED: '' }[st] ?? 'warn';
         },
         candidateIcon(st) {
             return { APPROVED_BY_RISK: 'circle-check', EXECUTED: 'shopping-cart', REJECTED_BY_RISK: 'circle-x', EXPIRED: 'clock' }[st] || 'search';
