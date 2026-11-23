@@ -38,6 +38,8 @@ function dashboard() {
             winrate: { t: 'Operazioni vinte', d: 'Percentuale di operazioni chiuse in guadagno. Va letta insieme al risultato: conta che le vincite siano più grandi delle perdite.' },
             rischiozero: { t: 'Metti al sicuro il guadagno', d: 'Vende subito il 50% della posizione e porta l\'uscita di sicurezza del resto al prezzo di carico più le commissioni: da quel momento la posizione non può chiudersi in perdita.' },
             pausa: { t: 'Bot in pausa', d: 'Nessun acquisto né vendita automatica. Le posizioni aperte restano invariate.' },
+            daytrade: { t: 'Day-trading SPY', d: 'Strategia intraday dello studio "Beat the Market" (Zarattini, Aziz, Barbon 2024). Ogni giorno il bot calcola l\'area di rumore di SPY: quanto si muove normalmente dall\'apertura negli ultimi 14 giorni. Ogni 30 minuti, se il prezzo esce sopra l\'area compra, se esce sotto vende allo scoperto; lo stop è il VWAP o il bordo dell\'area. Tutto viene chiuso prima della chiusura: nessun rischio overnight. La taglia si riduce quando SPY è molto volatile. Backtest 2019-2025 con l\'80% del conto: circa 6% l\'anno, perdita massima 5%, +13,7% nel 2022 con SPY a -18%.' },
+            panico: { t: 'Acquisti nel panico', d: 'Quando l\'indice della paura (VIX) chiude sopra 28 il bot compra l\'S&P 500 (ETF VOO) con il 10% del conto, al massimo 3 volte a distanza di 5 sedute. Vende quando il VIX torna sotto 20, dopo 60 sedute o se l\'indice scende del 15% sotto il prezzo medio. Backtest 1993-2026: 47 episodi, oltre l\'80% in guadagno, perdita peggiore circa -6% del conto (2008).' },
         },
         // Agent Matrix
         agents: [], blocks: { asset_classes: [], sectors: [], symbols: [] }, blockLabels: [], tuning: null, agentBusy: '',
@@ -50,7 +52,7 @@ function dashboard() {
         },
         chatSuggestions: ['Come stanno andando i miei soldi?', 'Perché oggi non hai comprato niente?', 'Spiegami il titolo che sta perdendo di più', 'Ci sono notizie importanti oggi?', 'Sto rischiando troppo?'],
         account: {}, positions: [], closedPositions: [], bot: { logs: [] },
-        radar: {}, channels: {}, macro: {}, perf: {}, cio: {},
+        radar: {}, channels: {}, macro: {}, perf: {}, cio: {}, tactical: {},
         settings: { watchlist: [] }, envLocked: {},
         showSettings: false, saving: false, notice: '', noticeError: false, tickerInput: '',
         showPosition: false, posSymbol: '', posDetail: null, posLoading: false, posError: '', posNotice: '', posNoticeError: false, selling: false,
@@ -139,6 +141,30 @@ function dashboard() {
             if (c.action === 'ROTATE') return { title: `rotazione da ${c.sell_symbol} a ${c.buy_symbol}.`, short: `Rotazione ${c.sell_symbol} → ${c.buy_symbol}`, text: why };
             if (c.action === 'SELL') return { title: `vendita di ${c.sell_symbol}.`, short: `Vendita ${c.sell_symbol}`, text: why };
             return { title: 'nessun acquisto.', short: 'Attesa', text: why };
+        },
+        // Capitale tattico: day-trading su SPY e acquisti nel panico su VOO
+        dayTrade() {
+            const t = this.tactical || {};
+            if (!t.enabled) return { tag: 'Spento', tone: '', text: 'Quota del capitale tattico a zero nelle impostazioni.' };
+            if (t.state === 'mercato chiuso') return { tag: 'In attesa', tone: '', text: 'Borsa USA chiusa: primo controllo alle 10:00 di New York.' };
+            const p = t.position;
+            if (t.state === 'long' || t.state === 'short') {
+                const pnl = p && p.pnl != null ? ` · risultato ${this.usd(p.pnl, true)} (${this.pct(p.pnl_pct)})` : '';
+                return { tag: t.state === 'long' ? 'Long' : 'Short', tone: t.state === 'long' ? 'good' : 'blue',
+                         text: `${Math.abs(p ? p.qty : 0)} azioni da ${this.usd(p ? p.entry : 0)}${pnl}.` };
+            }
+            return { tag: 'Flat', tone: '', text: 'Nessuna posizione: il prezzo è dentro l\'area di rumore o il segnale non è ancora arrivato.' };
+        },
+        bandText() {
+            const c = this.tactical.last_check || {};
+            if (c.lower == null || c.upper == null) return '—';
+            return `${this.num(c.lower, 2)} – ${this.num(c.upper, 2)} · SPY ${this.num(c.price, 2)}`;
+        },
+        panicNow() {
+            const p = (this.tactical || {}).panic || {};
+            if (!this.tactical.enabled) return { title: 'Spento', text: '' };
+            if (p.tranches) return { title: `${p.tranches} tranche su VOO`, text: (p.first ? `Dal ${p.first}. ` : '') + (p.note || '') };
+            return { title: 'Nessuna', text: p.note || 'Controllo ogni giorno alle 09:35 di New York.' };
         },
         moneySentence() {
             const inv = this.investedPct();
@@ -448,6 +474,10 @@ function dashboard() {
             const n = Number(v);
             return (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%';
         },
+        num(v, d = 2) {
+            if (v === null || v === undefined || v === '' || isNaN(v)) return '—';
+            return Number(v).toLocaleString('it-IT', { minimumFractionDigits: d, maximumFractionDigits: d });
+        },
         qty(v) { return Number(v).toLocaleString('it-IT', { maximumFractionDigits: 6 }); },
         tone(v) {
             if (v === null || v === undefined || isNaN(v) || Number(v) === 0) return 'text-zinc-300';
@@ -579,6 +609,7 @@ function dashboard() {
                 this.macro = this.channels.macro || {};
                 this.perf = this.bot.performance || {};
                 this.cio = this.bot.cio || {};
+                this.tactical = this.bot.tactical || {};
                 // Log e dialoghi arrivano in modo incrementale; riallineamento dopo un riavvio del server
                 if ((data.log_head || 0) < this.lastLogId) { this.logs = []; this.lastLogId = 0; this.clearedId = 0; }
                 if ((data.dialogue_head || 0) < this.lastDialogueId) { this.dialogue = []; this.lastDialogueId = 0; }

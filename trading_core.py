@@ -132,6 +132,11 @@ DEFAULT_CONFIG = {
     "ai_provider": "groq",
     "keep_alive_enabled": True,
     "core_spy_pct": 0.0,          # quota del capitale su SPY (core + satellite, agents/core_allocation.py); 0 = disattivato
+    # Capitale tattico: quota per il day-trading su SPY (agents/day_trader.py) e per gli acquisti nel panico su VOO
+    # (agents/panic_buyer.py); lo swing usa il resto. 0 = disattivato. Non si combina con il core SPY.
+    "daytrade_pct": 80.0,
+    "daytrade_short": True,       # day-trading anche al ribasso (short di SPY): metà dei segnali dello studio
+    "panic_buy": True,            # tranche di VOO con VIX >= 28
     # Mercato USA chiuso: "preparazione" = acquisti solo crypto (24/7) e analisi delle azioni per l'apertura;
     # "crypto" = solo crypto. Alpaca non negozia azioni non USA; fuori orario le azioni USA accettano solo ordini limite.
     "closed_market_mode": "preparazione",
@@ -152,6 +157,9 @@ ENV_OVERRIDES = {
     "scan_interval_min": "BOT_SCAN_INTERVAL_MIN",
     "keep_alive_enabled": "BOT_KEEP_ALIVE",
     "core_spy_pct": "BOT_CORE_SPY_PCT",
+    "daytrade_pct": "BOT_DAYTRADE_PCT",
+    "daytrade_short": "BOT_DAYTRADE_SHORT",
+    "panic_buy": "BOT_PANIC_BUY",
     "closed_market_mode": "BOT_CLOSED_MARKET_MODE",
 }
 CLOSED_MARKET_MODES = ("preparazione", "crypto")
@@ -243,8 +251,9 @@ def _validate_config(data, base):
     number("stop_loss_pct", -50.0, -0.5)
     number("scan_interval_min", 1, 1440, int)
     number("core_spy_pct", 0.0, 90.0)
+    number("daytrade_pct", 0.0, 80.0)
 
-    for key in ("auto_execute_trades", "keep_alive_enabled"):
+    for key in ("auto_execute_trades", "keep_alive_enabled", "daytrade_short", "panic_buy"):
         if key in data:
             if not isinstance(data[key], bool):
                 raise ValueError(f"{key} deve essere true/false")
@@ -542,6 +551,8 @@ from agents.portfolio_allocator import (MAX_POSITION_PCT, MIN_DOLLAR_VOLUME, MIN
                                         TRAIL_ATR_MULT, TREND_EXIT_EMA50_RATIO, risk_limits, size_trade,
                                         trend_up_confirmed)
 from agents import core_allocation as core_alloc
+from agents import day_trader as dtr
+from agents import panic_buyer as pnc
 
 
 def groq_news_llm(system, prompt):
@@ -929,6 +940,138 @@ def submit_core_order(side, amount_usd):
         client_order_id=f"{core_alloc.CORE_ORDER_PREFIX}{side.lower()}-{uuid.uuid4().hex[:16]}",
     )
     return alpaca_client.submit_order(order_data)
+
+
+# ---------------------------------------------------------------------------
+# Capitale tattico: day-trading su SPY e acquisti nel panico su VOO (app.py, daytrade_loop)
+# ---------------------------------------------------------------------------
+NON_SWING_PREFIXES = (core_alloc.CORE_ORDER_PREFIX, dtr.ORDER_PREFIX, pnc.ORDER_PREFIX)
+TACTICAL_SYMBOLS = (dtr.SYMBOL, pnc.SYMBOL)
+DT_HISTORY_DAYS = 30            # giorni di calendario di barre: almeno 15 sedute per rumore (14) e volatilità (14+1)
+DT_BARS_TTL_SEC = 45            # una lettura delle barre basta per i controlli dello stesso minuto
+_dt_bars_cache = {"ts": 0.0, "bars": None, "source": ""}
+
+
+def tactical_pct(cfg=None):
+    """Quota del capitale tattico (0 = disattivato). Con il core SPY attivo resta spento: userebbero lo stesso simbolo."""
+    cfg = cfg or get_config()
+    if float(cfg.get("core_spy_pct") or 0) > 0:
+        return 0.0
+    return min(float(cfg.get("daytrade_pct") or 0), dtr.MAX_PCT)
+
+
+def is_tactical_symbol(symbol):
+    return normalize_symbol(symbol) in TACTICAL_SYMBOLS
+
+
+def _alpaca_minute_bars(days):
+    from alpaca.data.enums import DataFeed
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    client = with_http_timeout(StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET))
+    start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    # Feed IEX: gratuito e in tempo reale con il piano base (SIP solo con 15 minuti di ritardo)
+    bars = client.get_stock_bars(StockBarsRequest(symbol_or_symbols=dtr.SYMBOL, timeframe=TimeFrame.Minute,
+                                                  start=start, feed=DataFeed.IEX)).df
+    if bars is None or bars.empty:
+        return None
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.xs(dtr.SYMBOL, level="symbol")
+    return bars[["open", "high", "low", "close", "volume"]]
+
+
+def _yahoo_minute_bars():
+    df = yf.download(dtr.SYMBOL, period="1mo", interval="5m", progress=False, auto_adjust=False, prepost=False)
+    if df is None or df.empty:
+        return None
+    if hasattr(df.columns, "levels"):
+        df.columns = df.columns.get_level_values(0)
+    return df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
+
+
+def spy_minute_bars(log=print):
+    """(barre di SPY degli ultimi DT_HISTORY_DAYS giorni, fonte): Alpaca 1 minuto, riserva Yahoo 5 minuti."""
+    now = time.time()
+    if _dt_bars_cache["bars"] is not None and now - _dt_bars_cache["ts"] < DT_BARS_TTL_SEC:
+        return _dt_bars_cache["bars"], _dt_bars_cache["source"]
+    bars, source = None, ""
+    if ALPACA_KEY and ALPACA_SECRET:
+        try:
+            bars, source = _alpaca_minute_bars(DT_HISTORY_DAYS), "Alpaca IEX 1 min"
+        except Exception as e:
+            _warn_throttled("dt_bars_alpaca", f"📈 [Day-trading] Barre Alpaca non disponibili ({type(e).__name__}: {e}): "
+                                              "uso Yahoo a 5 minuti.", log, every=1800)
+    if bars is None:
+        try:
+            bars, source = _yahoo_minute_bars(), "Yahoo 5 min"
+        except Exception as e:
+            log(f"📈 [Day-trading] Barre di SPY non disponibili: {type(e).__name__}: {e}")
+            return None, ""
+    if bars is not None:
+        _dt_bars_cache.update(ts=now, bars=bars, source=source)
+    return bars, source
+
+
+def vix_levels():
+    """(chiusura del VIX della seduta precedente, ultimo valore) da Yahoo; None dove non disponibile."""
+    df = _download(["^VIX"], "1mo", "1d").get("^VIX")
+    if df is None or df.empty:
+        return None, None
+    close = df["Close"].dropna()
+    if close.empty:
+        return None, None
+    last_day = pd.Timestamp(close.index[-1]).date()
+    today = dt.datetime.now(_ET).date()
+    prev = close.iloc[-2] if last_day >= today and len(close) > 1 else close.iloc[-1]
+    return float(prev), float(close.iloc[-1])
+
+
+def market_session():
+    """{"open": bool, "minute": minuti dalle 09:30 di New York, "to_close": minuti alla chiusura} dall'orologio Alpaca."""
+    if not alpaca_client:
+        return {"open": False, "minute": None, "to_close": None}
+    try:
+        clock = alpaca_client.get_clock()
+    except Exception as e:
+        _warn_throttled("dt_clock", f"📈 [Day-trading] Orologio di Alpaca non disponibile: {type(e).__name__}: {e}",
+                        print, every=600)
+        return {"open": None, "minute": None, "to_close": None}
+    now = clock.timestamp.astimezone(_ET)
+    minute = (now.hour - 9) * 60 + now.minute - 30
+    to_close = (clock.next_close - clock.timestamp).total_seconds() / 60 if clock.is_open else None
+    return {"open": bool(clock.is_open), "minute": minute, "to_close": to_close, "date": now.date()}
+
+
+def submit_daytrade_order(side, qty, tag):
+    """Ordine a mercato di azioni intere di SPY (lo short non ammette frazioni), client_order_id "dt-…"."""
+    order = MarketOrderRequest(symbol=dtr.SYMBOL, qty=int(qty), side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                               time_in_force=TimeInForce.DAY,
+                               client_order_id=f"{dtr.ORDER_PREFIX}{tag}-{uuid.uuid4().hex[:16]}")
+    return alpaca_client.submit_order(order)
+
+
+def submit_panic_order(side, amount_usd=None, qty=None):
+    """Acquisto a importo o vendita della quantità posseduta di VOO, client_order_id "px-…"."""
+    kwargs = {"notional": round(amount_usd, 2)} if amount_usd is not None else {"qty": qty}
+    order = MarketOrderRequest(symbol=pnc.SYMBOL, side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                               time_in_force=TimeInForce.DAY,
+                               client_order_id=f"{pnc.ORDER_PREFIX}{side.lower()}-{uuid.uuid4().hex[:16]}", **kwargs)
+    return alpaca_client.submit_order(order)
+
+
+def panic_orders(days=150, log=print):
+    """Ordini eseguiti di VOO del modulo panico: [{"side", "date", "client_order_id"}], None se Alpaca non risponde."""
+    rows = order_history(dt.date.today() - dt.timedelta(days=days), symbol=pnc.SYMBOL, log=log)
+    if rows is None:
+        return None
+    out = []
+    for r in rows:
+        if r["status"] != "filled" or not r.get("filled_at"):
+            continue
+        filled = dt.datetime.fromisoformat(r["filled_at"]).astimezone(_ET).date()
+        out.append({"side": r["side"], "date": filled, "client_order_id": r["client_order_id"]})
+    return out
 
 
 def close_position(alpaca_symbol):
@@ -1757,6 +1900,8 @@ def order_history(since, symbol=None, log=print):
             continue
         cid = o.client_order_id or ""
         source = ("core SPY" if cid.startswith(core_alloc.CORE_ORDER_PREFIX)
+                  else "day-trading" if cid.startswith(dtr.ORDER_PREFIX)
+                  else "panico" if cid.startswith(pnc.ORDER_PREFIX)
                   else "bot" if cid.startswith(ORDER_TAG_PREFIX) else "altro")
         rows.append({
             "id": str(o.id), "symbol": o.symbol, "side": str(getattr(o.side, "value", o.side)).upper(),
@@ -1802,8 +1947,8 @@ def sync_ledger(days=90, log=print):
     for o in orders:
         qty = float(o.filled_qty or 0)
         price = float(o.filled_avg_price or 0)
-        if qty <= 0 or price <= 0 or (o.client_order_id or "").startswith(core_alloc.CORE_ORDER_PREFIX):
-            continue                  # gli ordini del core SPY non sono trade del bot
+        if qty <= 0 or price <= 0 or (o.client_order_id or "").startswith(NON_SWING_PREFIXES):
+            continue                  # gli ordini del core SPY e del capitale tattico non sono trade dello swing
         key = normalize_symbol(o.symbol)
         side = str(getattr(o.side, "value", o.side)).lower()
         filled_at = o.filled_at.astimezone(TIMEZONE) if hasattr(o.filled_at, "astimezone") else None
@@ -2641,7 +2786,8 @@ def is_tradable(yf_symbol):
     if not alpaca_client:
         return True
     try:
-        ok = bool(alpaca_client.get_asset(to_alpaca_symbol(yf_symbol)).tradable)
+        # JSON grezzo come per GET /assets: i modelli di alpaca-py rifiutano i valori nuovi degli elenchi di Alpaca
+        ok = bool((alpaca_client.get(f"/assets/{to_alpaca_symbol(yf_symbol)}") or {}).get("tradable"))
     except Exception as e:
         if "not found" not in str(e).lower() and "404" not in str(e):
             return True
@@ -3306,6 +3452,8 @@ def validate_desk_decision(d, pitches, holdings, account, cfg, channels, sold_ke
     crypto = is_crypto(pitch["symbol"])
     if core_alloc.is_core(pitch["symbol"]) and float(cfg.get("core_spy_pct") or 0) > 0:
         return hold(f"{pitch['symbol']} è gestito dal core del portafoglio: il bot non lo compra")
+    if is_tactical_symbol(pitch["symbol"]) and tactical_pct(cfg) > 0:
+        return hold(f"{pitch['symbol']} è riservato al capitale tattico (day-trading / panico): lo swing non lo compra")
     if crypto and crypto_night_blocked():
         return hold(f"{pitch['symbol']}: blocco crypto overnight (22:00-08:00 CET), nessuna nuova apertura")
     if crypto and not ((channels.get("macro") or {}).get("trend_up") or {}).get("crypto", True):

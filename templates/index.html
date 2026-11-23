@@ -153,13 +153,44 @@
                                         <span class="pin" :style="'left:' + vixPos(macro.vix) + '%'"><span class="n" x-text="'VIX ' + Number(macro.vix).toFixed(1)"></span></span>
                                     </div>
                                     <p class="desc">Indice della paura (VIX) <button class="info" @click="help('vix')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button>
-                                        sotto 20 calmo, 25 il bot riduce gli acquisti, 28 vende tutte le posizioni.</p>
+                                        sotto 20 calmo, 25 lo swing riduce gli acquisti, 28 lo swing vende e il capitale tattico compra l'indice a tranche.</p>
                                 </div>
                             </template>
                         </div>
                     </section>
                 </div>
             </div>
+
+            <section class="panel" x-show="tactical.enabled !== undefined">
+                <header><h2>Capitale tattico</h2>
+                    <span class="aside" x-text="tactical.enabled ? (tactical.pct || 0).toFixed(0) + '% del conto · lo swing usa il resto' : 'disattivato'"></span></header>
+                <div class="body grid-2" style="gap:24px">
+                    <div class="kv">
+                        <div><span class="k">Day-trading SPY <button class="info" @click="help('daytrade')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></span>
+                             <span class="v"><span class="tag" :class="dayTrade().tone" x-text="dayTrade().tag"></span></span>
+                             <span class="sub" x-text="dayTrade().text"></span></div>
+                        <div x-show="tactical.last_check"><span class="k">Ultimo controllo</span>
+                             <span class="v n" x-text="(tactical.last_check || {}).time"></span>
+                             <span class="sub" x-text="(tactical.last_check || {}).action"></span></div>
+                        <div x-show="tactical.last_check"><span class="k">Area di rumore</span>
+                             <span class="v n" x-text="bandText()"></span>
+                             <span class="sub">Sopra la banda il bot compra, sotto vende allo scoperto; dentro resta fermo.</span></div>
+                        <div x-show="tactical.enabled"><span class="k">Prossimo controllo</span><span class="v n" x-text="tactical.next_check || '—'"></span>
+                             <span class="sub">Ogni 30 minuti dalle 10:00 alle 15:30 di New York (16:00-21:30 in Italia); tutto chiuso prima della campanella.</span></div>
+                    </div>
+                    <div class="kv">
+                        <div><span class="k">Acquisti nel panico <button class="info" @click="help('panico')" aria-label="Definizione"><span class="ico" x-html="icon('info')"></span></button></span>
+                             <span class="v" x-text="panicNow().title"></span>
+                             <span class="sub" x-text="panicNow().text"></span></div>
+                        <div x-show="(tactical.panic || {}).vix_prev != null"><span class="k">VIX alla chiusura precedente</span>
+                             <span class="v n" x-text="num((tactical.panic || {}).vix_prev, 1)"></span>
+                             <span class="sub">Da 28 in su il bot compra l'S&amp;P 500 (VOO) a tranche del 10%, al massimo 3.</span></div>
+                        <div x-show="(tactical.panic || {}).vix != null"><span class="k">VIX ora</span>
+                             <span class="v n" x-text="num((tactical.panic || {}).vix, 1)"></span>
+                             <span class="sub">Sotto 20 la paura è rientrata e il bot vende le tranche.</span></div>
+                    </div>
+                </div>
+            </section>
 
             <section class="panel" x-show="perf.trades">
                 <header><h2>Operazioni chiuse</h2><span class="aside">ultimi 90 giorni</span></header>

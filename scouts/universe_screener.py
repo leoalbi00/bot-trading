@@ -136,12 +136,13 @@ class DynamicUniverseScreener:
     def _alpaca_assets(self) -> Dict[str, List[str]]:
         if not self.alpaca_client:
             return {}
-        from alpaca.trading.enums import AssetClass, AssetStatus
-        from alpaca.trading.requests import GetAssetsRequest
-        eq = self.alpaca_client.get_all_assets(GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE))
-        cr = self.alpaca_client.get_all_assets(GetAssetsRequest(asset_class=AssetClass.CRYPTO, status=AssetStatus.ACTIVE))
-        return {"equity": sorted(a.symbol for a in eq if a.tradable),
-                "crypto": sorted(a.symbol.split("/")[0] for a in cr if a.tradable and a.symbol.endswith("/USD"))}
+        # JSON grezzo di GET /v2/assets: la validazione dei modelli di alpaca-py fallisce quando Alpaca aggiunge valori
+        # nuovi ai suoi elenchi (es. "13 validation errors for list[Asset]") e la fonte resterebbe vuota per ore
+        eq = self.alpaca_client.get("/assets", {"status": "active", "asset_class": "us_equity"}) or []
+        cr = self.alpaca_client.get("/assets", {"status": "active", "asset_class": "crypto"}) or []
+        return {"equity": sorted(a["symbol"] for a in eq if a.get("tradable") and a.get("symbol")),
+                "crypto": sorted(a["symbol"].split("/")[0] for a in cr
+                                 if a.get("tradable") and str(a.get("symbol", "")).endswith("/USD"))}
 
     # ------------------------------------------------------------------ fonti crypto
     def _coinbase(self) -> Dict[str, float]:
