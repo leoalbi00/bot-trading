@@ -6,6 +6,7 @@ import datetime
 import itertools
 from collections import deque
 from functools import wraps
+import pandas as pd
 import requests
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -14,6 +15,8 @@ import trading_core as core
 import command_center as cc
 from agents import portfolio_allocator as allocator
 from agents import core_allocation as core_alloc
+from agents import day_trader as dtr
+from agents import panic_buyer as pnc
 from trading_core import alpaca_client
 
 KEEP_ALIVE_INTERVAL = 600  # secondi tra un self-ping e l'altro
@@ -41,6 +44,7 @@ bot_state = {
     "cio": {},           # mandato esecutivo del CIO
     "performance": {},   # Post-Trade Auditor: win rate, PnL, permanenza media
     "ledger_open": {},   # per posizione: data di apertura, stop, allocazione e convinzione (da Alpaca)
+    "tactical": {},      # capitale tattico: day-trading su SPY e acquisti nel panico su VOO (daytrade_loop)
     "latest_ai_analysis": {
         "symbol": "INIZIALIZZO...",
         "rsi": "--",
@@ -130,19 +134,27 @@ def core_spy_pct(cfg=None):
     return float((cfg or core.get_config()).get("core_spy_pct") or 0)
 
 def fetch_bot_positions(all_positions=None):
-    """Posizioni gestite dal bot: senza il core SPY quando è attivo. None se Alpaca non risponde."""
+    """Posizioni dello swing: senza il core SPY e senza SPY/VOO del capitale tattico. None se Alpaca non risponde."""
     positions = fetch_open_positions() if all_positions is None else all_positions
-    if positions is None or core_spy_pct() <= 0:
-        return positions
-    return core_alloc.split_positions(positions)[1]
+    if positions is None:
+        return None
+    if core_spy_pct() > 0:
+        positions = core_alloc.split_positions(positions)[1]
+    if core.tactical_pct() > 0:
+        positions = [p for p in positions if not core.is_tactical_symbol(p["symbol"])]
+    return positions
 
 def bot_account(acc, all_positions, cfg=None):
-    """Conto visto dal bot: con il core attivo, capitale e liquidità della sola quota satellite."""
+    """Conto visto dallo swing: con il core o il capitale tattico attivi, capitale e liquidità della sola quota restante."""
     pct = core_spy_pct(cfg)
-    if pct <= 0:
-        return acc
-    core_pos = core_alloc.split_positions(all_positions or [])[0]
-    return core_alloc.satellite_account(acc, pct, abs(core_pos["market_value"]) if core_pos else 0.0)
+    if pct > 0:
+        core_pos = core_alloc.split_positions(all_positions or [])[0]
+        return core_alloc.satellite_account(acc, pct, abs(core_pos["market_value"]) if core_pos else 0.0)
+    tactical = core.tactical_pct(cfg)
+    if tactical > 0:
+        used = sum(abs(p["market_value"]) for p in all_positions or [] if core.is_tactical_symbol(p["symbol"]))
+        return core_alloc.satellite_account(acc, tactical, used)
+    return acc
 
 def rebalance_core(acc, all_positions, channels, cfg, auto_trade, pending, market_open):
     """Porta SPY al controvalore obiettivo del core (quota x regime), solo a mercato aperto e oltre la banda del 3%."""
@@ -811,6 +823,224 @@ def chop_loop():
             log_message(f"🐝 [CHOP] Errore audit: {e}")
         time.sleep(5)
 
+# ---------------------------------------------------------------------------
+# Capitale tattico: day-trading su SPY (agents/day_trader.py) e acquisti nel panico su VOO (agents/panic_buyer.py)
+# ---------------------------------------------------------------------------
+DAYTRADE_INTERVAL_SEC = 20
+PANIC_ENTRY_MINUTE = 5           # tranche del panico alle 09:35 di New York (VIX della chiusura precedente)
+PANIC_EXIT_TO_CLOSE_MIN = 10     # uscite del panico 10 minuti prima della chiusura (VIX e prezzo quasi di chiusura)
+STALE_BARS_MIN = 5               # barre più vecchie di 5 minuti rispetto al controllo: dati fermi, nessuna decisione
+_dt_state = {"date": None, "done": set(), "panic_entry": None, "panic_exit": None}
+_dt_lock = threading.Lock()
+
+def _hhmm(minute):
+    return f"{9 + (30 + minute) // 60:02d}:{(30 + minute) % 60:02d}" if minute is not None else "—"
+
+def _tactical_status(**changes):
+    with state_lock:
+        bot_state["tactical"] = {**bot_state.get("tactical", {}), **changes}
+
+def _find(positions, symbol):
+    return next((p for p in positions if core.normalize_symbol(p["symbol"]) == symbol), None)
+
+def _dt_side(pos):
+    if not pos or not pos["qty"]:
+        return 0
+    return -1 if pos["qty"] < 0 or pos.get("side") == "SHORT" else 1
+
+def _dt_order(side, qty, tag, reason, auto_trade):
+    """Invia un ordine di day-trading e attende l'esecuzione. True se eseguito (o simulato in modalità Advisor)."""
+    log_message(f"📈 [Day-trading] {side} {qty} SPY — {reason}")
+    if not auto_trade:
+        log_message("🧭 [Advisor] Ordine di day-trading solo suggerito, nessun ordine inviato.")
+        return False
+    try:
+        order = core.submit_daytrade_order(side, qty, tag)
+    except Exception as e:
+        log_message(f"📈 [Day-trading] Ordine rifiutato: {type(e).__name__}: {e}")
+        return False
+    filled = core.wait_for_fill(order.id, timeout=20, log=log_message)
+    with _cache_lock:
+        _cache.clear()
+    if filled:
+        core.agent_say("Day-trading", f"{side} {qty} SPY a ${float(filled.filled_avg_price):,.2f} · {reason}", "ok")
+    return bool(filled)
+
+def dt_flatten(pos, reason, auto_trade):
+    """Chiude la posizione di day-trading. True se chiusa."""
+    qty = abs(pos["qty"])
+    if qty != int(qty):          # frazioni (non dovrebbero esistere): chiusura completa della posizione
+        log_message(f"📈 [Day-trading] Chiudo {pos['symbol']} ({qty}) — {reason}")
+        if not auto_trade:
+            return False
+        try:
+            core.close_position(pos["symbol"])
+            return True
+        except Exception as e:
+            log_message(f"📈 [Day-trading] Chiusura rifiutata: {type(e).__name__}: {e}")
+            return False
+    return _dt_order("SELL" if _dt_side(pos) > 0 else "BUY", int(qty), "exit", reason, auto_trade)
+
+def dt_check(t, today, spy, cfg, pct, auto_trade, active):
+    """Controllo del minuto t: stop della posizione aperta, poi eventuale ingresso (regole di agents/day_trader.py)."""
+    bars, source = core.spy_minute_bars(log=log_message)
+    if bars is None or bars.empty:
+        log_message(f"📈 [Day-trading] Controllo delle {_hhmm(t)} saltato: barre di SPY non disponibili.")
+        return
+    last = bars.index.max()
+    last = last.tz_convert(dtr.ET) if last.tzinfo else last
+    last_minute = (last.hour - 9) * 60 + last.minute - 30
+    if last.date() != today or last_minute < t - STALE_BARS_MIN:
+        log_message(f"📈 [Day-trading] Controllo delle {_hhmm(t)} saltato: ultima barra di SPY delle "
+                    f"{last.strftime('%H:%M')} ({source}), dati fermi.")
+        return
+    frames = dtr.session_frames(bars)
+    bands = dtr.noise_bands(frames)
+    snap = dtr.snapshot_at(frames, bands, pd.Timestamp(today), t)
+    side = _dt_side(spy)
+    exit_now, enter = dtr.decide(side, snap["price"], snap["upper"], snap["lower"], snap["vwap"],
+                                 allow_short=cfg.get("daytrade_short", True))
+    frac = dtr.exposure_fraction(pct, snap["vol"])
+    fmt = lambda v: f"{v:,.2f}" if v == v else "n/d"
+    detail = (f"SPY {fmt(snap['price'])} · banda {fmt(snap['lower'])}–{fmt(snap['upper'])} · VWAP {fmt(snap['vwap'])}")
+    action = "nessun segnale: prezzo dentro l'area di rumore"
+    if side and not exit_now:
+        action = f"{'long' if side > 0 else 'short'} confermato: stop non toccato"
+    if exit_now:
+        action = "stop: " + ("prezzo sotto banda/VWAP" if side > 0 else "prezzo sopra banda/VWAP")
+        if not dt_flatten(spy, f"{action} ({detail})", auto_trade) and auto_trade:
+            enter = 0                # posizione non chiusa: nessun nuovo ingresso sopra quella vecchia
+            action += " · uscita non eseguita, riprovo al prossimo controllo"
+            _dt_state["done"].discard(t)
+    if enter:
+        if not active:
+            action += " · nuovo ingresso non eseguito: bot in pausa"
+        else:
+            acc = get_account_summary()
+            equity = float(acc.get("last_equity") or acc.get("portfolio") or 0)
+            shares = dtr.shares_for(equity, frac, snap["price"], float(acc.get("non_marginable_buying_power") or 0))
+            label = "LONG" if enter > 0 else "SHORT"
+            if shares <= 0:
+                action = f"segnale {label} senza liquidità disponibile"
+            else:
+                action = f"ingresso {label} {shares} azioni ({frac * 100:.0f}% del capitale)"
+                _dt_order("BUY" if enter > 0 else "SELL", shares, "long" if enter > 0 else "short",
+                          f"{'sopra' if enter > 0 else 'sotto'} l'area di rumore ({detail})", auto_trade)
+    log_message(f"📈 [Day-trading] Controllo delle {_hhmm(t)}: {action} — {detail} · fonte {source}")
+    _tactical_status(last_check={"time": _hhmm(t), "price": snap["price"], "upper": snap["upper"], "lower": snap["lower"],
+                                 "vwap": snap["vwap"], "action": action, "fraction_pct": round(frac * 100, 1),
+                                 "source": source})
+
+def panic_entry(today, voo, cfg, auto_trade):
+    prev, last = core.vix_levels()
+    orders = core.panic_orders(log=log_message)
+    if orders is None:
+        return False
+    ep = pnc.episode(orders, holding=bool(voo and voo["qty"] > 0))
+    acc = get_account_summary()
+    d = pnc.entry_amount(prev, ep, today, float(acc.get("portfolio") or 0),
+                         float(acc.get("non_marginable_buying_power") or 0), holidays=core.NYSE_HOLIDAYS)
+    _tactical_status(panic={"vix_prev": prev, "vix": last, "tranches": ep["tranches"], "first": str(ep["first"] or ""),
+                            "note": d["reason"]})
+    if d["amount"] > 0:
+        log_message(f"🛟 [Panico] BUY ${d['amount']:,.2f} di {pnc.SYMBOL} — {d['reason']}")
+        if not auto_trade:
+            log_message("🧭 [Advisor] Tranche del panico solo suggerita, nessun ordine inviato.")
+        else:
+            try:
+                core.submit_panic_order("BUY", amount_usd=d["amount"])
+                core.agent_say("Panico", f"Tranche ${d['amount']:,.0f} di {pnc.SYMBOL} · {d['reason']}", "ok")
+            except Exception as e:
+                log_message(f"🛟 [Panico] Ordine rifiutato: {type(e).__name__}: {e}")
+    return True
+
+def panic_exit(today, voo, auto_trade):
+    prev, last = core.vix_levels()
+    orders = core.panic_orders(log=log_message)
+    if orders is None:
+        return False
+    ep = pnc.episode(orders, holding=True)
+    if ep["first"] is None:
+        return True                  # VOO non comprato dal modulo: non lo tocca
+    reason = pnc.exit_reason(last, ep, today, voo["current_price"], voo["avg_entry_price"], holidays=core.NYSE_HOLIDAYS)
+    _tactical_status(panic={**(bot_state.get("tactical", {}).get("panic") or {}), "vix": last, "tranches": ep["tranches"],
+                            "first": str(ep["first"]), "note": reason or "posizione mantenuta: nessuna condizione di uscita"})
+    if reason:
+        log_message(f"🛟 [Panico] SELL {voo['qty']} {pnc.SYMBOL} — {reason}")
+        if auto_trade:
+            try:
+                core.submit_panic_order("SELL", qty=voo["qty"])
+                core.agent_say("Panico", f"Uscita da {pnc.SYMBOL} · {reason}", "ok")
+            except Exception as e:
+                log_message(f"🛟 [Panico] Ordine rifiutato: {type(e).__name__}: {e}")
+    return True
+
+def daytrade_tick():
+    """Un giro del capitale tattico: panico all'apertura e in chiusura, controlli ogni 30 minuti, flat prima della chiusura."""
+    cfg = core.get_config()
+    pct = core.tactical_pct(cfg)
+    if pct <= 0:
+        _tactical_status(enabled=False, state="disattivato")
+        return
+    sess = core.market_session()
+    if sess["open"] is None:
+        return                       # orologio di Alpaca non disponibile: si riprova al prossimo giro
+    if not sess["open"]:
+        _tactical_status(enabled=True, pct=pct, state="mercato chiuso", next_check="10:00")
+        return
+    today = sess["date"]
+    if _dt_state["date"] != today:
+        _dt_state.update(date=today, done=set())
+    all_positions = fetch_open_positions()
+    pending = core.get_pending_order_symbols(log=log_message)
+    if all_positions is None or pending is None:
+        return                       # stato del conto sconosciuto: nessuna decisione
+    spy, voo = _find(all_positions, dtr.SYMBOL), _find(all_positions, pnc.SYMBOL)
+    auto_trade, active = cfg["auto_execute_trades"], bot_state["active"]
+    minute, to_close = sess["minute"], sess["to_close"]
+
+    if cfg.get("panic_buy", True):
+        if voo and to_close <= PANIC_EXIT_TO_CLOSE_MIN and _dt_state["panic_exit"] != today \
+                and pnc.SYMBOL not in pending:
+            if panic_exit(today, voo, auto_trade):
+                _dt_state["panic_exit"] = today
+        if active and minute >= PANIC_ENTRY_MINUTE and _dt_state["panic_entry"] != today and pnc.SYMBOL not in pending:
+            if panic_entry(today, voo, cfg, auto_trade):
+                _dt_state["panic_entry"] = today
+
+    if dtr.SYMBOL in pending:
+        return
+    if spy and (to_close <= dtr.FLAT_BEFORE_CLOSE_MIN or minute < dtr.CHECK_STEP_MIN):
+        # chiusura di fine giornata; prima del primo controllo: posizione rimasta da ieri (riavvio a cavallo della chiusura)
+        dt_flatten(spy, "chiusura di fine giornata: nessuna posizione overnight" if to_close <= dtr.FLAT_BEFORE_CLOSE_MIN
+                   else "posizione rimasta dalla seduta precedente", auto_trade)
+        return
+    upcoming = [c for c in dtr.check_minutes() if c >= minute]
+    _tactical_status(enabled=True, pct=pct, short=cfg.get("daytrade_short", True),
+                     state=("long" if _dt_side(spy) > 0 else "short" if _dt_side(spy) < 0 else "flat"),
+                     position={"qty": spy["qty"], "entry": spy["avg_entry_price"], "pnl": spy["unrealized_pl"],
+                               "pnl_pct": spy["unrealized_plpc"]} if spy else None,
+                     next_check=_hhmm(upcoming[0]) if upcoming else "chiusura")
+    if to_close <= dtr.FLAT_BEFORE_CLOSE_MIN:
+        return
+    t = dtr.check_due(minute, _dt_state["done"])
+    if t is None:
+        return
+    _dt_state["done"].add(t)
+    dt_check(t, today, spy, cfg, pct, auto_trade, active)
+
+def daytrade_loop():
+    """Capitale tattico: giro ogni 20 secondi, indipendente da CIO e sciame (simboli separati: SPY e VOO)."""
+    time.sleep(core.STARTUP_GRACE_SECONDS + 5)
+    while True:
+        started = time.time()
+        try:
+            with _dt_lock:
+                daytrade_tick()
+        except Exception as e:
+            log_message(f"📈 [Day-trading] Errore: {type(e).__name__}: {e}")
+        time.sleep(max(1, DAYTRADE_INTERVAL_SEC - (time.time() - started)))
+
 def keep_alive_url():
     base = os.getenv("RENDER_EXTERNAL_URL")
     if base:
@@ -867,6 +1097,7 @@ def start_background_threads():
     threading.Thread(target=radar_loop, daemon=True).start()
     threading.Thread(target=chop_loop, daemon=True).start()
     threading.Thread(target=guardian_loop, daemon=True).start()
+    threading.Thread(target=daytrade_loop, daemon=True).start()
     log_message(f"🧵 Thread di trading, radar Esploratore, Guardian ({core.GUARDIAN_INTERVAL_SEC}s) e Keep-Alive avviati "
                 f"(PID {os.getpid()})")
     cfg = core.get_config()
@@ -971,6 +1202,7 @@ def api_data():
             "latest_ai_analysis": dict(bot_state["latest_ai_analysis"]),
             "cio": dict(bot_state["cio"]),
             "performance": dict(bot_state["performance"]),
+            "tactical": dict(bot_state.get("tactical") or {}),
         }
     return jsonify({
         "account": cached("account_pnl", account_with_pnl),
