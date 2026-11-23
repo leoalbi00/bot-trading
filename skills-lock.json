@@ -86,6 +86,13 @@
       "skillPath": "skills/verification-before-completion/SKILL.md",
       "computedHash": "09b0e3a4689c1c38a3b8fc6ef57a1d4165aa33c0013d546dbde9dd348941a319"
     },
+    "volatility-modeling": {
+      "source": "joellewis/finance_skills",
+      "commit": "5c498eacf7057e31238c4c5a8012a1afe9ec7c8a",
+      "sourceType": "github",
+      "skillPath": "plugins/wealth-management/skills/volatility-modeling/SKILL.md",
+      "computedHash": "f568c7f743d05d0b595c847deb1a0c9705f1e1fc3550a9497490aef4b1175d1a"
+    },
     "web-design-guidelines": {
       "source": "vercel-labs/agent-skills",
       "sourceType": "github",
